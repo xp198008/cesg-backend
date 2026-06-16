@@ -1,0 +1,137 @@
+"""CESG 业务后端入口（独立 FastAPI 服务，默认端口 8100）。
+
+只负责"与设备无关的业务功能"：用户 / 角色 / 机构 / 车辆 / 司机，
+并在增删改时 best-effort 同步基础档案到 808 平台。
+设备 / 视频 / 实时 / 历史回放 / 808 控制由 808 平台负责，本服务不涉及。
+"""
+import asyncio
+import logging
+import sys
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+
+    _env = Path(__file__).resolve().parent / ".env"
+    if _env.exists():
+        load_dotenv(_env)
+except ImportError:
+    pass
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+
+from app.config import settings
+from app.database import init_models
+from app.routers import (
+    api_alarm_type,
+    api_driver,
+    api_fault_type,
+    api_map_rules,
+    api_org,
+    api_permission_menu,
+    api_role,
+    api_shortcut,
+    api_user,
+    api_vehicle,
+    api_vehicle_alloc,
+    api_weather,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="CESG 业务后端", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(api_user.router)
+app.include_router(api_role.router)
+app.include_router(api_org.router)
+app.include_router(api_vehicle.router)
+app.include_router(api_driver.router)
+app.include_router(api_alarm_type.router)
+app.include_router(api_fault_type.router)
+app.include_router(api_map_rules.router)
+app.include_router(api_permission_menu.router)
+app.include_router(api_vehicle_alloc.router)
+app.include_router(api_shortcut.router)
+app.include_router(api_weather.router)
+
+
+async def _ensure_default_admin() -> None:
+    """库中无任何用户时补一条默认 admin（用户名 admin / 密码 123456）。"""
+    import bcrypt
+    from sqlalchemy import func, select
+
+    from app.database import AsyncSessionLocal
+    from app.models import OrgCompany, SysRole, SysUser
+
+    async with AsyncSessionLocal() as s:
+        n = await s.scalar(select(func.count()).select_from(SysUser))
+        if n and n > 0:
+            return
+        company = await s.scalar(select(OrgCompany).order_by(OrgCompany.id).limit(1))
+        role = await s.scalar(select(SysRole).order_by(SysRole.id).limit(1))
+        if not company:
+            company = OrgCompany(name="环卫集团", short_name="环卫集团")
+            s.add(company)
+            await s.flush()
+            company.org_code = f"{company.id:04d}"
+        if not role:
+            role = SysRole(name="系统管理员", code="admin", remark="全部模块", is_global=True, permissions="[]")
+            s.add(role)
+            await s.flush()
+        s.add(
+            SysUser(
+                username="admin",
+                password_hash=bcrypt.hashpw(b"123456", bcrypt.gensalt()).decode("utf-8"),
+                password_plain="123456",
+                real_name="管理员",
+                role_id=role.id,
+                org_id=company.id,
+                allow_pwd_edit=True,
+                is_active=True,
+            )
+        )
+        await s.commit()
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    await init_models()
+    await _ensure_default_admin()
+    logger.info("CESG 业务后端已就绪：http://127.0.0.1:%s", settings.app_port)
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status_code=204)
+
+
+@app.get("/")
+async def root():
+    return {"service": "CESG 业务后端", "ok": True}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=settings.app_port,
+        reload=True,
+        reload_excludes=["**/data/**", "**/__pycache__/**", "**/*.pyc"],
+        log_level="info",
+    )
