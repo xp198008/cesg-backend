@@ -119,9 +119,14 @@ async def list_fleets(company_id: int = Query(..., ge=1), db: AsyncSession = Dep
 async def list_company_vehicles(
     company_id: int = Query(..., ge=1),
     fleet_id: int | None = Query(None),
+    subtree: bool = Query(False),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(Vehicle).where(Vehicle.company_id == company_id)
+    if subtree:
+        org_ids = await collect_org_company_subtree_ids(db, company_id)
+        stmt = select(Vehicle).where(Vehicle.company_id.in_(org_ids))
+    else:
+        stmt = select(Vehicle).where(Vehicle.company_id == company_id)
     if fleet_id is not None:
         stmt = stmt.where(Vehicle.fleet_id == fleet_id)
     rows = (await db.execute(stmt.order_by(Vehicle.plate_no))).scalars().all()
@@ -136,9 +141,11 @@ async def list_company_vehicles(
 
 @router.get("/users")
 async def list_company_users(company_id: int = Query(..., ge=1), db: AsyncSession = Depends(get_db)):
-    org_ids = await collect_org_company_subtree_ids(db, company_id)
+    # 用户范围：仅本公司名下的用户。
     rows = (
-        await db.execute(select(SysUser).where(SysUser.org_id.in_(org_ids)).order_by(SysUser.org_id, SysUser.id))
+        await db.execute(
+            select(SysUser).where(SysUser.org_id == company_id).order_by(SysUser.id)
+        )
     ).scalars().all()
     return {
         "ok": True,
@@ -325,12 +332,17 @@ async def _validate_vehicles(db: AsyncSession, rule: VehicleAllocRule, vehicle_i
     ids = list(dict.fromkeys(vehicle_ids))
     if not ids:
         return
+    # 规则所属公司及其所有下级公司的车辆均可纳入管控（总公司可管理整个子树）。
+    org_ids = await collect_org_company_subtree_ids(db, rule.company_id)
     rows = (await db.execute(select(Vehicle).where(Vehicle.id.in_(ids)))).scalars().all()
     if len(rows) != len(ids):
         raise HTTPException(status_code=400, detail="存在无效的车辆 ID")
     for vehicle in rows:
-        if vehicle.company_id != rule.company_id:
-            raise HTTPException(status_code=400, detail=f"车辆 {vehicle.plate_no} 不属于该规则所属公司")
+        if vehicle.company_id not in org_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"车辆 {vehicle.plate_no} 不属于该规则所属公司或下级组织",
+            )
         if rule.fleet_id is not None and vehicle.fleet_id != rule.fleet_id:
             raise HTTPException(status_code=400, detail=f"车队级规则下车辆须属于该车队：{vehicle.plate_no}")
 
@@ -339,13 +351,13 @@ async def _validate_users(db: AsyncSession, rule: VehicleAllocRule, user_ids: li
     ids = list(dict.fromkeys(user_ids))
     if not ids:
         return
-    org_ids = await collect_org_company_subtree_ids(db, rule.company_id)
+    # 用户范围：仅本公司名下的用户。
     rows = (await db.execute(select(SysUser).where(SysUser.id.in_(ids)))).scalars().all()
     if len(rows) != len(ids):
         raise HTTPException(status_code=400, detail="存在无效的用户 ID")
     for user in rows:
-        if user.org_id not in org_ids:
-            raise HTTPException(status_code=400, detail=f"用户 {user.username} 不属于该规则所属公司或下级组织")
+        if user.org_id != rule.company_id:
+            raise HTTPException(status_code=400, detail=f"用户 {user.username} 不属于该规则所属公司")
 
 
 @router.post("/rules/{rule_id}/vehicles")

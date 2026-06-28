@@ -47,11 +47,16 @@ class SysUser(Base):
     password_hash = Column(String(256), nullable=False)
     password_plain = Column(String(128), nullable=True)
     real_name = Column(String(64))
+    identity = Column(String(64), nullable=True)
+    phone = Column(String(32), nullable=True)
     role_id = Column(Integer, ForeignKey("sys_role.id"))
     org_id = Column(Integer, ForeignKey("org_company.id"))
     jt808_user_id = Column(String(36), nullable=True, index=True)
     allow_pwd_edit = Column(Boolean, default=True, nullable=False)
     is_active = Column(Boolean, default=True)
+    valid_until = Column(Date, nullable=True)
+    single_login = Column(Boolean, default=False, nullable=False, server_default="0")
+    login_session_token = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     remark = Column(String(256))
@@ -124,10 +129,20 @@ class Driver(Base):
         Integer, ForeignKey("org_company.id", ondelete="RESTRICT"), nullable=True, index=True
     )
     gender = Column(String(8), nullable=True)
+    certificate_code = Column(String(64), nullable=True)
     id_card = Column(String(32), nullable=True)
     phone = Column(String(32), nullable=True)
     birth_date = Column(Date, nullable=True)
+    entry_date = Column(Date, nullable=True)
+    license_issue_date = Column(Date, nullable=True)
     driver_license_no = Column(String(64), nullable=True)
+    driver_type = Column(String(16), nullable=True)
+    license_expiry = Column(String(32), nullable=True)
+    drive_hours = Column(Integer, nullable=True)
+    drive_mileage = Column(Integer, nullable=True)
+    score = Column(Integer, nullable=True)
+    native_place = Column(String(128), nullable=True)
+    avatar_url = Column(String(256), nullable=True)
     remark = Column(String(256))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -141,6 +156,7 @@ class Vehicle(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     plate_no = Column(String(16), nullable=False, unique=True, index=True)
     plate_color = Column(String(16), default="黄牌")
+    vehicle_category = Column(String(16), nullable=True)
     vehicle_type = Column(String(32))
     vehicle_type_ii = Column(String(32))
     color = Column(String(32))
@@ -154,6 +170,7 @@ class Vehicle(Base):
     driver_id = Column(
         Integer, ForeignKey("driver.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    driver_name = Column(String(64), nullable=True)
     owner_name = Column(String(64))
     contact_name = Column(String(64))
     contact_phone = Column(String(32))
@@ -167,6 +184,12 @@ class Vehicle(Base):
     status = Column(String(16), default="正常")
     last_online_at = Column(DateTime(timezone=True))
     channel_count = Column(Integer, default=0)
+    engine_displacement = Column(String(32), nullable=True)
+    fuel_tank_capacity = Column(String(32), nullable=True)
+    battery_capacity = Column(String(32), nullable=True)
+    range_mileage = Column(String(32), nullable=True)
+    battery_no = Column(String(64), nullable=True)
+    motor_no = Column(String(64), nullable=True)
     manufacturer = Column(String(64))
     brand = Column(String(64))
     model = Column(String(64))
@@ -210,12 +233,28 @@ class VehicleDevice(Base):
     sim_no = Column(String(32))
     actual_sim = Column(String(32))
     product_model = Column(String(64))
+    channels = Column(JSON, nullable=True)
     is_main = Column(Boolean, default=True)
     channel_no = Column(Integer, default=1)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     vehicle = relationship("Vehicle", back_populates="devices")
+
+
+class VehicleTypeDict(Base):
+    """基础数据：车辆类型维护。"""
+
+    __tablename__ = "vehicle_type_dict"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    type_code = Column(String(32), nullable=False, index=True)
+    type_name = Column(String(64), nullable=False, index=True)
+    icon_url = Column(String(256), nullable=True)
+    spec = Column(String(256), nullable=True)
+    site = Column(String(128), nullable=True)
+    sort_order = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 
 class ReserveTerminal(Base):
@@ -277,6 +316,20 @@ class AlarmTypeDict(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 
+class ViolationTypeDict(Base):
+    """违章/主动安全类型字典，供主动安全报警处理页面展示严重程度。"""
+
+    __tablename__ = "violation_type_dict"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    type_code = Column(String(32), nullable=False, unique=True, index=True)
+    type_name = Column(String(64), nullable=False, index=True)
+    description = Column(Text, nullable=True)
+    severity = Column(String(16), nullable=False, server_default="一般")
+    deduction_score = Column(Integer, nullable=False, server_default="0")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
 class FaultTypeDict(Base):
     """基础数据：故障类型字典，供人工报障等业务选用。"""
 
@@ -288,6 +341,26 @@ class FaultTypeDict(Base):
     fault_level = Column(String(16), nullable=False, server_default="中")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class VehicleLocation(Base):
+    """车辆实时位置快照，供主动安全处理弹窗地图定位等场景使用。"""
+
+    __tablename__ = "vehicle_location"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicle.id"), nullable=False, unique=True, index=True)
+    plate_no = Column(String(32), nullable=False, index=True)
+    company_id = Column(Integer, index=True)
+    terminal_id = Column(String(64), index=True)
+    lat = Column(Float)
+    lng = Column(Float)
+    speed = Column(Float)
+    pos_time = Column(DateTime)
+    current_position = Column(String(512))
+    is_online = Column(Boolean, default=False)
+    source = Column(String(32), default="ttx")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
 
 class MapApiConfig(Base):
@@ -334,6 +407,7 @@ class PrivateMapRule(Base):
     geometry_json = Column(JSON, nullable=False)
     speed_limit_kmh = Column(Integer, nullable=False, default=0, server_default="0")
     ref_public_rule_id = Column(Integer, nullable=True, index=True)
+    category_ids = Column(JSON, nullable=False, default=list)
     remark = Column(String(255))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -377,6 +451,74 @@ class MapRuleCategory(Base):
 
     company = relationship("OrgCompany", backref="map_rule_categories")
     weather_rule = relationship("PrivateMapRuleWeather")
+
+
+class VehicleViolation(Base):
+    """主动安全/违章报警记录，兼容旧项目安全管理页面。"""
+
+    __tablename__ = "vehicle_violation"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    biz_no = Column(String(32), nullable=False, unique=True, index=True)
+    external_alarm_id = Column(String(128), nullable=True, unique=True, index=True)
+    terminal_id = Column(String(32), nullable=False, index=True)
+    vehicle_id = Column(Integer, index=True, nullable=True)
+    plate_no = Column(String(16), default="", index=True)
+    company_id = Column(Integer, nullable=True, index=True)
+    violation_type_code = Column(Integer, nullable=True)
+    violation_type_name = Column(String(64), nullable=True)
+    violation_time = Column(DateTime, nullable=False, index=True)
+    lat = Column(Float, nullable=True)
+    lng = Column(Float, nullable=True)
+    address = Column(String(512), nullable=True)
+    source = Column(String(32), nullable=False)
+    transparent_type = Column(Integer, nullable=True)
+    raw_preview = Column(Text, nullable=True)
+    stream_snapshot_refs = Column(Text, nullable=True)
+    ttx_evidence_refs = Column(Text, nullable=True)
+    status = Column(String(16), nullable=False, default="待处理")
+    pre_audit_kind = Column(String(16), nullable=True)
+    ticket_appeal_remark = Column(Text, nullable=True)
+    ticket_appeal_attachment_refs = Column(Text, nullable=True)
+    handler_remark = Column(Text, nullable=True)
+    handler_name = Column(String(64), nullable=True)
+    handled_at = Column(DateTime, nullable=True)
+    auditor_name = Column(String(64), nullable=True)
+    audited_at = Column(DateTime, nullable=True)
+    audit_reject_remark = Column(Text, nullable=True)
+    appeal_reason = Column(Text, nullable=True)
+    appeal_submitted_at = Column(DateTime, nullable=True)
+    appeal_status = Column(String(16), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ViolationTicket(Base):
+    """主动安全报警关联罚单信息。"""
+
+    __tablename__ = "violation_ticket"
+    __table_args__ = (UniqueConstraint("biz_no", name="uq_violation_ticket_biz_no"),)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    biz_no = Column(String(32), nullable=False, index=True)
+    violation_id = Column(Integer, nullable=True, index=True)
+    process_type = Column(String(64), nullable=False)
+    remark = Column(Text, nullable=True)
+    amount = Column(Float, nullable=False, default=0.0)
+    status = Column(String(16), nullable=False, default="待处理")
+    created_by_name = Column(String(64), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class Jt808AlarmSyncState(Base):
+    """新 JT808 OpenAPI 主动安全同步游标。"""
+
+    __tablename__ = "jt808_alarm_sync_state"
+    source = Column(String(32), primary_key=True)
+    last_window_start_at = Column(DateTime, nullable=True)
+    last_window_end_at = Column(DateTime, nullable=True)
+    last_success_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    last_total = Column(Integer, nullable=False, default=0, server_default="0")
+    last_inserted = Column(Integer, nullable=False, default=0, server_default="0")
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 class UserLoginLog(Base):

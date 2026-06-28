@@ -63,12 +63,90 @@ async def init_models() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         if "sqlite" in DATABASE_URL:
+            cols = await conn.exec_driver_sql("PRAGMA table_info(sys_user)")
+            names = {row[1] for row in cols.fetchall()}
+            if names:
+                if "valid_until" not in names:
+                    await conn.exec_driver_sql("ALTER TABLE sys_user ADD COLUMN valid_until DATE")
+                if "single_login" not in names:
+                    await conn.exec_driver_sql("ALTER TABLE sys_user ADD COLUMN single_login BOOLEAN DEFAULT 0")
+                if "login_session_token" not in names:
+                    await conn.exec_driver_sql("ALTER TABLE sys_user ADD COLUMN login_session_token VARCHAR(64)")
+                if "identity" not in names:
+                    await conn.exec_driver_sql("ALTER TABLE sys_user ADD COLUMN identity VARCHAR(64)")
+                if "phone" not in names:
+                    await conn.exec_driver_sql("ALTER TABLE sys_user ADD COLUMN phone VARCHAR(32)")
             cols = await conn.exec_driver_sql("PRAGMA table_info(map_rule_category)")
             names = {row[1] for row in cols.fetchall()}
             if "weather_types" not in names:
                 await conn.exec_driver_sql("ALTER TABLE map_rule_category ADD COLUMN weather_types JSON")
             if "weather_speed_limits" not in names:
                 await conn.exec_driver_sql("ALTER TABLE map_rule_category ADD COLUMN weather_speed_limits JSON")
+            cols = await conn.exec_driver_sql("PRAGMA table_info(private_map_rule)")
+            names = {row[1] for row in cols.fetchall()}
+            if "category_ids" not in names:
+                await conn.exec_driver_sql("ALTER TABLE private_map_rule ADD COLUMN category_ids JSON")
+            cols = await conn.exec_driver_sql("PRAGMA table_info(vehicle_violation)")
+            names = {row[1] for row in cols.fetchall()}
+            if names:
+                if "external_alarm_id" not in names:
+                    await conn.exec_driver_sql("ALTER TABLE vehicle_violation ADD COLUMN external_alarm_id VARCHAR(128)")
+                    await conn.exec_driver_sql(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS ix_vehicle_violation_external_alarm_id "
+                        "ON vehicle_violation(external_alarm_id)"
+                    )
+                if "ttx_evidence_refs" not in names:
+                    await conn.exec_driver_sql("ALTER TABLE vehicle_violation ADD COLUMN ttx_evidence_refs TEXT")
+                if "stream_snapshot_refs" not in names:
+                    await conn.exec_driver_sql("ALTER TABLE vehicle_violation ADD COLUMN stream_snapshot_refs TEXT")
+                if "pre_audit_kind" not in names:
+                    await conn.exec_driver_sql("ALTER TABLE vehicle_violation ADD COLUMN pre_audit_kind VARCHAR(16)")
+                if "ticket_appeal_attachment_refs" not in names:
+                    await conn.exec_driver_sql("ALTER TABLE vehicle_violation ADD COLUMN ticket_appeal_attachment_refs TEXT")
+            cols = await conn.exec_driver_sql("PRAGMA table_info(vehicle_location)")
+            names = {row[1] for row in cols.fetchall()}
+            if names and "source" not in names:
+                await conn.exec_driver_sql("ALTER TABLE vehicle_location ADD COLUMN source VARCHAR(32) DEFAULT 'jt808_openapi'")
+            cols = await conn.exec_driver_sql("PRAGMA table_info(violation_ticket)")
+            names = {row[1] for row in cols.fetchall()}
+            if names and "created_by_name" not in names:
+                await conn.exec_driver_sql("ALTER TABLE violation_ticket ADD COLUMN created_by_name VARCHAR(64)")
+            cols = await conn.exec_driver_sql("PRAGMA table_info(vehicle)")
+            names = {row[1] for row in cols.fetchall()}
+            if names:
+                for col_name, col_type in (
+                    ("vehicle_category", "VARCHAR(16)"),
+                    ("driver_name", "VARCHAR(64)"),
+                    ("engine_displacement", "VARCHAR(32)"),
+                    ("fuel_tank_capacity", "VARCHAR(32)"),
+                    ("battery_capacity", "VARCHAR(32)"),
+                    ("range_mileage", "VARCHAR(32)"),
+                    ("battery_no", "VARCHAR(64)"),
+                    ("motor_no", "VARCHAR(64)"),
+                ):
+                    if col_name not in names:
+                        await conn.exec_driver_sql(f"ALTER TABLE vehicle ADD COLUMN {col_name} {col_type}")
+            cols = await conn.exec_driver_sql("PRAGMA table_info(vehicle_device)")
+            names = {row[1] for row in cols.fetchall()}
+            if names and "channels" not in names:
+                await conn.exec_driver_sql("ALTER TABLE vehicle_device ADD COLUMN channels JSON")
+            cols = await conn.exec_driver_sql("PRAGMA table_info(driver)")
+            names = {row[1] for row in cols.fetchall()}
+            if names:
+                for col_name, col_type in (
+                    ("certificate_code", "VARCHAR(64)"),
+                    ("entry_date", "DATE"),
+                    ("license_issue_date", "DATE"),
+                    ("driver_type", "VARCHAR(16)"),
+                    ("license_expiry", "VARCHAR(32)"),
+                    ("drive_hours", "INTEGER"),
+                    ("drive_mileage", "INTEGER"),
+                    ("score", "INTEGER"),
+                    ("native_place", "VARCHAR(128)"),
+                    ("avatar_url", "VARCHAR(256)"),
+                ):
+                    if col_name not in names:
+                        await conn.exec_driver_sql(f"ALTER TABLE driver ADD COLUMN {col_name} {col_type}")
 
 
 async def get_db():

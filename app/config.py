@@ -38,5 +38,21 @@ class Settings(BaseSettings):
     jt808_mysql_password: str = "lgx123"
     jt808_mysql_database: str = "jt808"
 
+    # ---- 新 JT808 OpenAPI：主动安全报警全局调度拉取 ----
+    # 文档见 docs/api.docx；用于 1200/1210/1201/1208/1209。
+    jt808_openapi_base_url: str = "https://www.gb35658.com/lingx3api"
+    jt808_openapi_account: str = ""
+    jt808_openapi_password: str = ""
+    jt808_openapi_password_hashed: bool = False
+    jt808_openapi_apitoken: str = ""
+    jt808_openapi_timeout: float = 15.0
+
+    # 默认关闭，配置好账号后再启用；避免开发环境启动后误拉生产数据。
+    jt808_alarm_sync_enabled: bool = False
+    jt808_alarm_sync_interval_seconds: int = 60
+    jt808_alarm_sync_lookback_minutes: int = 5
+    jt808_alarm_sync_page_size: int = 100
+    jt808_alarm_sync_max_pages: int = 20
+
 
 settings = Settings()

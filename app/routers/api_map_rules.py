@@ -80,6 +80,8 @@ async def map_api_config_get(
     db: AsyncSession = Depends(get_db),
 ):
     row = await db.scalar(select(MapApiConfig).where(MapApiConfig.provider == (provider or "amap")).limit(1))
+    if row is not None:
+        await db.refresh(row)
     return {"ok": True, "data": _map_config_out(row) if row else None}
 
 
@@ -100,6 +102,7 @@ async def map_api_config_put(body: MapApiConfigBody, db: AsyncSession = Depends(
         row.default_center_lat = body.default_center_lat
     row.remark = (body.remark or "").strip() or None
     await db.flush()
+    await db.refresh(row)
     return {"ok": True, "data": _map_config_out(row)}
 
 
@@ -226,6 +229,10 @@ class PrivateMapRuleUpdateBody(BaseModel):
     remark: str | None = Field(None, max_length=255)
 
 
+class PrivateRuleCategoryAssignBody(BaseModel):
+    category_ids: list[int] = Field(default_factory=list)
+
+
 def _private_rule_out(row: PrivateMapRule) -> dict:
     return {
         "id": row.id,
@@ -237,6 +244,7 @@ def _private_rule_out(row: PrivateMapRule) -> dict:
         "geometry_json": row.geometry_json,
         "speed_limit_kmh": row.speed_limit_kmh,
         "ref_public_rule_id": row.ref_public_rule_id,
+        "category_ids": _normalize_vehicle_ids(row.category_ids if isinstance(row.category_ids, list) else []),
         "remark": row.remark,
         "created_at": row.created_at.strftime("%Y-%m-%d %H:%M:%S") if row.created_at else None,
         "updated_at": row.updated_at.strftime("%Y-%m-%d %H:%M:%S") if row.updated_at else None,
@@ -595,6 +603,81 @@ async def private_map_rule_get(
     return {"ok": True, "data": _private_rule_out(row)}
 
 
+@router.get("/private-map-rules/{rid}/categories")
+async def private_map_rule_categories_get(
+    rid: int,
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    cid = await _resolve_company_id(db, x_org_id)
+    row = await db.scalar(
+        select(PrivateMapRule).where(PrivateMapRule.id == rid, PrivateMapRule.company_id == cid).limit(1)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    selected_ids = _normalize_vehicle_ids(row.category_ids if isinstance(row.category_ids, list) else [])
+    rows = (
+        await db.execute(select(MapRuleCategory).where(MapRuleCategory.company_id == cid).order_by(MapRuleCategory.id.desc()))
+    ).scalars().all()
+    return {
+        "ok": True,
+        "selected_category_ids": selected_ids,
+        "items": [await _category_out(db, x) for x in rows],
+    }
+
+
+@router.put("/private-map-rules/{rid}/categories")
+async def private_map_rule_categories_put(
+    rid: int,
+    body: PrivateRuleCategoryAssignBody,
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    cid = await _resolve_company_id(db, x_org_id)
+    row = await db.scalar(
+        select(PrivateMapRule).where(PrivateMapRule.id == rid, PrivateMapRule.company_id == cid).limit(1)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    ids = _normalize_vehicle_ids(body.category_ids)
+    if ids:
+        rows = (
+            await db.execute(
+                select(MapRuleCategory.id, MapRuleCategory.type_name, MapRuleCategory.assigned_vehicle_ids)
+                .where(MapRuleCategory.company_id == cid, MapRuleCategory.id.in_(ids))
+            )
+        ).all()
+        existing = {int(rid) for rid, _, _ in rows}
+        missing = [x for x in ids if x not in existing]
+        if missing:
+            raise HTTPException(status_code=400, detail="包含不存在或不属于本公司的规则类别")
+        no_vehicle = [
+            int(rid)
+            for rid, _, vehicle_ids in rows
+            if not _normalize_vehicle_ids(vehicle_ids if isinstance(vehicle_ids, list) else [])
+        ]
+        if no_vehicle:
+            raise HTTPException(status_code=400, detail="包含未分配车辆的规则类别，不能分配")
+        vehicle_owner: dict[int, str] = {}
+        conflicts: list[str] = []
+        for rid, type_name, vehicle_ids in rows:
+            label = str(type_name or f"类别#{rid}")
+            for vid in _normalize_vehicle_ids(vehicle_ids if isinstance(vehicle_ids, list) else []):
+                if vid in vehicle_owner:
+                    conflicts.append(f"规则「{vehicle_owner[vid]}」与规则「{label}」车辆有交集")
+                    break
+                else:
+                    vehicle_owner[vid] = label
+            if conflicts:
+                break
+        if conflicts:
+            raise HTTPException(status_code=400, detail=conflicts[0])
+    row.category_ids = ids
+    await db.flush()
+    await db.refresh(row)
+    return {"ok": True, "selected_category_ids": ids, "data": _private_rule_out(row)}
+
+
 @router.post("/private-map-rules")
 async def private_map_rule_create(
     body: PrivateMapRuleCreateBody,
@@ -618,6 +701,7 @@ async def private_map_rule_create(
     )
     db.add(row)
     await db.flush()
+    await db.refresh(row)
     return {"ok": True, "id": row.id, "data": _private_rule_out(row)}
 
 
@@ -646,6 +730,7 @@ async def private_map_rule_update(
     if "remark" in data:
         row.remark = (body.remark or "").strip() or None
     await db.flush()
+    await db.refresh(row)
     return {"ok": True, "data": _private_rule_out(row)}
 
 
@@ -698,7 +783,7 @@ async def private_map_rules_batch_from_public(
         row.rule_type_code = pub.rule_type_code
         row.draw_shape_type = pub.draw_shape_type
         row.geometry_json = pub.geometry_json
-        row.speed_limit_kmh = 0
+        row.speed_limit_kmh = pub.speed_limit_kmh or 0
         row.ref_public_rule_id = public_id
         row.remark = pub.remark
     await db.flush()

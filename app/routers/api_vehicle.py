@@ -212,6 +212,7 @@ class VehicleSavePayload(BaseModel):
     vehicle_id: int | None = None
     plate_no: str = Field(..., min_length=1, max_length=16)
     plate_color: str | None = None
+    vehicle_category: str | None = None
     vehicle_type: str | None = None
     vehicle_type_ii: str | None = None
     color: str | None = None
@@ -222,6 +223,7 @@ class VehicleSavePayload(BaseModel):
     company_id: int = Field(..., ge=1)
     fleet_id: int | None = None
     driver_id: int | None = None
+    driver_name: str | None = None
     owner_name: str | None = None
     contact_name: str | None = None
     contact_phone: str | None = None
@@ -235,6 +237,12 @@ class VehicleSavePayload(BaseModel):
     status: str | None = None
     last_online_at: str | None = None
     channel_count: int | None = None
+    engine_displacement: str | None = None
+    fuel_tank_capacity: str | None = None
+    battery_capacity: str | None = None
+    range_mileage: str | None = None
+    battery_no: str | None = None
+    motor_no: str | None = None
     manufacturer: str | None = None
     brand: str | None = None
     model: str | None = None
@@ -259,6 +267,7 @@ class VehicleSavePayload(BaseModel):
     sim_no: str | None = None
     actual_sim: str | None = None
     product_model: str | None = None
+    channels: list[str] | None = None
     device_channel_no: int | None = None
 
 
@@ -311,6 +320,7 @@ async def _upsert_main_device(db: AsyncSession, vehicle_id: int, payload: Vehicl
     d.sim_no = _norm(payload.sim_no) or None
     d.actual_sim = _norm(payload.actual_sim) or None
     d.product_model = _norm(payload.product_model) or None
+    d.channels = payload.channels or []
     d.channel_no = _to_int(payload.device_channel_no, 1) or 1
 
 
@@ -339,6 +349,7 @@ async def _ensure_unique_plate_and_device(
 def _apply_vehicle_payload(v: Vehicle, co: OrgCompany, payload: VehicleSavePayload) -> None:
     v.plate_no = _norm(payload.plate_no)
     v.plate_color = _norm(payload.plate_color) or "黄牌"
+    v.vehicle_category = _norm(payload.vehicle_category) or None
     v.vehicle_type = _norm(payload.vehicle_type) or None
     v.vehicle_type_ii = _norm(payload.vehicle_type_ii) or None
     v.color = _norm(payload.color) or None
@@ -350,6 +361,7 @@ def _apply_vehicle_payload(v: Vehicle, co: OrgCompany, payload: VehicleSavePaylo
     v.company_org_code = _norm(co.org_code) or None
     v.fleet_id = payload.fleet_id
     v.driver_id = payload.driver_id if payload.driver_id and payload.driver_id > 0 else None
+    v.driver_name = _norm(payload.driver_name) or None
     v.owner_name = _norm(payload.owner_name) or None
     v.contact_name = _norm(payload.contact_name) or None
     v.contact_phone = _norm(payload.contact_phone) or None
@@ -363,6 +375,12 @@ def _apply_vehicle_payload(v: Vehicle, co: OrgCompany, payload: VehicleSavePaylo
     v.status = _norm(payload.status) or "正常"
     v.last_online_at = _to_datetime(payload.last_online_at)
     v.channel_count = _to_int(payload.channel_count, 0) or 0
+    v.engine_displacement = _norm(payload.engine_displacement) or None
+    v.fuel_tank_capacity = _norm(payload.fuel_tank_capacity) or None
+    v.battery_capacity = _norm(payload.battery_capacity) or None
+    v.range_mileage = _norm(payload.range_mileage) or None
+    v.battery_no = _norm(payload.battery_no) or None
+    v.motor_no = _norm(payload.motor_no) or None
     v.manufacturer = _norm(payload.manufacturer) or None
     v.brand = _norm(payload.brand) or None
     v.model = _norm(payload.model) or None
@@ -440,6 +458,7 @@ async def vehicle_detail(vehicle_id: int, db: AsyncSession = Depends(get_db)):
             "id": v.id,
             "plate_no": v.plate_no,
             "plate_color": v.plate_color,
+            "vehicle_category": v.vehicle_category,
             "vehicle_type": v.vehicle_type,
             "vehicle_type_ii": v.vehicle_type_ii,
             "color": v.color,
@@ -450,7 +469,7 @@ async def vehicle_detail(vehicle_id: int, db: AsyncSession = Depends(get_db)):
             "company_id": v.company_id,
             "fleet_id": v.fleet_id,
             "driver_id": v.driver_id,
-            "driver_name": driver_name,
+            "driver_name": v.driver_name or driver_name,
             "owner_name": v.owner_name,
             "contact_name": v.contact_name,
             "contact_phone": v.contact_phone,
@@ -464,6 +483,12 @@ async def vehicle_detail(vehicle_id: int, db: AsyncSession = Depends(get_db)):
             "status": v.status,
             "last_online_at": v.last_online_at.isoformat() if v.last_online_at else None,
             "channel_count": v.channel_count,
+            "engine_displacement": v.engine_displacement,
+            "fuel_tank_capacity": v.fuel_tank_capacity,
+            "battery_capacity": v.battery_capacity,
+            "range_mileage": v.range_mileage,
+            "battery_no": v.battery_no,
+            "motor_no": v.motor_no,
             "manufacturer": v.manufacturer,
             "brand": v.brand,
             "model": v.model,
@@ -489,6 +514,7 @@ async def vehicle_detail(vehicle_id: int, db: AsyncSession = Depends(get_db)):
             "sim_no": d.sim_no if d else None,
             "actual_sim": d.actual_sim if d else None,
             "product_model": d.product_model if d else None,
+            "channels": d.channels if d and d.channels else [],
             "device_channel_no": d.channel_no if d else 1,
         },
     }
@@ -711,7 +737,8 @@ async def vehicle_list(
     if status:
         q = q.where(Vehicle.status == status)
     if company_id:
-        q = q.where(Vehicle.company_id == company_id)
+        company_subtree = await collect_org_company_subtree_ids(db, int(company_id))
+        q = q.where(Vehicle.company_id.in_(company_subtree))
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
     q = q.offset((page - 1) * page_size).limit(page_size)
     rows = (await db.execute(q)).scalars().all()

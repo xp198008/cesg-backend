@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import string
-from datetime import datetime
+from datetime import date, datetime
 
 import bcrypt
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
@@ -41,6 +42,11 @@ class UserLoginPayload(BaseModel):
     password: str = Field(..., min_length=1, max_length=128)
 
 
+class UserSessionCheckPayload(BaseModel):
+    user_id: int = Field(..., ge=1)
+    session_token: str | None = Field(default=None, max_length=128)
+
+
 class UserOperationLogIn(BaseModel):
     username: str = Field(..., min_length=1, max_length=64)
     operation_content: str = Field(..., min_length=1, max_length=2000)
@@ -53,6 +59,10 @@ class UserCreatePayload(BaseModel):
     allow_pwd_edit: int = Field(default=1)
     role_id: int = Field(..., ge=1)
     user_status: int = Field(default=1)
+    valid_until: date | None = None
+    single_login: int = Field(default=0)
+    identity: str | None = Field(None, max_length=64)
+    phone: str | None = Field(None, max_length=32)
 
 
 class UserUpdatePayload(BaseModel):
@@ -62,6 +72,10 @@ class UserUpdatePayload(BaseModel):
     allow_pwd_edit: int = Field(default=1)
     role_id: int = Field(..., ge=1)
     user_status: int = Field(default=1)
+    valid_until: date | None = None
+    single_login: int = Field(default=0)
+    identity: str | None = Field(None, max_length=64)
+    phone: str | None = Field(None, max_length=32)
 
 
 class UserResetPasswordPayload(BaseModel):
@@ -80,6 +94,17 @@ def _fmt_dt(dt: datetime | None) -> str:
     if getattr(dt, "tzinfo", None) is not None:
         dt = dt.replace(tzinfo=None)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _fmt_date(d: date | None) -> str:
+    if d is None:
+        return ""
+    return d.strftime("%Y-%m-%d")
+
+
+def _norm_optional_text(value: str | None) -> str | None:
+    text = (value or "").strip()
+    return text or None
 
 
 def _effective_role_code_for_session(role: SysRole | None, username: str) -> str:
@@ -113,6 +138,7 @@ def _generate_login_password(length: int = 6) -> str:
 async def user_list(
     keyword: str | None = Query(default=None),
     role_id: int | None = Query(default=None, ge=1),
+    user_status: int | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ):
     stmt = select(SysUser).options(selectinload(SysUser.role), selectinload(SysUser.org))
@@ -124,6 +150,8 @@ async def user_list(
         )
     if role_id is not None:
         stmt = stmt.where(SysUser.role_id == role_id)
+    if user_status is not None:
+        stmt = stmt.where(SysUser.is_active == bool(int(user_status)))
     stmt = stmt.order_by(SysUser.id)
     users = (await db.execute(stmt)).scalars().all()
     out: list[dict] = []
@@ -148,6 +176,10 @@ async def user_list(
                 "role_perm": role_perm,
                 "user_status": 1 if u.is_active else 0,
                 "allow_pwd_edit": 1 if allow else 0,
+                "valid_until": _fmt_date(getattr(u, "valid_until", None)),
+                "single_login": 1 if getattr(u, "single_login", False) else 0,
+                "identity": getattr(u, "identity", None) or "",
+                "phone": getattr(u, "phone", None) or "",
                 "updated_at": _fmt_dt(u.updated_at) or _fmt_dt(u.created_at),
             }
         )
@@ -172,6 +204,10 @@ async def user_create(
     role = await db.scalar(select(SysRole).where(SysRole.id == payload.role_id).limit(1))
     if role is None:
         raise HTTPException(status_code=400, detail="角色不存在，请重新选择")
+    identity = _norm_optional_text(payload.identity)
+    phone = _norm_optional_text(payload.phone)
+    if phone and not re.fullmatch(r"1\d{10}", phone):
+        raise HTTPException(status_code=400, detail="手机号格式不正确")
     try:
         pwd_hash = bcrypt.hashpw(payload.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
         user = SysUser(
@@ -179,10 +215,14 @@ async def user_create(
             password_hash=pwd_hash,
             password_plain=payload.password,
             real_name=username,
+            identity=identity,
+            phone=phone,
             role_id=payload.role_id,
             org_id=payload.org_id,
             allow_pwd_edit=bool(int(payload.allow_pwd_edit)),
             is_active=bool(int(payload.user_status)),
+            valid_until=payload.valid_until,
+            single_login=bool(int(payload.single_login)),
         )
         db.add(user)
         await db.flush()
@@ -208,6 +248,10 @@ async def user_create(
             "role_name": role.name,
             "allow_pwd_edit": 1 if user.allow_pwd_edit else 0,
             "user_status": 1 if user.is_active else 0,
+            "valid_until": _fmt_date(user.valid_until),
+            "single_login": 1 if user.single_login else 0,
+            "identity": user.identity or "",
+            "phone": user.phone or "",
             "updated_at": _fmt_dt(user.updated_at) or _fmt_dt(user.created_at),
         },
     }
@@ -237,13 +281,21 @@ async def user_update(
     role = await db.scalar(select(SysRole).where(SysRole.id == payload.role_id).limit(1))
     if role is None:
         raise HTTPException(status_code=400, detail="角色不存在，请重新选择")
+    identity = _norm_optional_text(payload.identity)
+    phone = _norm_optional_text(payload.phone)
+    if phone and not re.fullmatch(r"1\d{10}", phone):
+        raise HTTPException(status_code=400, detail="手机号格式不正确")
     try:
         user.username = username
         user.real_name = username
+        user.identity = identity
+        user.phone = phone
         user.org_id = payload.org_id
         user.role_id = payload.role_id
         user.allow_pwd_edit = bool(int(payload.allow_pwd_edit))
         user.is_active = bool(int(payload.user_status))
+        user.valid_until = payload.valid_until
+        user.single_login = bool(int(payload.single_login))
         await db.flush()
         await db.refresh(user)
     except IntegrityError:
@@ -266,6 +318,10 @@ async def user_update(
             "role_name": role.name,
             "allow_pwd_edit": 1 if user.allow_pwd_edit else 0,
             "user_status": 1 if user.is_active else 0,
+            "valid_until": _fmt_date(user.valid_until),
+            "single_login": 1 if user.single_login else 0,
+            "identity": user.identity or "",
+            "phone": user.phone or "",
             "updated_at": _fmt_dt(user.updated_at) or _fmt_dt(user.created_at),
         },
     }
@@ -393,6 +449,8 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="当前用户已禁用，请联系管理员")
+    if user.valid_until is not None and user.valid_until < date.today():
+        raise HTTPException(status_code=403, detail="当前用户已过有效期，请联系管理员")
 
     saved_hash = user.password_hash or ""
     try:
@@ -403,6 +461,13 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
         ok = password == saved_hash
     if not ok:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    session_token = ""
+    if getattr(user, "single_login", False):
+        # 开启“单点登录”时，每次成功登录刷新 token，旧浏览器持有的 token 随即失效。
+        session_token = secrets.token_urlsafe(32)
+        user.login_session_token = session_token
+        await db.flush()
 
     role = user.role
     role_code = _effective_role_code_for_session(role, username)
@@ -439,6 +504,9 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
         "permission_ids": permission_ids,
         "allow_pwd_edit": 1 if getattr(user, "allow_pwd_edit", True) else 0,
         "user_status": 1 if user.is_active else 0,
+        "valid_until": _fmt_date(user.valid_until),
+        "single_login": 1 if user.single_login else 0,
+        "session_token": session_token,
     }
 
     try:
@@ -447,8 +515,32 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
         await db.flush()
     except Exception:
         await db.rollback()
+        if session_token:
+            fresh_user = await db.scalar(select(SysUser).where(SysUser.id == user.id).limit(1))
+            if fresh_user is not None:
+                fresh_user.login_session_token = session_token
+                await db.commit()
+    else:
+        await db.commit()
 
     return {"ok": True, "message": "登录成功", "data": data}
+
+
+@router.post("/session/check")
+async def user_session_check(payload: UserSessionCheckPayload, db: AsyncSession = Depends(get_db)):
+    user = await db.scalar(select(SysUser).where(SysUser.id == payload.user_id).limit(1))
+    if user is None:
+        raise HTTPException(status_code=401, detail="当前用户不存在，请重新登录")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="当前用户已禁用，请重新登录")
+    if user.valid_until is not None and user.valid_until < date.today():
+        raise HTTPException(status_code=403, detail="当前用户已过有效期，请重新登录")
+    if getattr(user, "single_login", False):
+        server_token = (getattr(user, "login_session_token", None) or "").strip()
+        client_token = (payload.session_token or "").strip()
+        if not server_token or not client_token or server_token != client_token:
+            raise HTTPException(status_code=409, detail="该账号已在其它设备登录，请重新登录")
+    return {"ok": True}
 
 
 @router.delete("/{user_id}")

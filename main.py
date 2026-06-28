@@ -23,14 +23,18 @@ if sys.platform == "win32":
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi import HTTPException
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.database import init_models
+from app.jt808_alarm_sync import cleanup_jt808_violations_without_evidence, jt808_alarm_scheduler
 from app.routers import (
     api_alarm_type,
     api_driver,
     api_fault_type,
+    api_jt808_alarm_sync,
     api_map_rules,
     api_org,
     api_permission_menu,
@@ -39,6 +43,10 @@ from app.routers import (
     api_user,
     api_vehicle,
     api_vehicle_alloc,
+    api_vehicle_type,
+    api_violation,
+    api_violation_ticket,
+    api_violation_type,
     api_weather,
 )
 
@@ -55,18 +63,90 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_vehicle_type_icon_media_dir = Path(__file__).resolve().parent / "data" / "vehicle_type_icons"
+_vehicle_type_icon_media_dir.mkdir(parents=True, exist_ok=True)
+
+
+@app.get("/media/vehicle-type-icons/{filename}")
+async def vehicle_type_icon_file(filename: str):
+    suffix = Path(filename).suffix.lower()
+    if Path(filename).name != filename or suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise HTTPException(status_code=404, detail="图片不存在")
+    target = _vehicle_type_icon_media_dir / filename
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="图片不存在")
+    return FileResponse(target)
+
+
+_driver_avatar_media_dir = Path(__file__).resolve().parent / "data" / "driver_avatars"
+_driver_avatar_media_dir.mkdir(parents=True, exist_ok=True)
+
+
+@app.get("/media/driver-avatars/{filename}")
+async def driver_avatar_file(filename: str):
+    suffix = Path(filename).suffix.lower()
+    if Path(filename).name != filename or suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise HTTPException(status_code=404, detail="图片不存在")
+    target = _driver_avatar_media_dir / filename
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="图片不存在")
+    return FileResponse(target)
+
+
 app.include_router(api_user.router)
 app.include_router(api_role.router)
 app.include_router(api_org.router)
 app.include_router(api_vehicle.router)
+app.include_router(api_vehicle_type.router)
 app.include_router(api_driver.router)
 app.include_router(api_alarm_type.router)
 app.include_router(api_fault_type.router)
+app.include_router(api_jt808_alarm_sync.router)
 app.include_router(api_map_rules.router)
 app.include_router(api_permission_menu.router)
 app.include_router(api_vehicle_alloc.router)
+app.include_router(api_violation.router)
+app.include_router(api_violation_ticket.router)
+app.include_router(api_violation_type.router)
 app.include_router(api_shortcut.router)
 app.include_router(api_weather.router)
+
+_ticket_appeal_media_dir = Path(__file__).resolve().parent / "data" / "ticket_appeal_attachments"
+_ticket_appeal_media_dir.mkdir(parents=True, exist_ok=True)
+app.mount(
+    "/media/ticket-appeal-attachments",
+    StaticFiles(directory=str(_ticket_appeal_media_dir)),
+    name="ticket-appeal-attachments",
+)
+
+app.mount(
+    "/media/vehicle-type-icons",
+    StaticFiles(directory=str(_vehicle_type_icon_media_dir)),
+    name="vehicle-type-icons",
+)
+
+
+async def _ensure_default_map_config() -> None:
+    """库中无地图配置时补一条高德默认记录，避免地图接口管理页空白。"""
+    from sqlalchemy import select
+
+    from app.database import AsyncSessionLocal
+    from app.models import MapApiConfig
+
+    async with AsyncSessionLocal() as s:
+        row = await s.scalar(select(MapApiConfig).where(MapApiConfig.provider == "amap").limit(1))
+        if row:
+            return
+        s.add(
+            MapApiConfig(
+                provider="amap",
+                default_zoom=12,
+                default_center_lng=106.55156,
+                default_center_lat=29.56301,
+                remark="系统默认",
+            )
+        )
+        await s.commit()
 
 
 async def _ensure_default_admin() -> None:
@@ -110,8 +190,17 @@ async def _ensure_default_admin() -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     await init_models()
+    await cleanup_jt808_violations_without_evidence()
+    await _ensure_default_map_config()
     await _ensure_default_admin()
+    await api_vehicle_type.ensure_default_vehicle_types()
+    jt808_alarm_scheduler.start()
     logger.info("CESG 业务后端已就绪：http://127.0.0.1:%s", settings.app_port)
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    await jt808_alarm_scheduler.stop()
 
 
 @app.get("/favicon.ico")
@@ -131,7 +220,7 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=settings.app_port,
-        reload=True,
+        reload=False,
         reload_excludes=["**/data/**", "**/__pycache__/**", "**/*.pyc"],
         log_level="info",
     )

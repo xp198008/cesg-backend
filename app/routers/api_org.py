@@ -357,13 +357,16 @@ async def company_list(
     page_size: int = Query(20, ge=1, le=200),
     org_code: str | None = None,
     name: str | None = None,
+    parent_id: int | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     conds = []
-    if org_code:
+    if org_code and org_code.strip():
         conds.append(OrgCompany.org_code.ilike(f"%{org_code.strip()}%"))
-    if name:
+    if name and name.strip():
         conds.append(OrgCompany.name.ilike(f"%{name.strip()}%"))
+    if parent_id is not None:
+        conds.append(OrgCompany.parent_id == parent_id)
     count_stmt = select(func.count()).select_from(OrgCompany)
     if conds:
         count_stmt = count_stmt.where(*conds)
