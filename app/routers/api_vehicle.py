@@ -251,6 +251,7 @@ class VehicleSavePayload(BaseModel):
     speed_limit: float | None = None
     track_retain_days: int | None = None
     mileage_factor: float | None = None
+    mileage_offset: float | None = None
     scrap_date: str | None = None
     inspect_date: str | None = None
     plate_login: bool | None = None
@@ -389,6 +390,7 @@ def _apply_vehicle_payload(v: Vehicle, co: OrgCompany, payload: VehicleSavePaylo
     v.speed_limit = _to_float(payload.speed_limit, 0.0) or 0.0
     v.track_retain_days = _to_int(payload.track_retain_days, 0) or 0
     v.mileage_factor = _to_float(payload.mileage_factor, None)
+    v.mileage_offset = _to_float(payload.mileage_offset, None)
     v.scrap_date = _to_date(payload.scrap_date)
     v.inspect_date = _to_date(payload.inspect_date)
     v.plate_login = _to_bool(payload.plate_login, False)
@@ -497,6 +499,7 @@ async def vehicle_detail(vehicle_id: int, db: AsyncSession = Depends(get_db)):
             "speed_limit": float(v.speed_limit) if v.speed_limit is not None else None,
             "track_retain_days": v.track_retain_days,
             "mileage_factor": float(v.mileage_factor) if v.mileage_factor is not None else None,
+            "mileage_offset": float(v.mileage_offset) if v.mileage_offset is not None else None,
             "scrap_date": str(v.scrap_date) if v.scrap_date else None,
             "inspect_date": str(v.inspect_date) if v.inspect_date else None,
             "plate_login": bool(v.plate_login),

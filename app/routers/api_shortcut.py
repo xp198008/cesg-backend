@@ -5,13 +5,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
+from app.dashboard_stats import build_home_stats
 from app.models import SysRole, SysUser, SysUserShortcut
 
 router = APIRouter(prefix="/api/shortcut", tags=["shortcut"])
@@ -188,6 +189,15 @@ async def _selected_ids(db: AsyncSession, user_id: int) -> set[str]:
         await db.execute(select(SysUserShortcut.permission_id).where(SysUserShortcut.user_id == user_id))
     ).scalars().all()
     return {str(x) for x in rows if x is not None}
+
+
+@router.get("/home-stats")
+async def shortcut_home_stats(
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """快捷桌面业务指标（待处理、今日完成）。"""
+    return await build_home_stats(db, x_org_id)
 
 
 @router.get("/permission-tree")

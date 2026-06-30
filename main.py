@@ -32,6 +32,7 @@ from app.database import init_models
 from app.jt808_alarm_sync import cleanup_jt808_violations_without_evidence, jt808_alarm_scheduler
 from app.routers import (
     api_alarm_type,
+    api_dashboard,
     api_driver,
     api_fault_type,
     api_jt808_alarm_sync,
@@ -109,6 +110,7 @@ app.include_router(api_violation.router)
 app.include_router(api_violation_ticket.router)
 app.include_router(api_violation_type.router)
 app.include_router(api_shortcut.router)
+app.include_router(api_dashboard.router)
 app.include_router(api_weather.router)
 
 _ticket_appeal_media_dir = Path(__file__).resolve().parent / "data" / "ticket_appeal_attachments"
@@ -190,6 +192,17 @@ async def _ensure_default_admin() -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     await init_models()
+    from app.database import AsyncSessionLocal
+    from app.user_online_daily import backfill_login_log_org_names, rebuild_daily_from_login_logs
+
+    async with AsyncSessionLocal() as s:
+        filled = await backfill_login_log_org_names(s)
+        if filled:
+            logger.info("已补全 %s 条登录明细的所属公司", filled)
+        rebuilt = await rebuild_daily_from_login_logs(s)
+        await s.commit()
+        if rebuilt:
+            logger.info("已重建 %s 条登录会话的用户按日在线记录", rebuilt)
     await cleanup_jt808_violations_without_evidence()
     await _ensure_default_map_config()
     await _ensure_default_admin()

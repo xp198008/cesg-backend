@@ -198,6 +198,7 @@ class Vehicle(Base):
     speed_limit = Column(Numeric(10, 2), default=0)
     track_retain_days = Column(Integer, default=0)
     mileage_factor = Column(Numeric(6, 2))
+    mileage_offset = Column(Numeric(10, 2), nullable=True)
     scrap_date = Column(Date)
     inspect_date = Column(Date)
     plate_login = Column(Boolean, default=False)
@@ -524,14 +525,53 @@ class Jt808AlarmSyncState(Base):
 class UserLoginLog(Base):
     __tablename__ = "user_login_log"
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=True, index=True)
     username = Column(String(64), nullable=False, index=True)
+    real_name = Column(String(64), nullable=True)
+    org_id = Column(Integer, nullable=True)
+    org_name = Column(String(128), nullable=True)
+    role_id = Column(Integer, nullable=True)
+    role_name = Column(String(64), nullable=True)
     login_ip = Column(String(64), nullable=False, server_default="")
+    login_method = Column(String(32), nullable=False, server_default="web")
     login_at = Column(DateTime, nullable=False, server_default=func.now(), index=True)
+    logout_at = Column(DateTime, nullable=True, index=True)
+    online_seconds = Column(Integer, nullable=True)
+    last_heartbeat_at = Column(DateTime, nullable=True)
+
+
+class UserOnlineDaily(Base):
+    """用户按日在线时长汇总（报表 user-online-duration 数据源）。"""
+    __tablename__ = "user_online_daily"
+    __table_args__ = (UniqueConstraint("username", "stat_date", name="uq_user_online_daily_username_date"),)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=True, index=True)
+    username = Column(String(64), nullable=False, index=True)
+    real_name = Column(String(64), nullable=True)
+    org_id = Column(Integer, nullable=True)
+    org_name = Column(String(128), nullable=True)
+    stat_date = Column(Date, nullable=False, index=True)
+    online_seconds = Column(Integer, nullable=False, default=0, server_default="0")
+    login_count = Column(Integer, nullable=False, default=0, server_default="0")
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 class UserOperationLog(Base):
     __tablename__ = "user_operation_log"
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=True, index=True)
     username = Column(String(64), nullable=False, index=True)
+    real_name = Column(String(64), nullable=True)
+    org_id = Column(Integer, nullable=True)
+    org_name = Column(String(128), nullable=True)
+    module = Column(String(64), nullable=True)
+    menu = Column(String(64), nullable=True)
+    action = Column(String(64), nullable=True)
     operation_content = Column(Text, nullable=False)
+    operation_ip = Column(String(64), nullable=True)
+    result = Column(String(16), nullable=False, server_default="成功")
+    vehicle = Column(String(32), nullable=True)
+    plate_color = Column(String(16), nullable=True)
+    device_no = Column(String(64), nullable=True)
+    source = Column(String(16), nullable=False, server_default="manual", index=True)
     created_at = Column(DateTime, nullable=False, server_default=func.now(), index=True)

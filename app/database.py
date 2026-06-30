@@ -123,6 +123,7 @@ async def init_models() -> None:
                     ("range_mileage", "VARCHAR(32)"),
                     ("battery_no", "VARCHAR(64)"),
                     ("motor_no", "VARCHAR(64)"),
+                    ("mileage_offset", "NUMERIC(10, 2)"),
                 ):
                     if col_name not in names:
                         await conn.exec_driver_sql(f"ALTER TABLE vehicle ADD COLUMN {col_name} {col_type}")
@@ -147,6 +148,43 @@ async def init_models() -> None:
                 ):
                     if col_name not in names:
                         await conn.exec_driver_sql(f"ALTER TABLE driver ADD COLUMN {col_name} {col_type}")
+            cols = await conn.exec_driver_sql("PRAGMA table_info(user_login_log)")
+            names = {row[1] for row in cols.fetchall()}
+            if names:
+                for col_name, col_type in (
+                    ("user_id", "INTEGER"),
+                    ("real_name", "VARCHAR(64)"),
+                    ("org_id", "INTEGER"),
+                    ("org_name", "VARCHAR(128)"),
+                    ("role_id", "INTEGER"),
+                    ("role_name", "VARCHAR(64)"),
+                    ("logout_at", "DATETIME"),
+                    ("login_method", "VARCHAR(32) DEFAULT 'web'"),
+                    ("online_seconds", "INTEGER"),
+                    ("last_heartbeat_at", "DATETIME"),
+                ):
+                    if col_name not in names:
+                        await conn.exec_driver_sql(f"ALTER TABLE user_login_log ADD COLUMN {col_name} {col_type}")
+            cols = await conn.exec_driver_sql("PRAGMA table_info(user_operation_log)")
+            names = {row[1] for row in cols.fetchall()}
+            if names:
+                for col_name, col_type in (
+                    ("user_id", "INTEGER"),
+                    ("real_name", "VARCHAR(64)"),
+                    ("org_id", "INTEGER"),
+                    ("org_name", "VARCHAR(128)"),
+                    ("module", "VARCHAR(64)"),
+                    ("menu", "VARCHAR(64)"),
+                    ("action", "VARCHAR(64)"),
+                    ("operation_ip", "VARCHAR(64)"),
+                    ("result", "VARCHAR(16) DEFAULT '成功'"),
+                    ("vehicle", "VARCHAR(32)"),
+                    ("plate_color", "VARCHAR(16)"),
+                    ("device_no", "VARCHAR(64)"),
+                    ("source", "VARCHAR(16) DEFAULT 'manual'"),
+                ):
+                    if col_name not in names:
+                        await conn.exec_driver_sql(f"ALTER TABLE user_operation_log ADD COLUMN {col_name} {col_type}")
 
 
 async def get_db():

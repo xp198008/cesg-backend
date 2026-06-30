@@ -1,7 +1,6 @@
 """新 JT808 OpenAPI 客户端。
 
-接口文档：docs/api.docx。这里仅封装主动安全第一阶段需要的接口：
-1200/1210 token、1201 位置、1208 ADAS、1209 DSM。
+接口文档：docs/api.docx。封装 token、定位、报警与统计相关接口。
 """
 from __future__ import annotations
 
@@ -164,6 +163,38 @@ class Jt808OpenApiClient:
                 "text": text,
                 "page": page,
                 "rows": rows,
+            }
+        )
+
+    async def list_vehicle_alarms(
+        self,
+        stime: str,
+        etime: str,
+        *,
+        page: int = 1,
+        rows: int = 1,
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
+        """1207 获取车辆报警数据列表。"""
+        payload: dict[str, Any] = {
+            "apicode": 1207,
+            "lingxtoken": await self.token(),
+            "stime": stime,
+            "etime": etime,
+            "page": page,
+            "rows": rows,
+        }
+        if device_id:
+            payload["deviceId"] = device_id
+        return await self._post(payload)
+
+    async def list_latest_data(self, *, text: str | None = None) -> dict[str, Any]:
+        """1241 最新数据接口（全量最新快照，含 online 字段）。"""
+        return await self._post(
+            {
+                "apicode": 1241,
+                "lingxtoken": await self.token(),
+                "text": text,
             }
         )
 
