@@ -19,62 +19,86 @@ router = APIRouter(prefix="/api/shortcut", tags=["shortcut"])
 
 _DATA_FILE = Path(__file__).resolve().parent.parent / "data" / "permission_menu.json"
 
+# permission_id → Vue 路由（与 jt808-vue3 shortcutRoutes.js 对齐；点击跳转以前端 MAP 为准）
 _SHORTCUT_META: dict[str, dict[str, str]] = {
-    "1": {"url": "../board_page/board.html", "icon": "./images/svg/icon-zhihuikanban.svg"},
-    "11": {"url": "../board_page/board.html", "icon": "./images/svg/icon-zhihuikanban.svg"},
-    "12": {"url": "../board_page/security_board.html", "icon": "./images/svg/icon-zhihuikanban.svg"},
-    "15": {"url": "../board_page/obd_board.html", "icon": "./images/svg/icon-zhihuikanban.svg"},
-    "2": {"url": "../dashboard_page/dashboard.html", "icon": "./images/svg/icon-zhihuikanban.svg"},
-    "3": {"url": "../monitoring_center/index.html", "icon": "./images/svg/icon-jiankong.svg"},
-    "31": {"url": "../monitoring_center/index.html", "icon": "./images/svg/icon-jiankong.svg"},
-    "32": {"url": "../monitoring_center/history_playback.html", "icon": "./images/svg/icon-jiankong.svg"},
-    "33": {"url": "../monitoring_center/group_monitoring.html", "icon": "./images/svg/icon-jiankong.svg"},
-    "321": {"url": "../monitoring_center/history_playback.html", "icon": "./images/svg/icon-jiankong.svg"},
-    "324": {"url": "../monitoring_center/multi_car_trajectory.html", "icon": "./images/svg/icon-jiankong.svg"},
-    "325": {"url": "../monitoring_center/security_monitoring.html", "icon": "./images/svg/icon-jiankong.svg"},
+    "1": {"url": "/main/board", "icon": "./images/svg/icon-zhihuikanban.svg"},
+    "2": {"url": "/main/home", "icon": "./images/svg/icon-zhihuikanban.svg"},
+    "3": {"url": "/main/realtime", "icon": "./images/svg/icon-jiankong.svg"},
+    "31": {"url": "/main/realtime", "icon": "./images/svg/icon-jiankong.svg"},
+    "311": {"url": "/main/realtimealarm", "icon": "./images/svg/icon-jiankong.svg"},
+    "321": {"url": "/main/videohistory", "icon": "./images/svg/icon-jiankong.svg"},
+    "322": {"url": "/main/postsitionhistory", "icon": "./images/svg/icon-jiankong.svg"},
+    "323": {"url": "/main/history", "icon": "./images/svg/icon-jiankong.svg"},
+    "324": {"url": "/main/postsitionhistorygroup", "icon": "./images/svg/icon-jiankong.svg"},
+    "33": {"url": "/main/realtimegroup", "icon": "./images/svg/icon-jiankong.svg"},
+    "325": {"url": "/main/realtimealarm", "icon": "./images/svg/icon-jiankong.svg"},
     "4": {"url": "/main/vehicle/fault/manual", "icon": "./images/svg/icon-carmanage.svg"},
     "411": {"url": "/main/vehicle/violation/manual", "icon": "./images/svg/icon-carmanage.svg"},
     "412": {"url": "/main/vehicle/violation/instruction", "icon": "./images/svg/icon-carmanage.svg"},
     "413": {"url": "/main/vehicle/violation/review", "icon": "./images/svg/icon-carmanage.svg"},
     "414": {"url": "/main/vehicle/violation/appeal", "icon": "./images/svg/icon-carmanage.svg"},
+    "421": {"url": "/main/vehicle/repair/list", "icon": "./images/svg/icon-carmanage.svg"},
+    "422": {"url": "/main/vehicle/repair/entry", "icon": "./images/svg/icon-carmanage.svg"},
+    "423": {"url": "/main/vehicle/repair/review", "icon": "./images/svg/icon-carmanage.svg"},
+    "424": {"url": "/main/vehicle/repair/uploaded", "icon": "./images/svg/icon-carmanage.svg"},
     "431": {"url": "/main/vehicle/fault/manual", "icon": "./images/svg/icon-carmanage.svg"},
     "432": {"url": "/main/vehicle/fault/handle", "icon": "./images/svg/icon-carmanage.svg"},
     "433": {"url": "/main/vehicle/fault/review", "icon": "./images/svg/icon-carmanage.svg"},
-    "5": {"url": "../map_manage/geofence_manage.html", "icon": "./images/svg/icon-ditu.svg"},
-    "51": {"url": "../map_manage/map_api_manage.html", "icon": "./images/svg/icon-ditu.svg"},
-    "52": {"url": "../map_manage/geofence_manage.html", "icon": "./images/svg/icon-ditu.svg"},
-    "6": {"url": "../stats_report/mileage_report.html", "icon": "./images/svg/icon-tongji.svg"},
-    "611": {"url": "../stats_report/mileage_report.html", "icon": "./images/svg/icon-tongji.svg"},
-    "626": {"url": "../stats_report/vehicle_work_daily_report.html", "icon": "./images/svg/icon-tongji.svg"},
-    "641": {"url": "../stats_report/vehicle_offline_report.html", "icon": "./images/svg/icon-tongji.svg"},
-    "7": {"url": "../ops_manage/rule_maintenance.html", "icon": "./images/svg/icon-yunying.svg"},
-    "71": {"url": "../ops_manage/rule_maintenance.html", "icon": "./images/svg/icon-yunying.svg"},
-    "72": {"url": "../ops_manage/speed_limit_area.html", "icon": "./images/svg/icon-yunying.svg"},
-    "73": {"url": "../ops_manage/speed_limit_weather.html", "icon": "./images/svg/icon-yunying.svg"},
-    "8": {"url": "../safety_manage/active_safety_alarm.html", "icon": "./images/svg/icon-anquan.svg"},
-    "81": {"url": "../safety_manage/active_safety_alarm.html", "icon": "./images/svg/icon-anquan.svg"},
-    "82": {"url": "../safety_manage/active_safety_alarm_appeal_audit.html", "icon": "./images/svg/icon-anquan.svg"},
-    "83": {"url": "../safety_manage/active_safety_evidence_query.html", "icon": "./images/svg/icon-anquan.svg"},
-    "84": {"url": "../safety_manage/alarm_false_positive_query.html", "icon": "./images/svg/icon-anquan.svg"},
-    "85": {"url": "../safety_manage/ticket_processing.html", "icon": "./images/svg/icon-anquan.svg"},
-    "87": {"url": "../safety_manage/driver_identity_report.html", "icon": "./images/svg/icon-anquan.svg"},
-    "88": {"url": "../safety_manage/driver_identity_query.html", "icon": "./images/svg/icon-anquan.svg"},
-    "89": {"url": "../safety_manage/comprehensive_key_alarm_process.html", "icon": "./images/svg/icon-anquan.svg"},
-    "9": {"url": "../system_manage/system_config.html", "icon": "./images/svg/icon-xitong.svg"},
-    "91": {"url": "../system_manage/system_config.html", "icon": "./images/svg/icon-xitong.svg"},
-    "92": {"url": "../system_manage/system_config.html", "icon": "./images/svg/icon-xitong.svg"},
-    "10": {"url": "../basic_data_manage/org_manage.html", "icon": "./images/svg/icon-jichushuju.svg"},
-    "100": {"url": "../basic_data_manage/vehicle_type_manage.html", "icon": "./images/svg/icon-jichushuju.svg"},
-    "101": {"url": "../basic_data_manage/user_info.html", "icon": "./images/svg/icon-jichushuju.svg"},
-    "102": {"url": "../basic_data_manage/vehicle_info.html", "icon": "./images/svg/icon-jichushuju.svg"},
-    "103": {"url": "../basic_data_manage/driver_info.html", "icon": "./images/svg/icon-jichushuju.svg"},
-    "105": {"url": "../basic_data_manage/org_manage.html", "icon": "./images/svg/icon-jichushuju.svg"},
-    "106": {"url": "../basic_data_manage/team_manage.html", "icon": "./images/svg/icon-jichushuju.svg"},
-    "107": {"url": "../basic_data_manage/alarm_type.html", "icon": "./images/svg/icon-jichushuju.svg"},
-    "108": {"url": "../basic_data_manage/role_manage.html", "icon": "./images/svg/icon-jichushuju.svg"},
-    "109": {"url": "../basic_data_manage/fault_type.html", "icon": "./images/svg/icon-jichushuju.svg"},
-    "110": {"url": "../basic_data_manage/public_speed_limit_manage.html", "icon": "./images/svg/icon-jichushuju.svg"},
-    "16": {"url": "../knowledge_graph/knowledge_graph.html", "icon": "./images/svg/icon-zhihuikanban.svg"},
+    "434": {"url": "/main/vehicle/fault/upload", "icon": "./images/svg/icon-carmanage.svg"},
+    "5": {"url": "/main/map/geofence", "icon": "./images/svg/icon-ditu.svg"},
+    "51": {"url": "/main/map/config", "icon": "./images/svg/icon-ditu.svg"},
+    "52": {"url": "/main/map/geofence", "icon": "./images/svg/icon-ditu.svg"},
+    "53": {"url": "/main/map/geofence", "icon": "./images/svg/icon-ditu.svg"},
+    "6": {"url": "/main/report/mileage-summary", "icon": "./images/svg/icon-tongji.svg"},
+    "611": {"url": "/main/report/mileage-summary", "icon": "./images/svg/icon-tongji.svg"},
+    "612": {"url": "/main/report/mileage-daily", "icon": "./images/svg/icon-tongji.svg"},
+    "613": {"url": "/main/report/mileage-single", "icon": "./images/svg/icon-tongji.svg"},
+    "614": {"url": "/main/report/mileage-monthly", "icon": "./images/svg/icon-tongji.svg"},
+    "621": {"url": "/main/report/behavior-daily", "icon": "./images/svg/icon-tongji.svg"},
+    "622": {"url": "/main/report/behavior-monthly", "icon": "./images/svg/icon-tongji.svg"},
+    "623": {"url": "/main/report/behavior-query", "icon": "./images/svg/icon-tongji.svg"},
+    "624": {"url": "/main/report/behavior-statistics", "icon": "./images/svg/icon-tongji.svg"},
+    "625": {"url": "/main/report/behavior-track", "icon": "./images/svg/icon-tongji.svg"},
+    "626": {"url": "/main/report/travel-work-daily", "icon": "./images/svg/icon-tongji.svg"},
+    "631": {"url": "/main/report/travel-stop-summary", "icon": "./images/svg/icon-tongji.svg"},
+    "632": {"url": "/main/report/travel-stop-detail", "icon": "./images/svg/icon-tongji.svg"},
+    "633": {"url": "/main/report/travel-driving-summary", "icon": "./images/svg/icon-tongji.svg"},
+    "634": {"url": "/main/report/travel-driving-detail", "icon": "./images/svg/icon-tongji.svg"},
+    "635": {"url": "/main/report/travel-acc-statistics", "icon": "./images/svg/icon-tongji.svg"},
+    "636": {"url": "/main/report/travel-acc-query", "icon": "./images/svg/icon-tongji.svg"},
+    "637": {"url": "/main/report/travel-acc-daily", "icon": "./images/svg/icon-tongji.svg"},
+    "638": {"url": "/main/report/travel-trip-detail", "icon": "./images/svg/icon-tongji.svg"},
+    "641": {"url": "/main/report/travel-offline-detail", "icon": "./images/svg/icon-tongji.svg"},
+    "642": {"url": "/main/report/travel-fuel", "icon": "./images/svg/icon-tongji.svg"},
+    "651": {"url": "/main/report/alarm-statistics", "icon": "./images/svg/icon-tongji.svg"},
+    "652": {"url": "/main/report/alarm-key-query", "icon": "./images/svg/icon-tongji.svg"},
+    "7": {"url": "/main/rule/fatigue", "icon": "./images/svg/icon-yunying.svg"},
+    "71": {"url": "/main/rule/fatigue", "icon": "./images/svg/icon-yunying.svg"},
+    "72": {"url": "/main/map/private-speed", "icon": "./images/svg/icon-yunying.svg"},
+    "73": {"url": "/main/rule/sensor", "icon": "./images/svg/icon-yunying.svg"},
+    "8": {"url": "/main/safety/active-alarm", "icon": "./images/svg/icon-anquan.svg"},
+    "81": {"url": "/main/safety/active-alarm", "icon": "./images/svg/icon-anquan.svg"},
+    "82": {"url": "/main/safety/alarm-audit", "icon": "./images/svg/icon-anquan.svg"},
+    "83": {"url": "/main/safety/evidence-query", "icon": "./images/svg/icon-anquan.svg"},
+    "84": {"url": "/main/safety/false-positive", "icon": "./images/svg/icon-anquan.svg"},
+    "85": {"url": "/main/safety/ticket-processing", "icon": "./images/svg/icon-anquan.svg"},
+    "86": {"url": "/main/safety/ticket-archive", "icon": "./images/svg/icon-anquan.svg"},
+    "89": {"url": "/main/safety/key-alarm-process", "icon": "./images/svg/icon-anquan.svg"},
+    "9": {"url": "/main/system", "icon": "./images/svg/icon-xitong.svg"},
+    "91": {"url": "/main/system", "icon": "./images/svg/icon-xitong.svg"},
+    "92": {"url": "/main/system", "icon": "./images/svg/icon-xitong.svg"},
+    "10": {"url": "/main/base/org", "icon": "./images/svg/icon-jichushuju.svg"},
+    "100": {"url": "/main/base/vehicle-types", "icon": "./images/svg/icon-jichushuju.svg"},
+    "101": {"url": "/main/base/users", "icon": "./images/svg/icon-jichushuju.svg"},
+    "102": {"url": "/main/base/vehicles", "icon": "./images/svg/icon-jichushuju.svg"},
+    "103": {"url": "/main/base/drivers", "icon": "./images/svg/icon-jichushuju.svg"},
+    "105": {"url": "/main/base/org", "icon": "./images/svg/icon-jichushuju.svg"},
+    "106": {"url": "/main/base/vehicle-assignment", "icon": "./images/svg/icon-jichushuju.svg"},
+    "107": {"url": "/main/base/alarms", "icon": "./images/svg/icon-jichushuju.svg"},
+    "108": {"url": "/main/base/roles", "icon": "./images/svg/icon-jichushuju.svg"},
+    "109": {"url": "/main/base/faults", "icon": "./images/svg/icon-jichushuju.svg"},
+    "110": {"url": "/main/base/speed-rules", "icon": "./images/svg/icon-jichushuju.svg"},
+    "16": {"url": "http://113.207.68.94:5002", "icon": "./images/svg/icon-zhihuikanban.svg"},
 }
 
 
@@ -209,6 +233,48 @@ async def shortcut_permission_tree(user_id: int = Query(..., ge=1), db: AsyncSes
     return {"ok": True, "tree": _filter_tree(_read_tree(), allowed_ids, checked_ids)}
 
 
+async def _migrate_legacy_board_shortcuts(
+    db: AsyncSession,
+    user_id: int,
+    rows: list[SysUserShortcut],
+    allowed: dict[str, dict[str, Any]],
+) -> None:
+    """将已废弃的看板子页快捷项(11/12/15)合并为智慧看板(1)并写回数据库。"""
+    legacy_board_ids = {"11", "12", "15"}
+    meta_one = allowed.get("1")
+    if not meta_one:
+        return
+    touched = False
+    for row in rows:
+        if str(row.permission_id) not in legacy_board_ids:
+            continue
+        row.permission_id = "1"
+        row.title = meta_one["title"]
+        row.url = meta_one["url"]
+        row.icon = meta_one.get("icon") or row.icon
+        touched = True
+    if not touched:
+        return
+    await db.flush()
+    # 去重：同一用户只保留一条 id=1
+    rows_after = (
+        await db.execute(
+            select(SysUserShortcut)
+            .where(SysUserShortcut.user_id == user_id)
+            .order_by(SysUserShortcut.sort_order.asc(), SysUserShortcut.id.asc())
+        )
+    ).scalars().all()
+    seen_one = False
+    for row in rows_after:
+        if str(row.permission_id) != "1":
+            continue
+        if seen_one:
+            await db.delete(row)
+        else:
+            seen_one = True
+    await db.flush()
+
+
 @router.get("/list")
 async def shortcut_list(user_id: int = Query(..., ge=1), db: AsyncSession = Depends(get_db)):
     user = await _load_user(db, user_id)
@@ -220,10 +286,20 @@ async def shortcut_list(user_id: int = Query(..., ge=1), db: AsyncSession = Depe
             .order_by(SysUserShortcut.sort_order.asc(), SysUserShortcut.id.asc())
         )
     ).scalars().all()
+    await _migrate_legacy_board_shortcuts(db, user_id, list(rows), allowed)
+    rows = (
+        await db.execute(
+            select(SysUserShortcut)
+            .where(SysUserShortcut.user_id == user_id)
+            .order_by(SysUserShortcut.sort_order.asc(), SysUserShortcut.id.asc())
+        )
+    ).scalars().all()
     out: list[dict[str, Any]] = []
     for row in rows:
         pid = str(row.permission_id)
         if pid not in allowed:
+            continue
+        if any(item.get("permission_id") == pid for item in out):
             continue
         meta = allowed[pid]
         out.append(
@@ -242,10 +318,13 @@ async def shortcut_list(user_id: int = Query(..., ge=1), db: AsyncSession = Depe
 async def shortcut_save(payload: ShortcutSavePayload, db: AsyncSession = Depends(get_db)):
     user = await _load_user(db, payload.user_id)
     allowed = _allowed_shortcut_entries(user)
+    legacy_board_ids = {"11", "12", "15"}
     selected: list[str] = []
     seen: set[str] = set()
     for x in payload.permission_ids:
         pid = str(x).strip()
+        if pid in legacy_board_ids:
+            pid = "1"
         if not pid or pid in seen or pid not in allowed:
             continue
         seen.add(pid)
