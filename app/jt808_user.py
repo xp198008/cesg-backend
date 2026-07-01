@@ -65,6 +65,15 @@ def _connect() -> pymysql.connections.Connection:
     )
 
 
+def _open_connection() -> pymysql.connections.Connection | None:
+    """建立 MySQL 连接；隧道/网络不可达时返回 None，避免向上抛出 500。"""
+    try:
+        return _connect()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("JT808 MySQL 连接失败: %s", e)
+        return None
+
+
 def _get_default_role_org(cur: pymysql.cursors.Cursor) -> tuple[str, str]:
     global _default_role_org
     if _default_role_org:
@@ -104,7 +113,9 @@ def _sync_create(
     is_active: bool,
     group_id: int | None,
 ) -> str | None:
-    conn = _connect()
+    conn = _open_connection()
+    if conn is None:
+        return None
     try:
         with conn.cursor() as cur:
             role_id, org_id = _get_default_role_org(cur)
@@ -172,7 +183,9 @@ def _sync_update(
     group_id: int | None,
     plain_password: str | None,
 ) -> str | None:
-    conn = _connect()
+    conn = _open_connection()
+    if conn is None:
+        return None
     try:
         with conn.cursor() as cur:
             uid = jt808_user_id or _find_user_id(cur, account) or (
@@ -215,7 +228,9 @@ def _sync_update(
 
 
 def _sync_set_password(jt808_user_id: str | None, account: str, plain_password: str) -> bool:
-    conn = _connect()
+    conn = _open_connection()
+    if conn is None:
+        return False
     try:
         with conn.cursor() as cur:
             uid = jt808_user_id or _find_user_id(cur, account)
@@ -255,7 +270,9 @@ def _sync_delete(jt808_user_id: str | None, account: str) -> bool:
     if (account or "").strip().lower() == settings.jt808_admin_account.lower():
         logger.warning("JT808 跳过删除内置管理员 account=%s", account)
         return False
-    conn = _connect()
+    conn = _open_connection()
+    if conn is None:
+        return False
     try:
         with conn.cursor() as cur:
             uid = jt808_user_id or _find_user_id(cur, account)
@@ -378,7 +395,9 @@ async def bg_update(user_id: int, old_username: str | None = None) -> None:
 
 async def _lookup_jt808_id(account: str) -> str | None:
     def _lookup() -> str | None:
-        conn = _connect()
+        conn = _open_connection()
+        if conn is None:
+            return None
         try:
             with conn.cursor() as cur:
                 return _find_user_id(cur, account)
@@ -388,25 +407,67 @@ async def _lookup_jt808_id(account: str) -> str | None:
     return await asyncio.to_thread(_lookup)
 
 
-async def bg_set_password(user_id: int, plain_password: str) -> None:
+async def sync_set_password(user_id: int, plain_password: str) -> dict[str, Any]:
+    """同步用户密码到 808 MySQL；808 无账号时补建。返回同步结果供 API 反馈前端。"""
     if not _enabled():
-        return
-    data = await _load_user(user_id)
-    if not data or not data["username"]:
-        return
-    ok = await asyncio.to_thread(
-        _sync_set_password,
-        data["jt808_user_id"],
-        data["username"],
-        plain_password,
-    )
-    if ok and not data["jt808_user_id"]:
-        uid = await _lookup_jt808_id(data["username"])
-        if uid:
-            try:
-                await _backfill_jt808_user_id(user_id, uid)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("回写 jt808_user_id 失败 user_id=%s: %s", user_id, e)
+        return {"ok": True, "skipped": True, "reason": "jt808_sync_disabled"}
+    try:
+        data = await _load_user(user_id)
+        if not data or not data["username"]:
+            return {"ok": False, "message": "用户数据不完整，无法同步 808"}
+
+        ok = await asyncio.to_thread(
+            _sync_set_password,
+            data["jt808_user_id"],
+            data["username"],
+            plain_password,
+        )
+        created = False
+        created_uid: str | None = None
+        if not ok:
+            created_uid = await asyncio.to_thread(
+                _sync_create,
+                data["username"],
+                plain_password,
+                data["username"],
+                data["is_active"],
+                data["group_id"],
+            )
+            if created_uid:
+                ok = True
+                created = True
+                logger.info("JT808 改密时补建用户 account=%s id=%s", data["username"], created_uid)
+
+        jt808_uid = data["jt808_user_id"] or created_uid
+        if ok and not data["jt808_user_id"]:
+            jt808_uid = created_uid or await _lookup_jt808_id(data["username"])
+            if jt808_uid:
+                try:
+                    await _backfill_jt808_user_id(user_id, jt808_uid)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("回写 jt808_user_id 失败 user_id=%s: %s", user_id, e)
+
+        if ok:
+            return {
+                "ok": True,
+                "created": created,
+                "jt808_user_id": jt808_uid,
+                "message": "808 密码已同步" + ("（已补建账号）" if created else ""),
+            }
+        return {
+            "ok": False,
+            "message": "808 MySQL 同步失败，请确认 SSH 隧道已建立且 808 数据库可连接",
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("JT808 改密同步异常 user_id=%s: %s", user_id, e)
+        return {
+            "ok": False,
+            "message": f"808 MySQL 同步异常：{e}",
+        }
+
+
+async def bg_set_password(user_id: int, plain_password: str) -> None:
+    await sync_set_password(user_id, plain_password)
 
 
 async def bg_delete(user_id: int, username: str, jt808_user_id: str | None) -> None:

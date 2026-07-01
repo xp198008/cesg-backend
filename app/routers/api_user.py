@@ -26,6 +26,7 @@ from app.user_online_daily import (
     resolve_user_org_profile,
     sync_login_session_to_daily,
 )
+from app.vehicle_alloc_scope import parse_user_id_header, resolve_monitor_scope
 
 router = APIRouter(prefix="/api/user", tags=["user"])
 
@@ -208,6 +209,15 @@ def _generate_login_password(length: int = 6) -> str:
         chars.append(secrets.choice(pool))
     secrets.SystemRandom().shuffle(chars)
     return "".join(chars)
+
+
+def _jt808_sync_view(sync_result: dict) -> tuple[str, str | None]:
+    """将 sync_set_password 结果转为前端 jt808_sync 字段。"""
+    if sync_result.get("skipped"):
+        return "skipped", sync_result.get("reason") or "808 同步已关闭"
+    if sync_result.get("ok"):
+        return "success", sync_result.get("message")
+    return "failed", sync_result.get("message") or "808 同步失败"
 
 
 @router.get("/list")
@@ -434,7 +444,6 @@ async def user_credential(user_id: int, db: AsyncSession = Depends(get_db)):
 @router.post("/set-password")
 async def user_set_password(
     payload: UserSetPasswordPayload,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     user = await db.scalar(select(SysUser).where(SysUser.id == payload.user_id).limit(1))
@@ -452,11 +461,13 @@ async def user_set_password(
         raise HTTPException(status_code=500, detail=f"修改密码失败: {e}")
 
     await db.commit()
-    background_tasks.add_task(jt808_user.bg_set_password, user.id, new_pwd)
+    sync_result = await jt808_user.sync_set_password(user.id, new_pwd)
+    jt808_sync, jt808_sync_message = _jt808_sync_view(sync_result)
     return {
         "ok": True,
         "message": "密码已更新",
-        "jt808_sync": "queued",
+        "jt808_sync": jt808_sync,
+        "jt808_sync_message": jt808_sync_message,
         "data": {
             "user_id": user.id,
             "username": user.username,
@@ -468,7 +479,6 @@ async def user_set_password(
 @router.post("/reset-password")
 async def user_reset_password(
     payload: UserResetPasswordPayload,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     user = await db.scalar(select(SysUser).where(SysUser.id == payload.user_id).limit(1))
@@ -480,11 +490,13 @@ async def user_reset_password(
     await db.flush()
     await db.refresh(user)
     await db.commit()
-    background_tasks.add_task(jt808_user.bg_set_password, user.id, new_pwd)
+    sync_result = await jt808_user.sync_set_password(user.id, new_pwd)
+    jt808_sync, jt808_sync_message = _jt808_sync_view(sync_result)
     return {
         "ok": True,
         "message": "密码已重置并可复制",
-        "jt808_sync": "queued",
+        "jt808_sync": jt808_sync,
+        "jt808_sync_message": jt808_sync_message,
         "text": f"{user.username}/{new_pwd}",
         "data": {
             "user_id": user.id,
@@ -858,6 +870,19 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
         await db.commit()
 
     return {"ok": True, "message": "登录成功", "data": data}
+
+
+@router.get("/monitor-scope")
+async def user_monitor_scope(
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
+    """实时监控：返回当前用户可见车辆键（车牌/设备号），供 808 树前端过滤。"""
+    user_id = parse_user_id_header(x_user_id)
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="缺少请求头 X-User-Id")
+    scope = await resolve_monitor_scope(db, user_id)
+    return {"ok": True, "data": scope}
 
 
 @router.post("/jt808-auth-sync")

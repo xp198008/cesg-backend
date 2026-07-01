@@ -279,18 +279,19 @@ async def sync_user_group_auth(
         return {"ok": False, "message": "808 平台未找到对应用户，请先完成用户同步"}
 
     desired = await compute_desired_group_ids(db, user, role_code=role_code)
-    if not desired:
-        return {
-            "ok": True,
-            "skipped": True,
-            "reason": "no_group_mapping",
-            "message": "未找到可同步的 808 车组（请确认公司已同步 jt808_group_id）",
-            "jt808_user_id": jt808_uid,
-        }
-
     current = await _fetch_current_group_ids(jt808_uid, token)
     to_add = desired - current
     to_del = current - desired
+
+    if not to_add and not to_del:
+        return {
+            "ok": True,
+            "jt808_user_id": jt808_uid,
+            "desired_groups": sorted(desired),
+            "added": 0,
+            "deleted": 0,
+            "unchanged": len(desired),
+        }
 
     added = 0
     deleted = 0

@@ -556,6 +556,80 @@ class UserOnlineDaily(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class ManualFaultReport(Base):
+    """人工报障录入（与 jt_device_fault 分流）。"""
+
+    __tablename__ = "manual_fault_report"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    biz_no = Column(String(32), nullable=False, unique=True, index=True)
+    plate_no = Column(String(16), nullable=False, index=True)
+    terminal_bind_no = Column(String(64), nullable=True, index=True)
+    vehicle_id = Column(Integer, nullable=True, index=True)
+    company_id = Column(Integer, nullable=True, index=True)
+    fault_type_dict_id = Column(Integer, nullable=False, index=True)
+    fault_type_name = Column(String(64), nullable=True)
+    fault_level = Column(String(16), nullable=False)
+    discovery_time = Column(DateTime, nullable=False, index=True)
+    discoverer = Column(String(64), nullable=False)
+    fault_devices = Column(Text, nullable=True)
+    fault_phenomenon = Column(Text, nullable=True)
+    fault_location = Column(String(256), nullable=True)
+    affect_service = Column(Integer, nullable=False, server_default="1")
+    handle_status = Column(String(32), nullable=False, server_default="未处理")
+    handled_at = Column(DateTime, nullable=True)
+    handler_name = Column(String(64), nullable=True)
+    handler_remark = Column(String(255), nullable=True)
+    audited_at = Column(DateTime, nullable=True)
+    auditor_name = Column(String(64), nullable=True)
+    audit_remark = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class JtDeviceFault(Base):
+    """终端/车载故障（0x0200 报警位），供报障处理页。"""
+
+    __tablename__ = "jt_device_fault"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    biz_no = Column(String(32), nullable=False, unique=True, index=True)
+    terminal_id = Column(String(32), nullable=False, index=True)
+    vehicle_id = Column(Integer, index=True, nullable=True)
+    plate_no = Column(String(16), default="", index=True)
+    company_id = Column(Integer, nullable=True, index=True)
+    fault_bit = Column(Integer, nullable=False, index=True)
+    fault_type_name = Column(String(64), nullable=True)
+    fault_time = Column(DateTime, nullable=False, index=True)
+    alarm_flags = Column(Integer, nullable=False)
+    lat = Column(Float, nullable=True)
+    lng = Column(Float, nullable=True)
+    speed_kmh = Column(Float, nullable=True)
+    direction = Column(Integer, nullable=True)
+    raw_preview = Column(Text, nullable=True)
+    source = Column(String(32), nullable=False, default="jt808_0200_alarm")
+    handle_status = Column(String(32), default="未处理")
+    handled_at = Column(DateTime, nullable=True)
+    handler_name = Column(String(64), nullable=True)
+    handler_remark = Column(String(255), nullable=True)
+    audited_at = Column(DateTime, nullable=True)
+    auditor_name = Column(String(64), nullable=True)
+    audit_remark = Column(String(255), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class JtDeviceFaultReceipt(Base):
+    """设备报障结案后的上传单据索引。"""
+
+    __tablename__ = "jt_device_fault_receipt"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fault_id = Column(Integer, nullable=False, index=True)
+    biz_no = Column(String(32), nullable=False, index=True)
+    stored_name = Column(String(255), nullable=False)
+    original_name = Column(String(255), nullable=False)
+    file_size = Column(Integer, nullable=False)
+    mime_type = Column(String(128), nullable=True)
+    uploader_name = Column(String(64), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
 class UserOperationLog(Base):
     __tablename__ = "user_operation_log"
     id = Column(Integer, primary_key=True, autoincrement=True)

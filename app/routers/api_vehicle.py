@@ -32,6 +32,11 @@ from app.org_scope import (
     require_x_org_id_header,
     wants_org_tree_scope,
 )
+from app.vehicle_alloc_scope import (
+    apply_vehicle_id_scope,
+    parse_user_id_header,
+    resolve_allowed_vehicle_ids,
+)
 
 router = APIRouter(prefix="/api/vehicle", tags=["vehicle"])
 
@@ -444,7 +449,14 @@ async def vehicle_update(payload: VehicleSavePayload, background_tasks: Backgrou
 
 
 @router.get("/detail/{vehicle_id}")
-async def vehicle_detail(vehicle_id: int, db: AsyncSession = Depends(get_db)):
+async def vehicle_detail(
+    vehicle_id: int,
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    allowed = await resolve_allowed_vehicle_ids(db, parse_user_id_header(x_user_id))
+    if allowed is not None and vehicle_id not in allowed:
+        raise HTTPException(status_code=404, detail="车辆不存在")
     v = await db.scalar(select(Vehicle).where(Vehicle.id == vehicle_id).limit(1))
     if v is None:
         raise HTTPException(status_code=404, detail="车辆不存在")
@@ -725,9 +737,12 @@ async def vehicle_list(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
     q = select(Vehicle)
+    allowed_vehicle_ids = await resolve_allowed_vehicle_ids(db, parse_user_id_header(x_user_id))
+    q = apply_vehicle_id_scope(q, allowed_vehicle_ids)
     if wants_org_tree_scope(scope_org_tree, x_org_id):
         root = require_x_org_id_header(x_org_id)
         co = await db.scalar(select(OrgCompany.id).where(OrgCompany.id == root).limit(1))

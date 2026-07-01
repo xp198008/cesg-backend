@@ -33,9 +33,11 @@ from app.jt808_alarm_sync import cleanup_jt808_violations_without_evidence, jt80
 from app.routers import (
     api_alarm_type,
     api_dashboard,
+    api_device_fault,
     api_driver,
     api_fault_type,
     api_jt808_alarm_sync,
+    api_manual_fault,
     api_map_rules,
     api_org,
     api_permission_menu,
@@ -109,6 +111,8 @@ app.include_router(api_vehicle_alloc.router)
 app.include_router(api_violation.router)
 app.include_router(api_violation_ticket.router)
 app.include_router(api_violation_type.router)
+app.include_router(api_manual_fault.router)
+app.include_router(api_device_fault.router)
 app.include_router(api_shortcut.router)
 app.include_router(api_dashboard.router)
 app.include_router(api_weather.router)

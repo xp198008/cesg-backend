@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -16,8 +17,10 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import OrgCompany, Vehicle, VehicleViolation, ViolationTicket, ViolationTypeDict
+from app.models import OrgCompany, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTicket, ViolationTypeDict
 from app.org_scope import collect_org_company_subtree_ids, require_x_org_id_header
+from app.plate_util import norm_plate
+from app.timeutil import china_now_naive
 
 router = APIRouter(prefix="/api/violation", tags=["violation"])
 
@@ -32,6 +35,35 @@ class ViolationAuditIn(BaseModel):
     result: str = Field(..., max_length=32)
     remark: str | None = Field(None, max_length=2000)
     auditor_name: str | None = Field(None, max_length=64)
+
+
+class ViolationManualIn(BaseModel):
+    plate_no: str = Field(..., min_length=1, max_length=16)
+    violation_type_dict_id: int | None = Field(None, ge=1)
+    violation_type_name: str | None = Field(None, max_length=64)
+    violation_time: datetime | None = None
+    address: str | None = Field(None, max_length=500)
+    terminal_id: str | None = Field(None, max_length=32)
+    vehicle_id: int | None = Field(None, ge=1)
+    remark: str | None = Field(None, max_length=2000)
+
+
+def _gen_biz_no() -> str:
+    return f"WZ{china_now_naive().strftime('%Y%m%d%H%M%S')}{secrets.token_hex(3).upper()}"
+
+
+async def _read_main_terminal_id_for_vehicle(db: AsyncSession, vehicle_id: int) -> str:
+    rd = await db.execute(
+        select(VehicleDevice)
+        .where(VehicleDevice.vehicle_id == int(vehicle_id))
+        .order_by(VehicleDevice.is_main.desc(), VehicleDevice.id.asc())
+    )
+    for dev in rd.scalars().all():
+        for attr in ("device_no", "device_sn", "sim_no", "actual_sim"):
+            val = getattr(dev, attr, None)
+            if val is not None and str(val).strip():
+                return str(val).strip()[:32]
+    return ""
 
 
 class TicketProcessIn(BaseModel):
@@ -174,6 +206,7 @@ async def _scoped_query(db: AsyncSession, x_org_id: str | None):
 async def violation_list(
     status: str | None = Query(None),
     plate_no: str | None = Query(None),
+    biz_no: str | None = Query(None),
     terminal_id: str | None = Query(None),
     source: str | None = Query(None),
     start_time: str | None = Query(None),
@@ -200,6 +233,8 @@ async def violation_list(
             q = q.where(VehicleViolation.status == status.strip())
     if plate_no:
         q = q.where(VehicleViolation.plate_no.ilike(f"%{plate_no.strip()}%"))
+    if biz_no:
+        q = q.where(VehicleViolation.biz_no.ilike(f"%{biz_no.strip()}%"))
     if terminal_id:
         q = q.where(VehicleViolation.terminal_id.ilike(f"%{terminal_id.strip()}%"))
     if source:
@@ -226,6 +261,92 @@ async def violation_list(
             if ticket.biz_no:
                 ticket_by_biz[ticket.biz_no] = ticket
     return {"ok": True, "total": total, "items": [_row_out(x, ticket_by_biz) for x in rows], "page": page, "page_size": page_size}
+
+
+@router.post("/manual")
+async def violation_manual(
+    body: ViolationManualIn,
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """人工录入违章（车辆管理-手动违章录入）。"""
+    root = require_x_org_id_header(x_org_id)
+    co = await db.scalar(select(OrgCompany.id).where(OrgCompany.id == root).limit(1))
+    if co is None:
+        raise HTTPException(status_code=400, detail="X-Org-Id 对应公司不存在")
+    subtree = await collect_org_company_subtree_ids(db, root)
+
+    plate = norm_plate(body.plate_no)
+    if not plate:
+        raise HTTPException(status_code=400, detail="车牌不能为空")
+
+    v: Vehicle | None = None
+    if body.vehicle_id is not None:
+        r_id = await db.execute(select(Vehicle).where(Vehicle.id == int(body.vehicle_id)))
+        v_pick = r_id.scalar_one_or_none()
+        if v_pick is None:
+            raise HTTPException(status_code=400, detail="所选车辆不存在")
+        if norm_plate(v_pick.plate_no) != plate:
+            raise HTTPException(status_code=400, detail="所选车辆与车牌不一致")
+        v = v_pick
+    else:
+        vr = await db.execute(select(Vehicle).where(Vehicle.plate_no == plate))
+        v = vr.scalar_one_or_none()
+
+    if v is not None and v.company_id is not None and int(v.company_id) not in subtree:
+        raise HTTPException(status_code=403, detail="该车辆不属于您所在公司及下级公司，无法录入")
+
+    vehicle_id = int(v.id) if v else None
+    company_id = int(v.company_id) if v is not None and v.company_id is not None else root
+
+    if body.violation_type_dict_id is not None:
+        vt_row = await db.get(ViolationTypeDict, int(body.violation_type_dict_id))
+        if vt_row is None:
+            raise HTTPException(status_code=400, detail="所选违章类型不存在")
+        vtype_name = (vt_row.type_name or "").strip()[:64]
+    else:
+        vtype_name = (body.violation_type_name or "").strip()[:64]
+    if not vtype_name:
+        raise HTTPException(status_code=400, detail="请选择违章类型")
+
+    tid = (body.terminal_id or "").strip()[:32]
+    if not tid and v:
+        tid = await _read_main_terminal_id_for_vehicle(db, int(v.id))
+
+    vt = body.violation_time or china_now_naive()
+    lat_out: float | None = None
+    lng_out: float | None = None
+    addr_out = (body.address or "").strip()[:500] or None
+    if v is not None:
+        lr = await db.execute(select(VehicleLocation).where(VehicleLocation.vehicle_id == int(v.id)))
+        loc_row = lr.scalar_one_or_none()
+        if loc_row is not None:
+            if loc_row.lat is not None and loc_row.lng is not None:
+                lat_out, lng_out = float(loc_row.lat), float(loc_row.lng)
+            if not addr_out and (loc_row.current_position or "").strip():
+                addr_out = str(loc_row.current_position).strip()[:500]
+
+    row = VehicleViolation(
+        biz_no=_gen_biz_no(),
+        terminal_id=tid or "",
+        vehicle_id=vehicle_id,
+        plate_no=plate,
+        company_id=company_id,
+        violation_type_code=None,
+        violation_type_name=vtype_name,
+        violation_time=vt,
+        lat=lat_out,
+        lng=lng_out,
+        address=addr_out,
+        source="manual",
+        transparent_type=None,
+        raw_preview=(body.remark or "").strip() or None,
+        status="待处理",
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return {"ok": True, "id": row.id, "biz_no": row.biz_no}
 
 
 @router.get("/{violation_id}/detail")
