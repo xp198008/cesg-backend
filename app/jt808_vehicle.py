@@ -342,30 +342,53 @@ async def _build_1251_request(data: dict, token: str) -> tuple[dict[str, Any] | 
     return body, None
 
 
-async def _sync_upsert(data: dict) -> bool:
+async def _sync_upsert(data: dict, trace: dict | None = None) -> bool:
     dev = (data.get("device_no") or "").strip()
+    if trace is not None:
+        trace["fuel_tank_capacity_raw"] = data.get("fuel_tank_capacity")
+        trace["oil_box_parsed"] = _oil_box(data)
+        trace["group_id"] = data.get("group_id")
+        trace["device_no"] = dev or None
+        trace["plate_no"] = data.get("plate_no")
     if not dev:
         logger.info("JT808 车辆同步跳过：无主设备号 vehicle_id=%s", data.get("id"))
+        if trace is not None:
+            trace["skip_reason"] = "无主设备号"
         return False
     gid = data.get("group_id")
     if not gid:
         logger.warning("JT808 车辆同步跳过：公司无 jt808_group_id vehicle_id=%s", data.get("id"))
+        if trace is not None:
+            trace["skip_reason"] = "所属公司未配置 jt808_group_id"
         return False
 
+    tid = ""
     try:
         token = await _ensure_token()
         payload, err = await _build_1251_request(data, token)
         if payload is None:
             logger.warning("JT808 1251 车辆同步跳过 vehicle_id=%s: %s", data.get("id"), err)
+            if trace is not None:
+                trace["skip_reason"] = err
             return False
         tid = payload["deviceId"]
         plate = payload["carno"]
         car_id = payload.get("id")
         # _call 会再次附带 language/lingxtoken，这里去掉避免重复
         call_body = {k: v for k, v in payload.items() if k not in ("language", "lingxtoken")}
+        if trace is not None:
+            trace["request_apicode"] = 1251
+            trace["api_url"] = settings.jt808_api_base
+            trace["request_body"] = dict(call_body)
         r = await _call(call_body)
+        if trace is not None:
+            trace["response"] = r
+            trace["response_code"] = r.get("code")
+            trace["response_message"] = r.get("message")
     except Exception as e:  # noqa: BLE001
         logger.warning("JT808 1251 车辆同步异常 vehicle_id=%s tid=%s: %s", data.get("id"), tid, e)
+        if trace is not None:
+            trace["exception"] = str(e)
         return False
 
     if r.get("code") != 1:

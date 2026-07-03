@@ -44,6 +44,7 @@ from app.routers import (
     api_driver,
     api_fault_type,
     api_jt808_alarm_sync,
+    api_knowledge,
     api_manual_fault,
     api_map_rules,
     api_obd_speed,
@@ -125,6 +126,7 @@ app.include_router(api_manual_fault.router)
 app.include_router(api_device_fault.router)
 app.include_router(api_repair.router)
 app.include_router(api_shortcut.router)
+app.include_router(api_knowledge.router)
 app.include_router(api_dashboard.router)
 app.include_router(api_weather.router)
 app.include_router(api_ai.router)
