@@ -49,6 +49,7 @@ from app.routers import (
     api_obd_speed,
     api_org,
     api_permission_menu,
+    api_repair,
     api_role,
     api_shortcut,
     api_user,
@@ -122,6 +123,7 @@ app.include_router(api_violation_ticket.router)
 app.include_router(api_violation_type.router)
 app.include_router(api_manual_fault.router)
 app.include_router(api_device_fault.router)
+app.include_router(api_repair.router)
 app.include_router(api_shortcut.router)
 app.include_router(api_dashboard.router)
 app.include_router(api_weather.router)

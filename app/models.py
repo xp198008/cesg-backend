@@ -659,6 +659,52 @@ class JtDeviceFaultReceipt(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
+class VehicleRepair(Base):
+    """设备报修工单（人工录入 + 审核 + 维修状态跟踪）。"""
+
+    __tablename__ = "vehicle_repair"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    biz_no = Column(String(32), nullable=False, unique=True, index=True)
+    plate_no = Column(String(16), nullable=False, index=True)
+    vehicle_id = Column(Integer, nullable=True, index=True)
+    company_id = Column(Integer, nullable=True, index=True)
+    repair_type = Column(String(32), nullable=False, server_default="设备报修")
+    repair_time = Column(DateTime, nullable=False, index=True)
+    repairer = Column(String(64), nullable=False)
+    phone = Column(String(32), nullable=True)
+    expected_at = Column(DateTime, nullable=True)
+    main_device = Column(String(64), nullable=True)
+    device_model = Column(String(64), nullable=True)
+    device_no = Column(String(64), nullable=True)
+    description = Column(Text, nullable=True)
+    repair_address = Column(String(256), nullable=True)
+    estimated_cost = Column(Numeric(10, 2), nullable=True)
+    remark = Column(Text, nullable=True)
+    review_status = Column(String(32), nullable=False, server_default="待审核", index=True)
+    reviewer = Column(String(64), nullable=True)
+    review_remark = Column(String(255), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    repair_status = Column(String(32), nullable=False, server_default="待处理", index=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class VehicleRepairReceipt(Base):
+    """设备报修单据（维修工单/发票/配件清单等附件索引）。"""
+
+    __tablename__ = "vehicle_repair_receipt"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    repair_id = Column(Integer, nullable=False, index=True)
+    biz_no = Column(String(32), nullable=False, index=True)
+    stored_name = Column(String(255), nullable=False)
+    original_name = Column(String(255), nullable=False)
+    file_size = Column(Integer, nullable=False)
+    mime_type = Column(String(128), nullable=True)
+    uploader_name = Column(String(64), nullable=True)
+    remark = Column(String(255), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
 class UserOperationLog(Base):
     __tablename__ = "user_operation_log"
     id = Column(Integer, primary_key=True, autoincrement=True)
