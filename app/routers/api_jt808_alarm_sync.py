@@ -1,7 +1,7 @@
 """JT808 主动安全同步管理接口。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,4 +42,20 @@ async def jt808_alarm_sync_run_once():
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "results": [x.__dict__ for x in results]}
+
+
+@router.post("/backfill")
+async def jt808_alarm_sync_backfill(
+    lookback_minutes: int = Query(120, ge=1, le=1440),
+    reset_state: bool = Query(True),
+):
+    """按时间窗口回补历史主动安全报警（首次部署或排查时可用）。"""
+    try:
+        results = await jt808_alarm_scheduler.run_backfill(
+            lookback_minutes=lookback_minutes,
+            reset_state=reset_state,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "lookback_minutes": lookback_minutes, "reset_state": reset_state, "results": [x.__dict__ for x in results]}
 

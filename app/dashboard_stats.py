@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import OrgCompany, VehicleViolation
 from app.org_scope import collect_org_company_subtree_ids, require_x_org_id_header, wants_org_tree_scope
+from app.violation_filters import violation_list_visibility
 
 
 def _today_iso_range() -> tuple[str, str]:
@@ -41,16 +42,20 @@ async def build_home_stats(db: AsyncSession, x_org_id: str | None) -> dict:
     scope = _violation_scope_clause(scoped_company_ids)
 
     pending_q = select(func.count()).select_from(VehicleViolation).where(
+        violation_list_visibility(),
         or_(
             VehicleViolation.status == "待处理",
             and_(VehicleViolation.status == "待审核", VehicleViolation.pre_audit_kind == "preprocess"),
-        )
+        ),
     )
     if scope is not None:
         pending_q = pending_q.where(scope)
 
     start_iso, end_iso = _today_iso_range()
-    completed_q = select(func.count()).select_from(VehicleViolation).where(VehicleViolation.status == "已处理")
+    completed_q = select(func.count()).select_from(VehicleViolation).where(
+        violation_list_visibility(),
+        VehicleViolation.status == "已处理",
+    )
     try:
         completed_q = completed_q.where(
             VehicleViolation.handled_at >= datetime.fromisoformat(start_iso),

@@ -65,6 +65,11 @@ class UserSessionCheckPayload(BaseModel):
     session_token: str | None = Field(default=None, max_length=128)
 
 
+class RefreshJt808TokenPayload(BaseModel):
+    user_id: int = Field(..., ge=1)
+    session_token: str | None = Field(default=None, max_length=128)
+
+
 class UserOperationLogIn(BaseModel):
     username: str = Field(..., min_length=1, max_length=64)
     operation_content: str = Field(..., min_length=1, max_length=2000)
@@ -935,6 +940,48 @@ async def user_session_check(payload: UserSessionCheckPayload, db: AsyncSession 
         if not server_token or not client_token or server_token != client_token:
             raise HTTPException(status_code=409, detail="该账号已在其它设备登录，请重新登录")
     return {"ok": True}
+
+
+@router.post("/refresh-jt808-token")
+async def user_refresh_jt808_token(payload: RefreshJt808TokenPayload, db: AsyncSession = Depends(get_db)):
+    """808 lingxtoken 过期时由后端代用户重登 8003 换新 token（静默续期）。
+
+    单点登录用户先校验 CESG 会话：被新设备踢掉的旧会话不允许续期，
+    否则续期动作会在 808 单会话模式下反踢新设备，形成互抢循环。
+    """
+    user = await db.scalar(select(SysUser).where(SysUser.id == payload.user_id).limit(1))
+    if user is None:
+        raise HTTPException(status_code=401, detail="当前用户不存在，请重新登录")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="当前用户已禁用，请重新登录")
+    if user.valid_until is not None and user.valid_until < date.today():
+        raise HTTPException(status_code=403, detail="当前用户已过有效期，请重新登录")
+    if getattr(user, "single_login", False):
+        server_token = (getattr(user, "login_session_token", None) or "").strip()
+        client_token = (payload.session_token or "").strip()
+        if not server_token or not client_token or server_token != client_token:
+            raise HTTPException(status_code=409, detail="该账号已在其它设备登录，请重新登录")
+
+    pwd_plain = (getattr(user, "password_plain", "") or "").strip()
+    username = (user.username or "").strip()
+    if not pwd_plain or not username:
+        raise HTTPException(status_code=400, detail="当前用户未存储登录凭据，无法自动续期，请重新登录")
+
+    from app.jt808_vehicle import _encode_password, _post
+
+    try:
+        resp = await _post(
+            {
+                "apicode": 8003,
+                "account": username,
+                "password": _encode_password(pwd_plain, username),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"808 平台连接失败：{exc}") from exc
+    if resp.get("code") != 1 or not resp.get("token"):
+        raise HTTPException(status_code=400, detail=str(resp.get("message") or "808 平台续期失败，请重新登录"))
+    return {"ok": True, "token": resp["token"], "auth": resp.get("auth")}
 
 
 @router.delete("/{user_id}")

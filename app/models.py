@@ -489,7 +489,36 @@ class VehicleViolation(Base):
     appeal_reason = Column(Text, nullable=True)
     appeal_submitted_at = Column(DateTime, nullable=True)
     appeal_status = Column(String(16), nullable=True)
+    ai_queried = Column(Boolean, default=False, nullable=False, server_default="0")
     created_at = Column(DateTime, server_default=func.now())
+
+
+class ViolationAiAssessment(Base):
+    """主动安全报警 AI 首次评估与罚单建议（与 vehicle_violation 一对一）。"""
+
+    __tablename__ = "violation_ai_assessment"
+    __table_args__ = (UniqueConstraint("violation_id", name="uq_violation_ai_assessment_violation_id"),)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    violation_id = Column(Integer, ForeignKey("vehicle_violation.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    session_id = Column(String(128), nullable=True)
+    evaluation_text = Column(Text, nullable=True)
+    ticket_process_type = Column(String(64), nullable=True)
+    ticket_amount = Column(Float, nullable=True, default=0.0)
+    ticket_basis = Column(Text, nullable=True)
+    ticket_suggestion_text = Column(Text, nullable=True)
+    evidence_valid = Column(Boolean, nullable=True)
+    system_judgment_correct = Column(Boolean, nullable=True)
+    violated_rules_json = Column(Text, nullable=True)
+    video_analysis_text = Column(Text, nullable=True)
+    raw_response_text = Column(Text, nullable=True)
+    company_name = Column(String(128), nullable=True)
+    alarm_type_name = Column(String(64), nullable=True)
+    image_count = Column(Integer, nullable=False, default=0, server_default="0")
+    has_video = Column(Boolean, nullable=False, default=False, server_default="0")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+    violation = relationship("VehicleViolation", backref="ai_assessment", uselist=False)
 
 
 class ViolationTicket(Base):

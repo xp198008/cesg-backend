@@ -12,15 +12,23 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Header, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import OrgCompany, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTicket, ViolationTypeDict
+from app.models import Driver, Fleet, OrgCompany, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTicket, ViolationTypeDict
 from app.org_scope import collect_org_company_subtree_ids, require_x_org_id_header
 from app.plate_util import norm_plate
+from app.routers.api_vehicle import _vehicle_list_company_fleet_names
 from app.timeutil import china_now_naive
+from app.violation_ai_assessment import (
+    get_violation_ai_assessment,
+    run_violation_ai_assessment,
+    stream_violation_ai_assessment,
+)
+from app.violation_filters import violation_list_visibility
 
 router = APIRouter(prefix="/api/violation", tags=["violation"])
 
@@ -135,6 +143,96 @@ def _dt_text(v: datetime | None) -> str | None:
     return v.strftime("%Y-%m-%d %H:%M:%S") if v else None
 
 
+async def _load_org_company_maps(db: AsyncSession) -> tuple[dict[int, str | None], dict[int, int | None], dict[int, str | None]]:
+    company_map: dict[int, str | None] = {}
+    parent_map: dict[int, int | None] = {}
+    for cid, cname, pid in (await db.execute(select(OrgCompany.id, OrgCompany.name, OrgCompany.parent_id))).all():
+        company_map[cid] = cname
+        parent_map[cid] = pid
+    fleet_map: dict[int, str | None] = {}
+    for fid, fname in (await db.execute(select(Fleet.id, Fleet.name))).all():
+        fleet_map[fid] = fname
+    return company_map, parent_map, fleet_map
+
+
+def _apply_vehicle_display_fields(
+    out: dict[str, Any],
+    *,
+    vehicle: Vehicle | None,
+    company_id: int | None,
+    company_map: dict[int, str | None],
+    parent_map: dict[int, int | None],
+    fleet_map: dict[int, str | None],
+    drivers: dict[int, Driver],
+) -> dict[str, Any]:
+    """与车辆列表一致：所属公司展示上级真实公司名，而非叶子机构编号。"""
+    if vehicle is not None:
+        display_company, display_fleet = _vehicle_list_company_fleet_names(
+            vehicle.company_id, vehicle.fleet_id, company_map, parent_map, fleet_map
+        )
+        out["company_name"] = display_company or "—"
+        out["fleet_name"] = display_fleet or ""
+        out["vehicle_type"] = vehicle.vehicle_type or ""
+        out["resolved_vehicle_id"] = vehicle.id
+        out["driver_id"] = vehicle.driver_id
+        driver_name = (vehicle.driver_name or "").strip()
+        if not driver_name and vehicle.driver_id and vehicle.driver_id in drivers:
+            driver_name = (drivers[vehicle.driver_id].name or "").strip()
+        out["driver_name"] = driver_name
+        return out
+
+    display_company, display_fleet = _vehicle_list_company_fleet_names(
+        company_id, None, company_map, parent_map, fleet_map
+    )
+    out["company_name"] = display_company or "—"
+    out["fleet_name"] = display_fleet or ""
+    out["vehicle_type"] = ""
+    out["driver_name"] = ""
+    return out
+
+
+async def _rows_out(
+    db: AsyncSession,
+    rows: list[VehicleViolation],
+    ticket_by_biz: dict[str, ViolationTicket] | None = None,
+) -> list[dict[str, Any]]:
+    ticket_by_biz = ticket_by_biz or {}
+    vehicle_ids = [int(x.vehicle_id) for x in rows if x.vehicle_id]
+    vehicles: dict[int, Vehicle] = {}
+    if vehicle_ids:
+        for vehicle in (await db.execute(select(Vehicle).where(Vehicle.id.in_(vehicle_ids)))).scalars().all():
+            vehicles[int(vehicle.id)] = vehicle
+
+    driver_ids = [int(v.driver_id) for v in vehicles.values() if v.driver_id]
+    drivers: dict[int, Driver] = {}
+    if driver_ids:
+        for driver in (await db.execute(select(Driver).where(Driver.id.in_(driver_ids)))).scalars().all():
+            drivers[int(driver.id)] = driver
+
+    company_map, parent_map, fleet_map = await _load_org_company_maps(db)
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        out = _row_out(row, ticket_by_biz)
+        vehicle = vehicles.get(int(row.vehicle_id)) if row.vehicle_id else None
+        company_id = vehicle.company_id if vehicle is not None else row.company_id
+        _apply_vehicle_display_fields(
+            out,
+            vehicle=vehicle,
+            company_id=company_id,
+            company_map=company_map,
+            parent_map=parent_map,
+            fleet_map=fleet_map,
+            drivers=drivers,
+        )
+        items.append(out)
+    return items
+
+
+async def _row_out_enriched(db: AsyncSession, row: VehicleViolation, ticket_by_biz: dict[str, ViolationTicket] | None = None) -> dict[str, Any]:
+    items = await _rows_out(db, [row], ticket_by_biz)
+    return items[0]
+
+
 def _row_out(row: VehicleViolation, ticket_by_biz: dict[str, ViolationTicket] | None = None) -> dict:
     ticket_by_biz = ticket_by_biz or {}
     ticket = ticket_by_biz.get(row.biz_no or "")
@@ -183,6 +281,7 @@ def _row_out(row: VehicleViolation, ticket_by_biz: dict[str, ViolationTicket] | 
         "ticket_status": ticket.status if ticket else None,
         "ticket_created_by_name": ticket.created_by_name if ticket else None,
         "ticket_created_at": _dt_text(ticket.created_at) if ticket else None,
+        "ai_queried": 1 if bool(getattr(row, "ai_queried", False)) else 0,
         "source_label": {
             "jt808_adas": "JT808 ADAS",
             "jt808_dsm": "JT808 DSM",
@@ -192,7 +291,7 @@ def _row_out(row: VehicleViolation, ticket_by_biz: dict[str, ViolationTicket] | 
 
 
 async def _scoped_query(db: AsyncSession, x_org_id: str | None):
-    q = select(VehicleViolation)
+    q = select(VehicleViolation).where(violation_list_visibility())
     if x_org_id:
         root = require_x_org_id_header(x_org_id)
         exists = await db.scalar(select(OrgCompany.id).where(OrgCompany.id == root).limit(1))
@@ -260,7 +359,13 @@ async def violation_list(
         for ticket in (await db.execute(select(ViolationTicket).where(ViolationTicket.biz_no.in_(biz)))).scalars().all():
             if ticket.biz_no:
                 ticket_by_biz[ticket.biz_no] = ticket
-    return {"ok": True, "total": total, "items": [_row_out(x, ticket_by_biz) for x in rows], "page": page, "page_size": page_size}
+    return {
+        "ok": True,
+        "total": total,
+        "items": await _rows_out(db, list(rows), ticket_by_biz),
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 @router.post("/manual")
@@ -354,7 +459,7 @@ async def violation_detail(violation_id: int, db: AsyncSession = Depends(get_db)
     row = await db.scalar(select(VehicleViolation).where(VehicleViolation.id == violation_id).limit(1))
     if row is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    return {"ok": True, "data": _row_out(row)}
+    return {"ok": True, "data": await _row_out_enriched(db, row)}
 
 
 @router.post("/{violation_id}/fetch-device-media")
@@ -395,7 +500,7 @@ async def violation_handle(violation_id: int, body: ViolationHandleIn, db: Async
         row.pre_audit_kind = "preprocess"
     await db.flush()
     await db.refresh(row)
-    return {"ok": True, "data": _row_out(row)}
+    return {"ok": True, "data": await _row_out_enriched(db, row)}
 
 
 @router.patch("/{violation_id}/audit")
@@ -455,7 +560,7 @@ async def violation_audit(violation_id: int, body: ViolationAuditIn, db: AsyncSe
 
     await db.flush()
     await db.refresh(row)
-    return {"ok": True, "data": _row_out(row)}
+    return {"ok": True, "data": await _row_out_enriched(db, row)}
 
 
 @router.patch("/{violation_id}/ticket-process-complete")
@@ -474,7 +579,7 @@ async def violation_ticket_complete(violation_id: int, body: TicketProcessIn, db
         ticket.status = "完成"
     await db.flush()
     await db.refresh(row)
-    return {"ok": True, "data": _row_out(row)}
+    return {"ok": True, "data": await _row_out_enriched(db, row)}
 
 
 @router.patch("/{violation_id}/ticket-appeal-submit")
@@ -496,7 +601,7 @@ async def violation_ticket_appeal(violation_id: int, body: TicketAppealIn, db: A
     row.audited_at = None
     await db.flush()
     await db.refresh(row)
-    return {"ok": True, "data": _row_out(row)}
+    return {"ok": True, "data": await _row_out_enriched(db, row)}
 
 
 @router.post("/{violation_id}/ticket-appeal-submit-with-attachments")
@@ -530,7 +635,7 @@ async def violation_ticket_appeal_with_attachments(
     row.audited_at = None
     await db.flush()
     await db.refresh(row)
-    return {"ok": True, "data": _row_out(row)}
+    return {"ok": True, "data": await _row_out_enriched(db, row)}
 
 
 @router.patch("/{violation_id}/false-alarm-reopen")
@@ -543,5 +648,36 @@ async def violation_false_alarm_reopen(violation_id: int, db: AsyncSession = Dep
     row.appeal_status = None
     await db.flush()
     await db.refresh(row)
-    return {"ok": True, "data": _row_out(row)}
+    return {"ok": True, "data": await _row_out_enriched(db, row)}
+
+
+@router.get("/{violation_id}/ai-assessment")
+async def violation_ai_assessment_get(violation_id: int, db: AsyncSession = Depends(get_db)):
+    return await get_violation_ai_assessment(db, violation_id)
+
+
+@router.post("/{violation_id}/ai-assessment/analyze")
+async def violation_ai_assessment_analyze(
+    violation_id: int,
+    force: bool = Query(False, description="为 true 时强制重新咨询 AI"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    user_id = (x_user_id or "cesg_anonymous").strip() or "cesg_anonymous"
+    return await run_violation_ai_assessment(db, violation_id=violation_id, user_id=user_id, force=force)
+
+
+@router.post("/{violation_id}/ai-assessment/analyze-stream")
+async def violation_ai_assessment_analyze_stream(
+    violation_id: int,
+    force: bool = Query(False, description="为 true 时强制重新咨询 AI"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
+    """SSE 流式 AI 评估：status / content(delta) / assessment / skip / error 事件。"""
+    user_id = (x_user_id or "cesg_anonymous").strip() or "cesg_anonymous"
+    return StreamingResponse(
+        stream_violation_ai_assessment(violation_id=violation_id, user_id=user_id, force=force),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
 

@@ -11,19 +11,23 @@ from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.jt808_openapi_client import Jt808OpenApiError, jt808_openapi_client
 from app.models import Jt808AlarmSyncState, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTicket
+from app.plate_util import norm_plate
+from app.violation_filters import is_unknown_violation_type_name
 
 logger = logging.getLogger(__name__)
 
 _SOURCE_ADAS = "jt808_adas"
-_SOURCE_DSM = "jt808_dsm"
+_SOURCE_DSM = "jt808_dsm"  # 历史库内来源标记；同步已不再调 1209
 _SOURCE_LOCATION = "jt808_location"
+# 808 平台约定：主动安全仅调 apicode 1208（已含原 DSM），不再调 1209。
+_SYNC_ALARM_SOURCES = (_SOURCE_ADAS,)
 
 _ADAS_ALARM_NAMES = {
     1: "前向碰撞报警",
@@ -61,6 +65,8 @@ class SyncResult:
     total: int = 0
     inserted: int = 0
     skipped_no_evidence: int = 0
+    skipped_no_vehicle: int = 0
+    skipped_unknown_type: int = 0
     updated_positions: int = 0
     error: str | None = None
 
@@ -126,16 +132,32 @@ def _external_alarm_id(source: str, item: dict[str, Any]) -> str:
 
 
 def _alarm_type_name(source: str, item: dict[str, Any]) -> str:
+    direct = str(item.get("name") or "").strip()
+    if direct:
+        level = _as_int(item.get("bjjb"))
+        if level in (1, 2) and direct.endswith("报警"):
+            return f"{direct}{level}级"
+        return direct
     code = _as_int(item.get("bjlx") if item.get("bjlx") is not None else item.get("bjid"))
-    names = _ADAS_ALARM_NAMES if source == _SOURCE_ADAS else _DSM_ALARM_NAMES
-    base = names.get(code or -1)
+    if source == _SOURCE_ADAS:
+        # 1208 合并返回 ADAS/DSM 类型码：先 ADAS 字典，未命中再试 DSM。
+        base = _ADAS_ALARM_NAMES.get(code or -1) or _DSM_ALARM_NAMES.get(code or -1)
+    else:
+        base = _DSM_ALARM_NAMES.get(code or -1)
     if not base:
-        prefix = "ADAS主动安全报警" if source == _SOURCE_ADAS else "DSM主动安全报警"
+        prefix = "主动安全报警"
         base = f"{prefix}{code}" if code is not None else prefix
     level = _as_int(item.get("bjjb"))
     if level in (1, 2) and base.endswith("报警"):
         return f"{base}{level}级"
     return base
+
+
+def _is_unknown_alarm_item(source: str, item: dict[str, Any]) -> bool:
+    raw_name = str(item.get("name") or "").strip()
+    if is_unknown_violation_type_name(raw_name):
+        return True
+    return is_unknown_violation_type_name(_alarm_type_name(source, item))
 
 
 def _split_media_files(files: Any) -> dict[str, Any]:
@@ -193,8 +215,13 @@ def _jt808_media_url(raw: Any) -> str:
 
 def _normalize_terminal_id(raw: Any) -> str:
     tid = str(raw or "").strip()
-    if tid.isdigit() and 10 <= len(tid) < 12:
-        return tid.zfill(12)
+    if not tid:
+        return ""
+    if tid.isdigit():
+        core = tid.lstrip("0") or "0"
+        if len(core) <= 12:
+            return core.zfill(12)
+        return tid[-12:]
     return tid
 
 
@@ -209,6 +236,10 @@ def _looks_like_terminal_id(raw: Any) -> bool:
 
 def _terminal_from_alarm_payload(item: dict[str, Any]) -> str:
     """优先从报警 payload 本身提取真实设备号，不把短 car_id 当终端号。"""
+    for key in ("deviceId", "device_id", "tid", "terminal_id", "terminalId"):
+        tid = _normalize_terminal_id(item.get(key))
+        if tid:
+            return tid
     files = item.get("files") if isinstance(item.get("files"), list) else []
     for f in files:
         if not isinstance(f, dict):
@@ -219,61 +250,105 @@ def _terminal_from_alarm_payload(item: dict[str, Any]) -> str:
             tid = _normalize_terminal_id(m.group(1))
             if tid:
                 return tid
-    for key in ("deviceId", "device_id", "tid", "terminal_id", "terminalId"):
-        tid = _normalize_terminal_id(item.get(key))
-        if tid:
-            return tid
     car_id = item.get("car_id")
     return _normalize_terminal_id(car_id) if _looks_like_terminal_id(car_id) else ""
 
 
-async def _terminal_by_platform_car_id(car_id: Any, cache: dict[str, str]) -> str:
+async def _platform_car_row(car_id: Any, cache: dict[str, dict[str, str]]) -> dict[str, str]:
     cid = str(car_id or "").strip()
     if not cid:
-        return ""
+        return {}
     if cid in cache:
         return cache[cid]
-    cache[cid] = ""
+    cache[cid] = {}
     try:
         data = await jt808_openapi_client.list_vehicles(device_id=cid, page=1, rows=1)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("JT808 车辆ID反查终端号失败 car_id=%s: %s", cid, exc)
-        return ""
+        logger.warning("JT808 车辆ID反查失败 car_id=%s: %s", cid, exc)
+        return cache[cid]
     rows = data.get("data") if isinstance(data.get("data"), list) else []
     if not rows or not isinstance(rows[0], dict):
-        return ""
-    tid = _normalize_terminal_id(rows[0].get("tid") or rows[0].get("deviceId") or rows[0].get("id"))
-    if tid and tid != cid:
-        cache[cid] = tid
+        return cache[cid]
+    row = rows[0]
+    tid = _normalize_terminal_id(row.get("tid") or row.get("deviceId") or row.get("id"))
+    carno = str(row.get("carno") or row.get("plate") or "").strip()
+    cache[cid] = {"tid": tid if tid and tid != cid else "", "carno": carno}
     return cache[cid]
 
 
-async def _terminal_from_alarm_item(item: dict[str, Any], car_id_cache: dict[str, str]) -> str:
+async def _terminal_by_platform_car_id(car_id: Any, cache: dict[str, dict[str, str]]) -> str:
+    return (await _platform_car_row(car_id, cache)).get("tid") or ""
+
+
+async def _plate_by_platform_car_id(car_id: Any, cache: dict[str, dict[str, str]]) -> str:
+    return (await _platform_car_row(car_id, cache)).get("carno") or ""
+
+
+async def _terminal_from_alarm_item(item: dict[str, Any], car_id_cache: dict[str, dict[str, str]]) -> str:
     terminal_id = _terminal_from_alarm_payload(item)
     if terminal_id:
         return terminal_id
     return await _terminal_by_platform_car_id(item.get("car_id"), car_id_cache)
 
 
-async def _vehicle_by_terminal(db: AsyncSession, terminal_id: str) -> Vehicle | None:
+def _terminal_variants(terminal_id: str) -> set[str]:
     tid = (terminal_id or "").strip()
     if not tid:
-        return None
+        return set()
     variants = {tid}
     if tid.isdigit():
         variants.add(tid.zfill(12))
-        variants.add(tid.lstrip("0") or "0")
+        stripped = tid.lstrip("0") or "0"
+        variants.add(stripped)
+    return variants
+
+
+async def _vehicle_by_terminal(db: AsyncSession, terminal_id: str) -> Vehicle | None:
+    variants = _terminal_variants(terminal_id)
+    if not variants:
+        return None
+    variant_list = list(variants)
     stmt = (
         select(Vehicle)
         .join(VehicleDevice, VehicleDevice.vehicle_id == Vehicle.id)
         .where(
-            (VehicleDevice.device_no.in_(list(variants)))
-            | (VehicleDevice.device_sn.in_(list(variants)))
-            | (VehicleDevice.sim_no.in_(list(variants)))
+            (VehicleDevice.device_no.in_(variant_list))
+            | (VehicleDevice.device_sn.in_(variant_list))
+            | (VehicleDevice.sim_no.in_(variant_list))
+            | (VehicleDevice.actual_sim.in_(variant_list))
         )
         .limit(1)
     )
-    return await db.scalar(stmt)
+    vehicle = await db.scalar(stmt)
+    if vehicle is not None:
+        return vehicle
+    loc = await db.scalar(
+        select(VehicleLocation).where(VehicleLocation.terminal_id.in_(variant_list)).limit(1)
+    )
+    if loc is None:
+        return None
+    return await db.scalar(select(Vehicle).where(Vehicle.id == loc.vehicle_id).limit(1))
+
+
+async def _vehicle_by_plate(db: AsyncSession, raw_plate: Any) -> Vehicle | None:
+    plate = norm_plate(str(raw_plate or ""))
+    if not plate:
+        return None
+    vehicle = await db.scalar(select(Vehicle).where(Vehicle.plate_no == plate).limit(1))
+    if vehicle is not None:
+        return vehicle
+    return await db.scalar(select(Vehicle).where(func.upper(Vehicle.plate_no) == plate.upper()).limit(1))
+
+
+async def _resolve_vehicle_for_alarm(
+    db: AsyncSession,
+    terminal_id: str,
+    raw_plate: Any = None,
+) -> Vehicle | None:
+    vehicle = await _vehicle_by_terminal(db, terminal_id)
+    if vehicle is not None:
+        return vehicle
+    return await _vehicle_by_plate(db, raw_plate)
 
 
 async def _upsert_state(
@@ -307,9 +382,12 @@ async def _sync_alarm_source(db: AsyncSession, source: str, start_at: datetime, 
     result = SyncResult(source=source)
     page_size = max(1, int(settings.jt808_alarm_sync_page_size))
     max_pages = max(1, int(settings.jt808_alarm_sync_max_pages))
-    list_func = jt808_openapi_client.list_adas_alarms if source == _SOURCE_ADAS else jt808_openapi_client.list_dsm_alarms
+    if source != _SOURCE_ADAS:
+        result.error = f"unsupported sync source: {source}"
+        return result
+    list_func = jt808_openapi_client.list_adas_alarms
     terminals: set[str] = set()
-    car_id_cache: dict[str, str] = {}
+    car_id_cache: dict[str, dict[str, str]] = {}
     try:
         for page in range(1, max_pages + 1):
             data = await list_func(_fmt_api_time(start_at), _fmt_api_time(end_at), page=page, rows=page_size)
@@ -325,7 +403,16 @@ async def _sync_alarm_source(db: AsyncSession, source: str, start_at: datetime, 
                 if exists:
                     continue
                 terminal_id = await _terminal_from_alarm_item(item, car_id_cache)
-                vehicle = await _vehicle_by_terminal(db, terminal_id)
+                plate = str(item.get("carno") or item.get("plate") or "").strip()
+                if not plate and item.get("car_id"):
+                    plate = await _plate_by_platform_car_id(item.get("car_id"), car_id_cache)
+                vehicle = await _resolve_vehicle_for_alarm(db, terminal_id, plate)
+                if vehicle is None:
+                    result.skipped_no_vehicle += 1
+                    continue
+                if _is_unknown_alarm_item(source, item):
+                    result.skipped_unknown_type += 1
+                    continue
                 alarm_time = _parse_api_time(item.get("gpstime") or item.get("ts")) or end_at
                 media = _split_media_files(item.get("files"))
                 if not _has_image_or_video_evidence(media):
@@ -335,9 +422,9 @@ async def _sync_alarm_source(db: AsyncSession, source: str, start_at: datetime, 
                     biz_no=_stable_biz_no(source, ext_id, alarm_time),
                     external_alarm_id=ext_id,
                     terminal_id=terminal_id,
-                    vehicle_id=vehicle.id if vehicle else None,
-                    plate_no=(vehicle.plate_no if vehicle else str(item.get("carno") or ""))[:16],
-                    company_id=vehicle.company_id if vehicle else None,
+                    vehicle_id=vehicle.id,
+                    plate_no=vehicle.plate_no[:16],
+                    company_id=vehicle.company_id,
                     violation_type_code=_as_int(item.get("bjlx") if item.get("bjlx") is not None else item.get("bjid")),
                     violation_type_name=_alarm_type_name(source, item),
                     violation_time=alarm_time,
@@ -395,6 +482,39 @@ async def _sync_positions(db: AsyncSession, terminals: list[str], result: SyncRe
     await _upsert_state(db, _SOURCE_LOCATION, None, _now(), SyncResult(_SOURCE_LOCATION, updated_positions=result.updated_positions))
 
 
+async def _delete_violations_with_tickets(db: AsyncSession, rows: list[VehicleViolation]) -> int:
+    if not rows:
+        return 0
+    biz_nos = [row.biz_no for row in rows if row.biz_no]
+    if biz_nos:
+        tickets = (
+            await db.execute(select(ViolationTicket).where(ViolationTicket.biz_no.in_(biz_nos)))
+        ).scalars().all()
+        for ticket in tickets:
+            await db.delete(ticket)
+    for row in rows:
+        await db.delete(row)
+    return len(rows)
+
+
+async def cleanup_jt808_violations_without_vehicle() -> int:
+    """删除 JT808 同步但无法关联 CESG 车辆的报警记录。"""
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(VehicleViolation).where(
+                    VehicleViolation.source.ilike("jt808%"),
+                    VehicleViolation.vehicle_id.is_(None),
+                )
+            )
+        ).scalars().all()
+        deleted = await _delete_violations_with_tickets(db, list(rows))
+        if deleted:
+            await db.commit()
+            logger.info("已清理无法关联车辆的 JT808 报警记录 %s 条", deleted)
+        return deleted
+
+
 async def cleanup_jt808_violations_without_evidence() -> int:
     """删除历史 JT808 来源但没有图片/视频证据的报警记录。"""
     async with AsyncSessionLocal() as db:
@@ -404,20 +524,27 @@ async def cleanup_jt808_violations_without_evidence() -> int:
             )
         ).scalars().all()
         to_delete = [row for row in rows if not _has_image_or_video_evidence(row.ttx_evidence_refs)]
-        if not to_delete:
-            return 0
-        biz_nos = [row.biz_no for row in to_delete if row.biz_no]
-        if biz_nos:
-            tickets = (
-                await db.execute(select(ViolationTicket).where(ViolationTicket.biz_no.in_(biz_nos)))
-            ).scalars().all()
-            for ticket in tickets:
-                await db.delete(ticket)
-        for row in to_delete:
-            await db.delete(row)
-        await db.commit()
-        logger.info("已清理无图片/视频证据的 JT808 报警记录 %s 条", len(to_delete))
-        return len(to_delete)
+        deleted = await _delete_violations_with_tickets(db, to_delete)
+        if deleted:
+            await db.commit()
+            logger.info("已清理无图片/视频证据的 JT808 报警记录 %s 条", deleted)
+        return deleted
+
+
+async def cleanup_jt808_violations_unknown_type() -> int:
+    """删除 JT808 同步的未知报警类型记录（如「未知报警类型」）。"""
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(VehicleViolation).where(VehicleViolation.source.ilike("jt808%"))
+            )
+        ).scalars().all()
+        to_delete = [row for row in rows if is_unknown_violation_type_name(row.violation_type_name)]
+        deleted = await _delete_violations_with_tickets(db, to_delete)
+        if deleted:
+            await db.commit()
+            logger.info("已清理未知报警类型的 JT808 报警记录 %s 条", deleted)
+        return deleted
 
 
 class Jt808AlarmScheduler:
@@ -435,6 +562,8 @@ class Jt808AlarmScheduler:
         return {
             "enabled": bool(settings.jt808_alarm_sync_enabled),
             "configured": jt808_openapi_client.configured(),
+            "base_url": (settings.jt808_openapi_base_url or "").strip(),
+            "auth_mode": jt808_openapi_client.auth_mode(),
             "running": self.running,
             "interval_seconds": settings.jt808_alarm_sync_interval_seconds,
             "lookback_minutes": settings.jt808_alarm_sync_lookback_minutes,
@@ -469,8 +598,28 @@ class Jt808AlarmScheduler:
         async with AsyncSessionLocal() as db:
             end_at = _now()
             results: list[SyncResult] = []
-            for source in (_SOURCE_ADAS, _SOURCE_DSM):
+            for source in _SYNC_ALARM_SOURCES:
                 start_at = await _last_window_start(db, source)
+                results.append(await _sync_alarm_source(db, source, start_at, end_at))
+            await db.commit()
+        self._last_results = [r.__dict__ for r in results]
+        self._last_error = next((r.error for r in results if r.error), None)
+        return results
+
+    async def run_backfill(self, lookback_minutes: int = 120, reset_state: bool = False) -> list[SyncResult]:
+        if not jt808_openapi_client.configured():
+            raise Jt808OpenApiError("JT808 OpenAPI 配置不完整")
+        async with AsyncSessionLocal() as db:
+            if reset_state:
+                for source in _SYNC_ALARM_SOURCES:
+                    row = await db.scalar(select(Jt808AlarmSyncState).where(Jt808AlarmSyncState.source == source).limit(1))
+                    if row is not None:
+                        await db.delete(row)
+                await db.flush()
+            end_at = _now()
+            start_at = end_at - timedelta(minutes=max(1, int(lookback_minutes)))
+            results: list[SyncResult] = []
+            for source in _SYNC_ALARM_SOURCES:
                 results.append(await _sync_alarm_source(db, source, start_at, end_at))
             await db.commit()
         self._last_results = [r.__dict__ for r in results]

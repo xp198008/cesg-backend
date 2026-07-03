@@ -29,8 +29,15 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.database import init_models
-from app.jt808_alarm_sync import cleanup_jt808_violations_without_evidence, jt808_alarm_scheduler
+from app.jt808_alarm_sync import (
+    cleanup_jt808_violations_unknown_type,
+    cleanup_jt808_violations_without_evidence,
+    cleanup_jt808_violations_without_vehicle,
+    jt808_alarm_scheduler,
+)
+from app.obd_speed_monitor import obd_speed_scheduler
 from app.routers import (
+    api_ai,
     api_alarm_type,
     api_dashboard,
     api_device_fault,
@@ -39,6 +46,7 @@ from app.routers import (
     api_jt808_alarm_sync,
     api_manual_fault,
     api_map_rules,
+    api_obd_speed,
     api_org,
     api_permission_menu,
     api_role,
@@ -106,6 +114,7 @@ app.include_router(api_alarm_type.router)
 app.include_router(api_fault_type.router)
 app.include_router(api_jt808_alarm_sync.router)
 app.include_router(api_map_rules.router)
+app.include_router(api_obd_speed.router)
 app.include_router(api_permission_menu.router)
 app.include_router(api_vehicle_alloc.router)
 app.include_router(api_violation.router)
@@ -116,6 +125,7 @@ app.include_router(api_device_fault.router)
 app.include_router(api_shortcut.router)
 app.include_router(api_dashboard.router)
 app.include_router(api_weather.router)
+app.include_router(api_ai.router)
 
 _ticket_appeal_media_dir = Path(__file__).resolve().parent / "data" / "ticket_appeal_attachments"
 _ticket_appeal_media_dir.mkdir(parents=True, exist_ok=True)
@@ -208,16 +218,22 @@ async def _startup() -> None:
         if rebuilt:
             logger.info("已重建 %s 条登录会话的用户按日在线记录", rebuilt)
     await cleanup_jt808_violations_without_evidence()
+    await cleanup_jt808_violations_without_vehicle()
+    deleted_unknown = await cleanup_jt808_violations_unknown_type()
+    if deleted_unknown:
+        logger.info("启动时已清理未知报警类型记录 %s 条", deleted_unknown)
     await _ensure_default_map_config()
     await _ensure_default_admin()
     await api_vehicle_type.ensure_default_vehicle_types()
     jt808_alarm_scheduler.start()
+    obd_speed_scheduler.start()
     logger.info("CESG 业务后端已就绪：http://127.0.0.1:%s", settings.app_port)
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     await jt808_alarm_scheduler.stop()
+    await obd_speed_scheduler.stop()
 
 
 @app.get("/favicon.ico")

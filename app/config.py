@@ -38,11 +38,14 @@ class Settings(BaseSettings):
     jt808_mysql_password: str = "lgx123"
     jt808_mysql_database: str = "jt808"
 
-    # ---- 新 JT808 OpenAPI：主动安全报警全局调度拉取 ----
-    # 文档见 docs/api.docx；用于 1200/1210/1201/1208/1209。
-    jt808_openapi_base_url: str = "https://www.gb35658.com/lingx3api"
-    jt808_openapi_account: str = ""
-    jt808_openapi_password: str = ""
+    # ---- JT808 主动安全报警拉取（1208 等）----
+    # 自建平台：http://113.207.68.96:8800/api + apicode 8003 登录（lingxtoken）
+    # 公网 OpenAPI：https://www.gb35658.com/lingx3api + apicode 1200（apitoken）
+    jt808_openapi_base_url: str = "http://113.207.68.96:8800/api"
+    # 8003=自建 8800；1200=gb35658。留空则按 base_url / 是否配置 apitoken 自动判断。
+    jt808_openapi_auth_mode: str = "8003"
+    jt808_openapi_account: str = "admin"
+    jt808_openapi_password: str = "123456"
     jt808_openapi_password_hashed: bool = False
     jt808_openapi_apitoken: str = ""
     jt808_openapi_timeout: float = 15.0
@@ -53,6 +56,30 @@ class Settings(BaseSettings):
     jt808_alarm_sync_lookback_minutes: int = 5
     jt808_alarm_sync_page_size: int = 100
     jt808_alarm_sync_max_pages: int = 20
+
+    # ---- OBD 时速违章监测：定时读 Redis OBD 数据，按私有地图规则判定超速 ----
+    # 部署在服务器上时 Redis 走本机回环；本地开发可用 SSH 隧道改 host/port。
+    obd_speed_check_enabled: bool = False
+    obd_speed_check_interval_seconds: int = 30
+    obd_redis_host: str = "127.0.0.1"
+    obd_redis_port: int = 6379
+    obd_redis_password: str = "lgx123"
+    # JT808 平台 redis.properties 默认 database=1；与 808 共用实例时须读同一库
+    obd_redis_db: int = 1
+    obd_redis_key_pattern: str = "*_OBD"
+    # 时速低于该值（km/h）不处理
+    obd_min_speed_kmh: float = 10.0
+    # OBD 读数 / 坐标快照超过该秒数视为过期，跳过判定
+    obd_stale_seconds: int = 300
+    # 限速折线的命中缓冲带（米）：车距折线多远内算"在该路段上"
+    obd_polyline_buffer_m: float = 30.0
+
+    # ---- Agent Worker AI（docs/AI.PDF）----
+    agent_worker_base_url: str = "http://113.207.68.94:5002"
+    agent_worker_api_key: str = ""
+    agent_worker_default_company: str = "三峰城服"
+    agent_worker_timeout: float = 60.0
+    agent_worker_video_timeout: float = 300.0
 
 
 settings = Settings()

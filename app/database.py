@@ -103,6 +103,8 @@ async def init_models() -> None:
                     await conn.exec_driver_sql("ALTER TABLE vehicle_violation ADD COLUMN pre_audit_kind VARCHAR(16)")
                 if "ticket_appeal_attachment_refs" not in names:
                     await conn.exec_driver_sql("ALTER TABLE vehicle_violation ADD COLUMN ticket_appeal_attachment_refs TEXT")
+                if "ai_queried" not in names:
+                    await conn.exec_driver_sql("ALTER TABLE vehicle_violation ADD COLUMN ai_queried BOOLEAN DEFAULT 0")
             cols = await conn.exec_driver_sql("PRAGMA table_info(vehicle_location)")
             names = {row[1] for row in cols.fetchall()}
             if names and "source" not in names:
