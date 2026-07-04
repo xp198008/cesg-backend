@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import uuid
 from datetime import datetime
@@ -18,7 +19,8 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import Driver, Fleet, OrgCompany, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTicket, ViolationTypeDict
+from app.jt808_follow import expand_terminal_id_variants, fetch_followed_device_ids
+from app.models import Driver, Fleet, OrgCompany, SysUser, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTicket, ViolationTypeDict
 from app.org_scope import collect_org_company_subtree_ids, require_x_org_id_header
 from app.plate_util import norm_plate
 from app.routers.api_vehicle import _vehicle_list_company_fleet_names
@@ -31,6 +33,7 @@ from app.violation_ai_assessment import (
 from app.violation_filters import violation_list_visibility
 
 router = APIRouter(prefix="/api/violation", tags=["violation"])
+logger = logging.getLogger(__name__)
 
 
 class ViolationHandleIn(BaseModel):
@@ -301,6 +304,64 @@ async def _scoped_query(db: AsyncSession, x_org_id: str | None):
     return q
 
 
+def _resolve_follow_user_id(user_id: int | None, x_user_id: str | None) -> int | None:
+    if user_id is not None:
+        return int(user_id)
+    raw = (x_user_id or "").strip()
+    if raw.isdigit():
+        return int(raw)
+    return None
+
+
+async def _apply_followed_only_filter(
+    db: AsyncSession,
+    q,
+    *,
+    followed_only: bool,
+    user_id: int | None,
+    x_user_id: str | None,
+):
+    if not followed_only:
+        return q
+
+    uid = _resolve_follow_user_id(user_id, x_user_id)
+    if uid is None:
+        return q.where(VehicleViolation.id == -1)
+
+    user = await db.scalar(select(SysUser).where(SysUser.id == uid).limit(1))
+    if user is None or not user.is_active:
+        return q.where(VehicleViolation.id == -1)
+
+    username = (user.username or "").strip()
+    pwd_plain = (getattr(user, "password_plain", None) or "").strip()
+    if not username or not pwd_plain:
+        raise HTTPException(status_code=400, detail="当前用户未存储808登录凭据，无法筛选关注车辆，请重新登录")
+
+    try:
+        device_ids = await fetch_followed_device_ids(username, pwd_plain)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fetch followed devices failed user_id=%s account=%s: %s", uid, username, exc)
+        raise HTTPException(status_code=502, detail=f"获取关注车辆失败：{exc}") from exc
+
+    if not device_ids:
+        return q.where(VehicleViolation.id == -1)
+
+    match_ids = expand_terminal_id_variants(device_ids)
+    device_match = or_(
+        VehicleDevice.device_no.in_(match_ids),
+        VehicleDevice.device_sn.in_(match_ids),
+        VehicleDevice.sim_no.in_(match_ids),
+        VehicleDevice.actual_sim.in_(match_ids),
+    )
+    vehicle_ids_subq = select(VehicleDevice.vehicle_id).where(device_match).distinct()
+    return q.where(
+        or_(
+            VehicleViolation.terminal_id.in_(match_ids),
+            VehicleViolation.vehicle_id.in_(vehicle_ids_subq),
+        )
+    )
+
+
 @router.get("/list")
 async def violation_list(
     status: str | None = Query(None),
@@ -310,14 +371,24 @@ async def violation_list(
     source: str | None = Query(None),
     start_time: str | None = Query(None),
     end_time: str | None = Query(None),
+    followed_only: bool = Query(False),
+    user_id: int | None = Query(None, ge=1),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     limit: int | None = Query(None, ge=1, le=2000),
     offset: int | None = Query(None, ge=0),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
     q = await _scoped_query(db, x_org_id)
+    q = await _apply_followed_only_filter(
+        db,
+        q,
+        followed_only=followed_only,
+        user_id=user_id,
+        x_user_id=x_user_id,
+    )
     if status:
         if status == "pending":
             q = q.where(
