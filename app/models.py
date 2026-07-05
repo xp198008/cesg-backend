@@ -724,3 +724,47 @@ class UserOperationLog(Base):
     device_no = Column(String(64), nullable=True)
     source = Column(String(16), nullable=False, server_default="manual", index=True)
     created_at = Column(DateTime, nullable=False, server_default=func.now(), index=True)
+
+
+class VehicleFaultLive(Base):
+    """实时故障车辆（来自 Redis QUEUE_GZM 的 LPOP 消费结果）。
+
+    与 manual_fault_report（人工报障）和 jt_device_fault（0x0200 报警位）互补，
+    供智慧看板"车辆运行状态"栏展示当前故障车辆汇总与近期列表。
+    TTL 由 redis_queue_fault_ttl_hours 控制，超期自动清理。
+    """
+
+    __tablename__ = "vehicle_fault_live"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    device_no = Column(String(64), nullable=True, index=True)
+    plate_no = Column(String(32), nullable=True, index=True)
+    vehicle_id = Column(Integer, nullable=True, index=True)
+    company_id = Column(Integer, nullable=True, index=True)
+    fault_code = Column(String(64), nullable=True)
+    fault_level = Column(String(16), nullable=True, index=True)
+    report_time = Column(DateTime, nullable=True, index=True)
+    handled = Column(Boolean, nullable=False, server_default="0", index=True)
+    raw = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now(), index=True)
+
+
+class ObdEnergySnapshot(Base):
+    """OBD 能耗快照（来自 Redis QUEUE_OBD_YC/QUEUE_OBD_DC 的 LPOP 消费结果）。
+
+    同设备同日只保留最新一条（device_no + day + energy_type 唯一约束），
+    供智慧看板"油耗/电耗统计"展示今日能耗、百公里能耗与近 7 日走势。
+    """
+
+    __tablename__ = "obd_energy_snapshot"
+    __table_args__ = (
+        UniqueConstraint("device_no", "day", "energy_type", name="uq_obd_energy_dev_day_type"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    device_no = Column(String(64), nullable=True, index=True)
+    energy_type = Column(String(4), nullable=False, index=True)  # oil / ev
+    fuel = Column(Float, nullable=True)        # 油车：升；电车：kWh（统一存 fuel 列）
+    mileage = Column(Float, nullable=True)     # km
+    report_time = Column(DateTime, nullable=True, index=True)
+    day = Column(String(8), nullable=True, index=True)  # yyyyMMdd
+    raw = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now(), index=True)

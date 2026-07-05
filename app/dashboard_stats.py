@@ -6,7 +6,16 @@ from datetime import datetime, timedelta
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Driver, ManualFaultReport, OrgCompany, Vehicle, VehicleLocation, VehicleViolation
+from app.models import (
+    Driver,
+    ManualFaultReport,
+    ObdEnergySnapshot,
+    OrgCompany,
+    Vehicle,
+    VehicleFaultLive,
+    VehicleLocation,
+    VehicleViolation,
+)
 from app.org_scope import collect_org_company_subtree_ids, require_x_org_id_header, wants_org_tree_scope
 from app.violation_filters import violation_list_visibility
 
@@ -251,7 +260,139 @@ async def _board_faults(db: AsyncSession, scoped_company_ids: set[int] | None) -
         for r in recent_rows
     ]
 
+    # 合并 Redis QUEUE_GZM 实时故障（vehicle_fault_live）
+    live_levels, live_total, live_recent = await _board_faults_live(db, scoped_company_ids)
+    for level_item in levels:
+        level_item["count"] += live_levels.get(level_item["level"], 0)
+    total += live_total
+    # 实时故障按时间倒序合并到 recent 头部，整体截断到 20 条
+    recent = live_recent + recent
+    if len(recent) > 20:
+        recent = recent[:20]
+
     return {"total": total, "handled": handled_total, "levels": levels, "recent": recent}
+
+
+async def _board_faults_live(
+    db: AsyncSession, scoped_company_ids: set[int] | None
+) -> tuple[dict[str, int], int, list[dict]]:
+    """从 vehicle_fault_live 取实时故障：返回 (按一级/二级/三级映射后的计数, 总数, 近期列表)。
+
+    live 表 fault_level 已归一化为 高/中/低；映射到 _FAULT_LEVEL_MAP 的标签。
+    """
+    def scoped(q):
+        if scoped_company_ids is not None:
+            q = q.where(
+                or_(
+                    VehicleFaultLive.company_id.in_(scoped_company_ids),
+                    VehicleFaultLive.company_id.is_(None),
+                )
+            )
+        return q
+
+    try:
+        level_rows = (
+            await db.execute(
+                scoped(
+                    select(
+                        VehicleFaultLive.fault_level,
+                        func.count().label("cnt"),
+                    ).where(VehicleFaultLive.fault_level.is_not(None)).group_by(VehicleFaultLive.fault_level)
+                )
+            )
+        ).all()
+    except Exception:  # noqa: BLE001
+        level_rows = []
+    live_levels: dict[str, int] = {}
+    for r in level_rows:
+        label = _FAULT_LEVEL_MAP.get(str(r[0] or "中"), "二级故障")
+        live_levels[label] = live_levels.get(label, 0) + int(r[1] or 0)
+    live_total = sum(live_levels.values())
+
+    try:
+        recent_rows = (
+            await db.execute(
+                scoped(
+                    select(
+                        VehicleFaultLive.report_time,
+                        VehicleFaultLive.plate_no,
+                        VehicleFaultLive.fault_level,
+                        VehicleFaultLive.handled,
+                    ).order_by(VehicleFaultLive.report_time.desc()).limit(20)
+                )
+            )
+        ).all()
+    except Exception:  # noqa: BLE001
+        recent_rows = []
+    live_recent = [
+        {
+            "time": _fmt_dt(r[0]),
+            "plate_no": r[1] or "—",
+            "level": _FAULT_LEVEL_MAP.get(str(r[2] or "中"), "二级故障"),
+            "status": "已处理" if r[3] else "待处理",
+        }
+        for r in recent_rows
+    ]
+    return live_levels, live_total, live_recent
+
+
+async def _board_energy(db: AsyncSession, scoped_company_ids: set[int] | None) -> dict:
+    """油/电耗统计。
+
+    oil.mileage 为各车 bclc（本次里程）之和。
+    oil.fuel 为 OBD fdjrlll(L/h) 积分估算的当日累计油耗；808 油箱液位(1169)有数据时前端优先展示 808。
+    """
+    today = datetime.now().strftime("%Y%m%d")
+    days_7: list[str] = []
+    for i in range(6, -1, -1):
+        d = datetime.now() - timedelta(days=i)
+        days_7.append(d.strftime("%Y%m%d"))
+
+    async def _agg_one(etype: str) -> dict:
+        # 今日：取 today 的快照，按"最新读数"求和（每车当日只留一条 upsert）
+        try:
+            today_rows = (
+                await db.execute(
+                    select(ObdEnergySnapshot.fuel, ObdEnergySnapshot.mileage).where(
+                        ObdEnergySnapshot.energy_type == etype,
+                        ObdEnergySnapshot.day == today,
+                    )
+                )
+            ).all()
+        except Exception:  # noqa: BLE001
+            today_rows = []
+        today_fuel = sum(float(r[0] or 0) for r in today_rows)
+        today_mileage = sum(float(r[1] or 0) for r in today_rows)
+        per100 = None
+        if today_mileage > 0 and today_fuel > 0:
+            per100 = round((today_fuel / today_mileage) * 100, 1)
+
+        # 近 7 日走势：每日 sum(fuel)
+        daily = []
+        for d in days_7:
+            try:
+                row = (
+                    await db.execute(
+                        select(func.sum(ObdEnergySnapshot.fuel)).where(
+                            ObdEnergySnapshot.energy_type == etype,
+                            ObdEnergySnapshot.day == d,
+                        )
+                    )
+                ).scalar()
+            except Exception:  # noqa: BLE001
+                row = None
+            label = f"{int(d[4:6])}/{int(d[6:8])}"
+            daily.append({"label": label, "fuel": round(float(row or 0), 1)})
+        return {
+            "today": round(today_fuel, 1) if today_fuel else 0,
+            "mileage": round(today_mileage, 1) if today_mileage else 0,
+            "per100": per100,
+            "daily": daily,
+        }
+
+    oil = await _agg_one("oil")
+    ev = await _agg_one("ev")
+    return {"oil": oil, "ev": ev}
 
 
 async def _board_drivers(db: AsyncSession, scoped_company_ids: set[int] | None) -> dict:
@@ -314,6 +455,7 @@ async def build_board_stats(db: AsyncSession, x_org_id: str | None) -> dict:
     warnings = await _board_warnings(db, scope, now)
     faults = await _board_faults(db, scoped_company_ids)
     drivers = await _board_drivers(db, scoped_company_ids)
+    energy = await _board_energy(db, scoped_company_ids)
 
     return {
         "ok": True,
@@ -321,4 +463,5 @@ async def build_board_stats(db: AsyncSession, x_org_id: str | None) -> dict:
         "warnings": warnings,
         "faults": faults,
         "drivers": drivers,
+        "energy": energy,
     }

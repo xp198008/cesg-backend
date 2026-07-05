@@ -74,6 +74,19 @@ class Settings(BaseSettings):
     # 限速折线的命中缓冲带（米）：车距折线多远内算"在该路段上"
     obd_polyline_buffer_m: float = 30.0
 
+    # ---- 智慧看板 Redis 队列消费（LPOP）----
+    # 复用 obd_redis_* 连接参数，不重复配置 host/port/password/db
+    redis_queue_enabled: bool = True
+    redis_queue_gzm: str = "QUEUE_GZM"
+    redis_queue_obd_yc: str = "QUEUE_OBD_YC"
+    redis_queue_obd_dc: str = "QUEUE_OBD_DC"
+    # 每轮 LPOP 条数上限（防止队列堆积时长时间占用）
+    redis_queue_batch_size: int = 200
+    # 调度间隔（秒）
+    redis_queue_interval_seconds: int = 5
+    # 故障记录保留时长（小时），超时自动清理
+    redis_queue_fault_ttl_hours: int = 72
+
     # ---- Agent Worker AI（docs/AI.PDF）----
     agent_worker_base_url: str = "http://113.207.68.94:5002"
     agent_worker_api_key: str = ""

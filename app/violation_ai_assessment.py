@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_worker_client import AgentWorkerError, agent_worker_client
 from app.ai_datasets import match_ai_company
+from app.media_url import extract_adas_relative_path, jt808_media_origin
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models import OrgCompany, Vehicle, VehicleViolation, ViolationAiAssessment
@@ -80,9 +81,16 @@ def _resolve_fetch_url(raw: str) -> str:
     if not s:
         return ""
     if s.startswith("http://") or s.startswith("https://"):
+        rel = extract_adas_relative_path(s)
+        if rel:
+            return f"{jt808_media_origin()}/ADAS_FILE/{rel}"
         return s
-    if s.startswith("/ADAS_FILE/"):
-        return f"https://www.gb35658.com{s}"
+    if s.startswith("/cmapi/media/adas/") or s.startswith("/api/media/adas/"):
+        rel = s.split("/media/adas/", 1)[-1].lstrip("/")
+        return f"{jt808_media_origin()}/ADAS_FILE/{rel}" if rel else ""
+    rel = extract_adas_relative_path(s)
+    if rel and "ADAS_FILE" in s.upper():
+        return f"{jt808_media_origin()}/ADAS_FILE/{rel}"
     if s.startswith("/cmmedia/"):
         s = s.replace("/cmmedia/", "/media/", 1)
     if s.startswith("/cmapi/"):

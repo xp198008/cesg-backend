@@ -36,6 +36,7 @@ from app.jt808_alarm_sync import (
     jt808_alarm_scheduler,
 )
 from app.obd_speed_monitor import obd_speed_scheduler
+from app.redis_queue_consumer import redis_queue_scheduler
 from app.routers import (
     api_ai,
     api_alarm_type,
@@ -47,6 +48,7 @@ from app.routers import (
     api_knowledge,
     api_manual_fault,
     api_map_rules,
+    api_media,
     api_obd_speed,
     api_org,
     api_permission_menu,
@@ -94,6 +96,9 @@ async def vehicle_type_icon_file(filename: str):
 _driver_avatar_media_dir = Path(__file__).resolve().parent / "data" / "driver_avatars"
 _driver_avatar_media_dir.mkdir(parents=True, exist_ok=True)
 
+_violation_snapshot_media_dir = Path(__file__).resolve().parent / "data" / "violation_snapshots"
+_violation_snapshot_media_dir.mkdir(parents=True, exist_ok=True)
+
 
 @app.get("/media/driver-avatars/{filename}")
 async def driver_avatar_file(filename: str):
@@ -120,6 +125,7 @@ app.include_router(api_obd_speed.router)
 app.include_router(api_permission_menu.router)
 app.include_router(api_vehicle_alloc.router)
 app.include_router(api_violation.router)
+app.include_router(api_media.router)
 app.include_router(api_violation_ticket.router)
 app.include_router(api_violation_type.router)
 app.include_router(api_manual_fault.router)
@@ -143,6 +149,12 @@ app.mount(
     "/media/vehicle-type-icons",
     StaticFiles(directory=str(_vehicle_type_icon_media_dir)),
     name="vehicle-type-icons",
+)
+
+app.mount(
+    "/media/violation-snapshots",
+    StaticFiles(directory=str(_violation_snapshot_media_dir)),
+    name="violation-snapshots",
 )
 
 
@@ -231,6 +243,7 @@ async def _startup() -> None:
     await api_vehicle_type.ensure_default_vehicle_types()
     jt808_alarm_scheduler.start()
     obd_speed_scheduler.start()
+    redis_queue_scheduler.start()
     logger.info("CESG 业务后端已就绪：http://127.0.0.1:%s", settings.app_port)
 
 
@@ -238,6 +251,7 @@ async def _startup() -> None:
 async def _shutdown() -> None:
     await jt808_alarm_scheduler.stop()
     await obd_speed_scheduler.stop()
+    await redis_queue_scheduler.stop()
 
 
 @app.get("/favicon.ico")

@@ -12,7 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Header, Query, UploadFile
+from starlette.datastructures import UploadFile as StarletteUploadFile
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_, select
@@ -20,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.jt808_follow import expand_terminal_id_variants, fetch_followed_device_ids
+from app.media_url import normalize_evidence_payload
 from app.models import Driver, Fleet, OrgCompany, SysUser, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTicket, ViolationTypeDict
 from app.org_scope import collect_org_company_subtree_ids, require_x_org_id_header
 from app.plate_util import norm_plate
@@ -87,6 +89,45 @@ class TicketAppealIn(BaseModel):
 
 _TICKET_APPEAL_ALLOWED_EXTS = {".xls", ".xlsx", ".doc", ".docx", ".pdf", ".jpg", ".jpeg", ".bmp", ".png", ".txt"}
 _TICKET_APPEAL_MAX_FILE_BYTES = 20 * 1024 * 1024
+_TICKET_APPEAL_FORM_FILE_KEYS = ("files", "file", "attachments")
+
+
+def _ext_from_content_type(content_type: str | None) -> str:
+    ct = (content_type or "").lower().split(";", 1)[0].strip()
+    return {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/bmp": ".bmp",
+        "application/pdf": ".pdf",
+        "text/plain": ".txt",
+        "application/msword": ".doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/vnd.ms-excel": ".xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    }.get(ct, "")
+
+
+def _collect_ticket_appeal_upload_files(form) -> list[StarletteUploadFile]:
+    found: list[StarletteUploadFile] = []
+    seen: set[int] = set()
+    for key, value in form.multi_items():
+        if key not in _TICKET_APPEAL_FORM_FILE_KEYS or not isinstance(value, StarletteUploadFile):
+            continue
+        obj_id = id(value)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        found.append(value)
+    return found
+
+
+def _resolve_ticket_appeal_filename(file: StarletteUploadFile) -> str:
+    original = (file.filename or "").strip().replace("\\", "/").split("/")[-1]
+    if original:
+        return original[:255]
+    ext = _ext_from_content_type(file.content_type) or ".bin"
+    return f"attachment_{uuid.uuid4().hex[:8]}{ext}"
 
 
 def _ticket_appeal_attachment_base_dir() -> Path:
@@ -106,10 +147,8 @@ def _json_loads(raw: str | None, fallback: Any) -> Any:
         return fallback
 
 
-async def _save_ticket_appeal_upload(violation_id: int, file: UploadFile) -> dict[str, Any]:
-    original = (file.filename or "").strip()
-    if not original:
-        raise HTTPException(status_code=400, detail="附件缺少文件名")
+async def _save_ticket_appeal_upload(violation_id: int, file: StarletteUploadFile) -> dict[str, Any]:
+    original = _resolve_ticket_appeal_filename(file)
     ext = Path(original).suffix.lower()
     if ext not in _TICKET_APPEAL_ALLOWED_EXTS:
         raise HTTPException(status_code=400, detail="申诉附件仅支持 EXCEL、WORD、PDF、JPG、BMP、PNG、TXT")
@@ -240,6 +279,7 @@ def _row_out(row: VehicleViolation, ticket_by_biz: dict[str, ViolationTicket] | 
     ticket_by_biz = ticket_by_biz or {}
     ticket = ticket_by_biz.get(row.biz_no or "")
     evidence = _json_loads(row.ttx_evidence_refs, {})
+    evidence_norm = normalize_evidence_payload(evidence) if isinstance(evidence, dict) else {"images": [], "videos": []}
     return {
         "id": row.id,
         "biz_no": row.biz_no,
@@ -260,8 +300,8 @@ def _row_out(row: VehicleViolation, ticket_by_biz: dict[str, ViolationTicket] | 
         "stream_snapshot_refs": _json_loads(row.stream_snapshot_refs, []),
         "stream_snapshot_paths": _json_loads(row.stream_snapshot_refs, []),
         "ttx_evidence_refs": _json_loads(row.ttx_evidence_refs, []),
-        "evidence_images": evidence.get("images", []) if isinstance(evidence, dict) else [],
-        "evidence_videos": evidence.get("videos", []) if isinstance(evidence, dict) else [],
+        "evidence_images": evidence_norm.get("images", []),
+        "evidence_videos": evidence_norm.get("videos", []),
         "status": row.status,
         "pre_audit_kind": row.pre_audit_kind,
         "ticket_appeal_remark": row.ticket_appeal_remark,
@@ -538,18 +578,12 @@ async def violation_fetch_device_media(violation_id: int, db: AsyncSession = Dep
     row = await db.scalar(select(VehicleViolation).where(VehicleViolation.id == violation_id).limit(1))
     if row is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    evidence = _json_loads(row.ttx_evidence_refs, {})
-    if isinstance(evidence, dict):
-        images = evidence.get("images") if isinstance(evidence.get("images"), list) else []
-        videos = evidence.get("videos") if isinstance(evidence.get("videos"), list) else []
-    else:
-        images = []
-        videos = []
+    evidence = normalize_evidence_payload(_json_loads(row.ttx_evidence_refs, {}))
     return {
         "ok": True,
         "message": "已读取本地同步的 JT808 证据",
-        "images": images,
-        "videos": videos,
+        "images": evidence.get("images", []),
+        "videos": evidence.get("videos", []),
         "downlink": [],
     }
 
@@ -678,8 +712,7 @@ async def violation_ticket_appeal(violation_id: int, body: TicketAppealIn, db: A
 @router.post("/{violation_id}/ticket-appeal-submit-with-attachments")
 async def violation_ticket_appeal_with_attachments(
     violation_id: int,
-    remark: str = Form(..., min_length=1, max_length=2000),
-    files: list[UploadFile] | None = File(None),
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """罚单待处理 → 待审核（罚单岗申诉），支持上传申诉附件。"""
@@ -689,12 +722,18 @@ async def violation_ticket_appeal_with_attachments(
     if (row.status or "").strip() != "罚单待处理":
         raise HTTPException(status_code=400, detail="仅「罚单待处理」记录可提交申诉")
 
-    rm = (remark or "").strip()
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" not in ctype:
+        raise HTTPException(status_code=400, detail="申诉附件须以 multipart/form-data 提交")
+
+    form = await request.form()
+    rm = str(form.get("remark") or "").strip()
     if not rm:
         raise HTTPException(status_code=400, detail="申诉说明不能为空")
 
+    upload_files = _collect_ticket_appeal_upload_files(form)
     refs: list[dict[str, Any]] = []
-    for f in files or []:
+    for f in upload_files:
         refs.append(await _save_ticket_appeal_upload(violation_id, f))
 
     row.status = "待审核"
@@ -706,7 +745,12 @@ async def violation_ticket_appeal_with_attachments(
     row.audited_at = None
     await db.flush()
     await db.refresh(row)
-    return {"ok": True, "data": await _row_out_enriched(db, row)}
+    return {
+        "ok": True,
+        "data": await _row_out_enriched(db, row),
+        "attachment_count": len(refs),
+        "files_received": len(upload_files),
+    }
 
 
 @router.patch("/{violation_id}/false-alarm-reopen")

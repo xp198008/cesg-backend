@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
-from urllib.parse import urlsplit
+from app.media_url import extract_adas_relative_path
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -204,12 +204,18 @@ def _jt808_media_url(raw: Any) -> str:
     if not url:
         return ""
     if re.match(r"^https?://", url, flags=re.I):
+        # 存库时用相对路径，HTTPS 页面不再触发混合内容
+        for prefix in (
+            "http://113.207.68.96:8800",
+            "http://127.0.0.1:8800",
+            "https://113.207.68.96:8800",
+        ):
+            if url.startswith(prefix):
+                path = url[len(prefix) :]
+                return path if path.startswith("/") else f"/{path}"
         return url
     if url.startswith("/ADAS_FILE/"):
-        base = (settings.jt808_openapi_base_url or "").strip()
-        parsed = urlsplit(base)
-        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else "https://www.gb35658.com"
-        return origin + url
+        return url
     return url
 
 
