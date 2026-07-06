@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from app.timeutil import china_now_naive
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -50,7 +52,7 @@ async def violation_ticket_create(body: ViolationTicketCreateIn, db: AsyncSessio
             vio.pre_audit_kind = "ticket"
             if creator:
                 vio.handler_name = creator
-                vio.handled_at = datetime.now()
+                vio.handled_at = china_now_naive()
         if creator and not (existing.created_by_name or "").strip():
             existing.created_by_name = creator
         await db.flush()
@@ -70,7 +72,7 @@ async def violation_ticket_create(body: ViolationTicketCreateIn, db: AsyncSessio
     vio.pre_audit_kind = "ticket"
     if creator:
         vio.handler_name = creator
-        vio.handled_at = datetime.now()
+        vio.handled_at = china_now_naive()
     await db.flush()
     await db.refresh(row)
     return {"ok": True, "item": _row_out(row)}

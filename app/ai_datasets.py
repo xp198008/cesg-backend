@@ -1,76 +1,76 @@
-"""Agent Worker 知识库 dataset_id 对照（docs/AI.PDF 第四节）。"""
-
-from __future__ import annotations
-
-from app.config import settings
-
-# 知识库名称 -> dataset_id（UUID）
-AI_DATASETS: dict[str, str] = {
-    "垫江公司": "7845fcd3-2332-45ac-a7ab-dc3fbe163455",
-    "合川分公司": "5b24ac06-a9fd-4f85-ad4d-1488b97765d4",
-    "江津公司": "07f20588-cae0-45fd-8dfe-b1a7e669aebd",
-    "铜梁公司": "7c67473b-3793-4bbe-82ff-ee47c3a70b33",
-    "渝环公司": "7944568e-548a-4e21-a02b-d2b76fd4f642",
-    "长寿公司": "e329a9d4-de57-49a9-905e-aae8451364ae",
-    "三峰城服": "aea0a41f-2257-431d-95bb-91cf3f3cb5cc",
-    "固废运输公司": "6df0852f-0eb7-4ba4-a082-883d9729b896",
-    "涪陵公司": "98697f6f-1a43-4152-9d4b-c04056acaf03",
-    "綦江公司": "f914c86f-e65e-46b8-9f17-e47b2c1753ee",
-    "益康工程": "2bd1751e-d7ec-4e49-ac17-c0ac21d15e4d",
-    "南岸公司": "a6d485a0-4857-463a-9df8-9c9e947366a0",
-    "黔江公司": "7dff0cba-b600-4ec5-855f-d9cabc4e80a0",
-    "环卫集团及水务环境集团": "31000bd4-0bd4-4af5-ad77-19bfd12b2f4d",
-    "永川公司": "2e96934f-a342-426d-9a13-3008c6688dcd",
-    "璧山公司": "c3ac9e17-fe94-419b-9f4a-1b66248c1894",
-    "固废处理公司": "92999a64-a12e-471a-8a51-1bc7190287d5",
-    "南川公司": "dfd36c1c-a428-412c-9e68-5161ef688272",
-    "水域公司": "483810ad-18cf-4b8f-b9eb-aa951ee3e5fb",
-    "益渝公司": "4c12b7ba-718b-4add-ba90-f02738d8530b",
-    "北碚公司": "0a0199c1-67b3-4ab1-aa82-af0a85ac0f11",
-}
-
-
-def match_ai_company(org_name: str | None) -> str | None:
-    """机构名 → AI 知识库公司名；匹配不到返回 None（不兜底）。"""
-    name = (org_name or "").strip()
-    if not name:
-        return None
-
-    if name in AI_DATASETS:
-        return name
-
-    for key in AI_DATASETS:
-        if key in name or name in key:
-            return key
-
-    simplified = (
-        name.replace("重庆市", "")
-        .replace("重庆", "")
-        .replace("有限责任公司", "")
-        .replace("有限公司", "")
-        .replace("分公司", "")
-        .strip()
-    )
-    if not simplified:
-        return None
-    for key in AI_DATASETS:
-        ks = key.replace("分公司", "").replace("公司", "").strip()
-        if ks and (ks in simplified or simplified.startswith(ks) or ks.startswith(simplified)):
-            return key
-
-    return None
-
-
-def resolve_ai_company(org_name: str | None, *, override: str | None = None) -> str:
-    """将 CESG 机构名映射为 Agent Worker 的 x-company（知识库/规章查询用）。"""
-    if override and override.strip():
-        return override.strip()
-
-    matched = match_ai_company(org_name)
-    if matched:
-        return matched
-    return (settings.agent_worker_default_company or "三峰城服").strip()
-
-
-def resolve_dataset_id(company: str) -> str | None:
-    return AI_DATASETS.get((company or "").strip())
+"""Agent Worker 知识库 dataset_id 对照（docs/AI.PDF 第四节）。"""
+
+from __future__ import annotations
+
+from app.config import settings
+
+# 知识库名称 -> dataset_id（UUID）
+AI_DATASETS: dict[str, str] = {
+    "垫江公司": "662ad5c8-85a4-48f7-ab8e-8ea0de39a879",
+    "合川分公司": "6c83f810-415c-494f-affd-5af95cbd3be4",
+    "江津公司": "40e10b47-4cfc-471e-aafb-2e276d28c239",
+    "铜梁公司": "6075ba3b-e494-4570-b47d-09be59ce970a",
+    "渝环公司": "d6308795-2649-43aa-aa17-1ac1f4e33071",
+    "长寿公司": "638546ca-50a6-43e8-a887-9c7f74b82820",
+    "三峰城服": "7c2784c2-3267-4a0a-b231-22e1d9d9c420",
+    "固废运输公司": "d4008312-1c7f-43c2-869a-1ff2996a2b72",
+    "涪陵公司": "95147708-4e16-4f5a-9a14-c9430f3d259e",
+    "綦江公司": "90dc6d46-604f-4601-ab06-a358dae461a2",
+    "益康工程": "16cbe50f-c04b-4c5c-81da-6e158ac7c0df",
+    "南岸公司": "563e5ef6-514d-4619-b84d-50811c521adc",
+    "黔江公司": "40cdaf34-db61-45ee-9a65-3d8bf7b2be86",
+    "环卫集团及水务环境集团": "818405f2-283e-4a40-b468-9b8b80091bac",
+    "永川公司": "65a53e19-9e67-4824-9d0d-8fec98bf5867",
+    "璧山公司": "b9e1bf7c-637e-422f-94ad-be00d7d76af2",
+    "固废处理公司": "2bd3ae66-0b19-410b-a56c-9b0709f83ffc",
+    "南川公司": "12371ada-11c8-4431-ace5-b17a23e7ea56",
+    "水域公司": "a01e9b6a-ae0c-4ff9-bc76-42ce6f177cb4",
+    "益渝公司": "bee8ab3a-f539-474f-affc-ce205af887c5",
+    "北碚公司": "5aa74f41-1b7d-4e7d-867a-6516c341a2fc",
+}
+
+
+def match_ai_company(org_name: str | None) -> str | None:
+    """机构名 → AI 知识库公司名；匹配不到返回 None（不兜底）。"""
+    name = (org_name or "").strip()
+    if not name:
+        return None
+
+    if name in AI_DATASETS:
+        return name
+
+    for key in AI_DATASETS:
+        if key in name or name in key:
+            return key
+
+    simplified = (
+        name.replace("重庆市", "")
+        .replace("重庆", "")
+        .replace("有限责任公司", "")
+        .replace("有限公司", "")
+        .replace("分公司", "")
+        .strip()
+    )
+    if not simplified:
+        return None
+    for key in AI_DATASETS:
+        ks = key.replace("分公司", "").replace("公司", "").strip()
+        if ks and (ks in simplified or simplified.startswith(ks) or ks.startswith(simplified)):
+            return key
+
+    return None
+
+
+def resolve_ai_company(org_name: str | None, *, override: str | None = None) -> str:
+    """将 CESG 机构名映射为 Agent Worker 的 x-company（知识库/规章查询用）。"""
+    if override and override.strip():
+        return override.strip()
+
+    matched = match_ai_company(org_name)
+    if matched:
+        return matched
+    return (settings.agent_worker_default_company or "三峰城服").strip()
+
+
+def resolve_dataset_id(company: str) -> str | None:
+    return AI_DATASETS.get((company or "").strip())

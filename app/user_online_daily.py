@@ -4,6 +4,8 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date, datetime, time as dt_time, timedelta
 
+from app.timeutil import china_now_naive
+
 from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -287,7 +289,7 @@ async def recompute_user_daily_for_date(
     if not rows:
         return None
 
-    now = datetime.now()
+    now = china_now_naive()
     day_start = datetime.combine(stat_date, dt_time.min)
     day_end = day_start + timedelta(days=1)
     sessions: list[tuple[datetime, datetime]] = []
@@ -351,7 +353,7 @@ async def close_open_sessions_for_user(
     logout_at: datetime | None = None,
     exclude_id: int | None = None,
 ) -> None:
-    now = logout_at or datetime.now()
+    now = logout_at or china_now_naive()
     stmt = select(UserLoginLog).where(
         UserLoginLog.username == (username or "")[:64],
         UserLoginLog.logout_at.is_(None),
@@ -371,7 +373,7 @@ async def close_open_sessions_for_user(
 
 
 async def record_login_daily(db: AsyncSession, login_row: UserLoginLog) -> None:
-    login_at = login_row.login_at or datetime.now()
+    login_at = login_row.login_at or china_now_naive()
     login_date = login_at.date() if hasattr(login_at, "date") else login_at
     await recompute_user_daily_for_date(db, login_row.username, login_date)
 
@@ -382,7 +384,7 @@ async def sync_login_session_to_daily(
     *,
     until: datetime | None = None,
 ) -> None:
-    now = until or datetime.now()
+    now = until or china_now_naive()
     login_row.last_heartbeat_at = now
     if login_row.login_at is not None:
         login_at = login_row.login_at
@@ -394,7 +396,7 @@ async def sync_login_session_to_daily(
 
 async def finalize_stale_open_sessions(db: AsyncSession, *, now: datetime | None = None) -> int:
     """补全未退出且已长时间无心跳的登录记录结束时间。"""
-    current = now or datetime.now()
+    current = now or china_now_naive()
     rows = (
         await db.execute(
             select(UserLoginLog)
@@ -438,7 +440,7 @@ async def rebuild_daily_from_login_logs(db: AsyncSession) -> int:
         await db.flush()
         return 0
 
-    now = datetime.now()
+    now = china_now_naive()
     await finalize_stale_open_sessions(db, now=now)
 
     by_user: dict[str, list[UserLoginLog]] = defaultdict(list)

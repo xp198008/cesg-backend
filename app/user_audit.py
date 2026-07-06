@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from app.timeutil import china_now_naive
+
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,7 +58,7 @@ def duration_seconds_between(
         return None
     start_naive = start.replace(tzinfo=None) if getattr(start, "tzinfo", None) else start
     if end is None:
-        end = now or datetime.now()
+        end = now or china_now_naive()
     end_naive = end.replace(tzinfo=None) if getattr(end, "tzinfo", None) else end
     if end_naive < start_naive:
         return None

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from app.timeutil import china_now_naive
+
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,7 +23,7 @@ from app.violation_filters import violation_list_visibility
 
 
 def _today_iso_range() -> tuple[str, str]:
-    now = datetime.now()
+    now = china_now_naive()
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end = now.replace(hour=23, minute=59, second=59, microsecond=0)
     return start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")
@@ -180,6 +182,8 @@ async def _board_warnings(db: AsyncSession, scope, now: datetime) -> dict:
         await db.execute(
             scoped(
                 select(
+                    VehicleViolation.id,
+                    VehicleViolation.biz_no,
                     VehicleViolation.violation_time,
                     VehicleViolation.plate_no,
                     VehicleViolation.violation_type_name,
@@ -190,10 +194,12 @@ async def _board_warnings(db: AsyncSession, scope, now: datetime) -> dict:
     ).all()
     recent = [
         {
-            "time": _fmt_dt(r[0]),
-            "plate_no": r[1] or "—",
-            "type_name": r[2] or "未知类型",
-            "status": r[3] or "—",
+            "id": r[0],
+            "biz_no": r[1] or "",
+            "time": _fmt_dt(r[2]),
+            "plate_no": r[3] or "—",
+            "type_name": r[4] or "未知类型",
+            "status": r[5] or "—",
         }
         for r in recent_rows
     ]
@@ -242,6 +248,8 @@ async def _board_faults(db: AsyncSession, scoped_company_ids: set[int] | None) -
         await db.execute(
             scoped(
                 select(
+                    ManualFaultReport.id,
+                    ManualFaultReport.biz_no,
                     ManualFaultReport.discovery_time,
                     ManualFaultReport.plate_no,
                     ManualFaultReport.fault_level,
@@ -252,10 +260,13 @@ async def _board_faults(db: AsyncSession, scoped_company_ids: set[int] | None) -
     ).all()
     recent = [
         {
-            "time": _fmt_dt(r[0]),
-            "plate_no": r[1] or "—",
-            "level": _FAULT_LEVEL_MAP.get(str(r[2] or "中"), "二级故障"),
-            "status": "待处理" if (r[3] or "未处理") == "未处理" else str(r[3]),
+            "id": r[0],
+            "biz_no": r[1] or "",
+            "source": "manual",
+            "time": _fmt_dt(r[2]),
+            "plate_no": r[3] or "—",
+            "level": _FAULT_LEVEL_MAP.get(str(r[4] or "中"), "二级故障"),
+            "status": "待处理" if (r[5] or "未处理") == "未处理" else str(r[5]),
         }
         for r in recent_rows
     ]
@@ -314,9 +325,12 @@ async def _board_faults_live(
             await db.execute(
                 scoped(
                     select(
+                        VehicleFaultLive.id,
+                        VehicleFaultLive.device_no,
                         VehicleFaultLive.report_time,
                         VehicleFaultLive.plate_no,
                         VehicleFaultLive.fault_level,
+                        VehicleFaultLive.fault_code,
                         VehicleFaultLive.handled,
                     ).order_by(VehicleFaultLive.report_time.desc()).limit(20)
                 )
@@ -326,10 +340,15 @@ async def _board_faults_live(
         recent_rows = []
     live_recent = [
         {
-            "time": _fmt_dt(r[0]),
-            "plate_no": r[1] or "—",
-            "level": _FAULT_LEVEL_MAP.get(str(r[2] or "中"), "二级故障"),
-            "status": "已处理" if r[3] else "待处理",
+            "id": r[0],
+            "biz_no": f"SYS{r[0]:08d}" if r[0] else "",
+            "source": "live",
+            "device_no": r[1] or "",
+            "time": _fmt_dt(r[2]),
+            "plate_no": r[3] or "—",
+            "level": _FAULT_LEVEL_MAP.get(str(r[4] or "中"), "二级故障"),
+            "fault_code": r[5] or "",
+            "status": "已处理" if r[6] else "待处理",
         }
         for r in recent_rows
     ]
@@ -342,10 +361,10 @@ async def _board_energy(db: AsyncSession, scoped_company_ids: set[int] | None) -
     oil.mileage 为各车 bclc（本次里程）之和。
     oil.fuel 为 OBD fdjrlll(L/h) 积分估算的当日累计油耗；808 油箱液位(1169)有数据时前端优先展示 808。
     """
-    today = datetime.now().strftime("%Y%m%d")
+    today = china_now_naive().strftime("%Y%m%d")
     days_7: list[str] = []
     for i in range(6, -1, -1):
-        d = datetime.now() - timedelta(days=i)
+        d = china_now_naive() - timedelta(days=i)
         days_7.append(d.strftime("%Y%m%d"))
 
     async def _agg_one(etype: str) -> dict:
@@ -449,7 +468,7 @@ async def build_board_stats(db: AsyncSession, x_org_id: str | None) -> dict:
     """智慧看板聚合指标：车辆、AI 预警、故障、司机画像（808 在线/里程由前端调平台接口）。"""
     scoped_company_ids = await _scoped_company_ids(db, x_org_id)
     scope = _violation_scope_clause(scoped_company_ids)
-    now = datetime.now()
+    now = china_now_naive()
 
     vehicles = await _board_vehicles(db, scoped_company_ids)
     warnings = await _board_warnings(db, scope, now)

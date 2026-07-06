@@ -8,6 +8,8 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+
+from app.timeutil import china_now_naive
 from typing import Any
 from app.media_url import extract_adas_relative_path
 
@@ -72,7 +74,7 @@ class SyncResult:
 
 
 def _now() -> datetime:
-    return datetime.now()
+    return china_now_naive()
 
 
 def _fmt_api_time(dt: datetime) -> str:

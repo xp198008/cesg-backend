@@ -5,7 +5,9 @@
 """
 import base64
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+
+from app.timeutil import china_now_naive
 from io import BytesIO
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, UploadFile
@@ -206,11 +208,14 @@ def _online_idle_sec() -> float:
 
 
 def _is_vehicle_online(last_online_at: datetime | None) -> bool:
+    """库里 naive datetime 统一按东八区解释（与 china_now_naive 写入约定一致）。"""
     if last_online_at is None:
         return False
-    now = datetime.now(timezone.utc)
-    la = last_online_at if last_online_at.tzinfo else last_online_at.replace(tzinfo=timezone.utc)
-    return (now - la.astimezone(timezone.utc)).total_seconds() <= _online_idle_sec()
+    if last_online_at.tzinfo:
+        la = last_online_at.astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None)
+    else:
+        la = last_online_at
+    return (china_now_naive() - la).total_seconds() <= _online_idle_sec()
 
 
 class VehicleSavePayload(BaseModel):

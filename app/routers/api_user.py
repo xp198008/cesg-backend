@@ -7,6 +7,8 @@ import secrets
 import string
 from datetime import date, datetime, time as dt_time
 
+from app.timeutil import china_now_naive, china_today
+
 import bcrypt
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -543,7 +545,7 @@ async def user_operation_log_append(payload: UserOperationLogIn, request: Reques
 async def user_logout(payload: UserLogoutPayload, request: Request, db: AsyncSession = Depends(get_db)):
     username = (payload.username or "").strip()[:64]
     ip = _client_login_ip(request)
-    logout_at = datetime.now()
+    logout_at = china_now_naive()
     login_row: UserLoginLog | None = None
     if payload.login_log_id is not None:
         login_row = await db.scalar(select(UserLoginLog).where(UserLoginLog.id == payload.login_log_id).limit(1))
@@ -574,7 +576,7 @@ async def user_session_heartbeat(payload: UserSessionHeartbeatPayload, db: Async
     await sync_login_session_to_daily(db, login_row)
     _apply_online_seconds(login_row, payload.online_seconds)
     if payload.finalize and login_row.logout_at is None:
-        login_row.logout_at = datetime.now()
+        login_row.logout_at = china_now_naive()
     await db.flush()
     return {
         "ok": True,
@@ -612,7 +614,7 @@ async def user_login_logs(
             stmt.order_by(UserLoginLog.login_at.desc()).offset((page - 1) * page_size).limit(page_size)
         )
     ).scalars().all()
-    now = datetime.now()
+    now = china_now_naive()
     items = []
     for row in rows:
         company = (row.org_name or "").strip()
@@ -657,7 +659,7 @@ async def user_online_duration_stats(
     start_dt = _parse_query_datetime(start_at)
     end_dt = _parse_query_datetime(end_at, end_of_day=True)
     if start_dt is None and end_dt is None:
-        today = date.today()
+        today = china_today()
         start_dt = datetime.combine(today, dt_time.min)
         end_dt = datetime.combine(today, dt_time(23, 59, 59))
     elif start_dt is None:
@@ -783,7 +785,7 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="当前用户已禁用，请联系管理员")
-    if user.valid_until is not None and user.valid_until < date.today():
+    if user.valid_until is not None and user.valid_until < china_today():
         raise HTTPException(status_code=403, detail="当前用户已过有效期，请联系管理员")
 
     saved_hash = user.password_hash or ""
@@ -856,7 +858,7 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
     )
 
     try:
-        login_now = datetime.now()
+        login_now = china_now_naive()
         await close_open_sessions_for_user(db, username, logout_at=login_now)
         db.add(login_log)
         await db.flush()
@@ -932,7 +934,7 @@ async def user_session_check(payload: UserSessionCheckPayload, db: AsyncSession 
         raise HTTPException(status_code=401, detail="当前用户不存在，请重新登录")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="当前用户已禁用，请重新登录")
-    if user.valid_until is not None and user.valid_until < date.today():
+    if user.valid_until is not None and user.valid_until < china_today():
         raise HTTPException(status_code=403, detail="当前用户已过有效期，请重新登录")
     if getattr(user, "single_login", False):
         server_token = (getattr(user, "login_session_token", None) or "").strip()
@@ -954,7 +956,7 @@ async def user_refresh_jt808_token(payload: RefreshJt808TokenPayload, db: AsyncS
         raise HTTPException(status_code=401, detail="当前用户不存在，请重新登录")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="当前用户已禁用，请重新登录")
-    if user.valid_until is not None and user.valid_until < date.today():
+    if user.valid_until is not None and user.valid_until < china_today():
         raise HTTPException(status_code=403, detail="当前用户已过有效期，请重新登录")
     if getattr(user, "single_login", False):
         server_token = (getattr(user, "login_session_token", None) or "").strip()

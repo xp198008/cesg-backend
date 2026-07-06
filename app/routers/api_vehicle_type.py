@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+
+from app.timeutil import china_now_naive
 from pathlib import Path
 from uuid import uuid4
 
@@ -74,7 +76,7 @@ class VehicleTypeUpdateIn(BaseModel):
 
 
 def _gen_type_code() -> str:
-    return f"HW{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    return f"HW{china_now_naive().strftime('%Y%m%d%H%M%S')}"
 
 
 def _png_size(content: bytes) -> tuple[int, int]:
@@ -217,7 +219,7 @@ async def _ensure_unique_type_name(
         stmt = stmt.where(VehicleTypeDict.id != exclude_id)
     exists = await db.scalar(stmt.limit(1))
     if exists is not None:
-        raise HTTPException(status_code=400, detail="车辆类型名称已存在，请更换后重试")
+        raise HTTPException(status_code=400, detail="该车辆类型已存在，不允许重复")
 
 
 def _normalize_required_text(value: str | None, field_label: str) -> str:
@@ -291,6 +293,7 @@ async def vehicle_type_get(tid: int, db: AsyncSession = Depends(get_db)):
 async def vehicle_type_create(body: VehicleTypeCreateIn, db: AsyncSession = Depends(get_db)):
     type_name = _normalize_required_text(body.type_name, "车型名称")
     spec = _normalize_required_text(body.spec, "车型规格")
+    icon_url = _normalize_required_text(body.icon_url, "车型图标")
     await _ensure_unique_type_name(db, type_name)
     max_order = await db.scalar(select(func.max(VehicleTypeDict.sort_order))) or 0
     row = VehicleTypeDict(
@@ -298,7 +301,7 @@ async def vehicle_type_create(body: VehicleTypeCreateIn, db: AsyncSession = Depe
         type_name=type_name,
         spec=spec,
         site=(body.site or "").strip() or None,
-        icon_url=(body.icon_url or "").strip() or "./images/carIcon/xiwu.png",
+        icon_url=icon_url,
         sort_order=max_order + 1,
     )
     db.add(row)
@@ -319,7 +322,7 @@ async def vehicle_type_icon_upload(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="图片不能超过 2MB")
     _ensure_icon_size(content, suffix)
 
-    filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid4().hex}{suffix}"
+    filename = f"{china_now_naive().strftime('%Y%m%d%H%M%S')}_{uuid4().hex}{suffix}"
     target = _ICON_DIR / filename
     target.write_bytes(content)
     if not target.exists():
@@ -345,7 +348,7 @@ async def vehicle_type_update(tid: int, body: VehicleTypeUpdateIn, db: AsyncSess
     if body.site is not None:
         row.site = body.site.strip() or None
     if body.icon_url is not None:
-        row.icon_url = body.icon_url.strip() or None
+        row.icon_url = _normalize_required_text(body.icon_url, "车型图标")
     await db.flush()
     await db.refresh(row)
     return {"ok": True, "data": _row_out(row)}

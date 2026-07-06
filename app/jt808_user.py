@@ -16,6 +16,8 @@ import hashlib
 import logging
 import uuid
 from datetime import datetime
+
+from app.timeutil import china_now_naive
 from typing import Any
 
 import pymysql
@@ -49,7 +51,7 @@ def lingx_password_encode(plain_password: str, account: str) -> str:
 
 
 def _jt808_time() -> str:
-    return datetime.now().strftime("%Y%m%d%H%M%S")
+    return china_now_naive().strftime("%Y%m%d%H%M%S")
 
 
 def _connect() -> pymysql.connections.Connection:

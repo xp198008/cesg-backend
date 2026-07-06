@@ -20,6 +20,7 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from app.database import Base
+from app.timeutil import china_now_naive
 
 
 class SysRole(Base):
@@ -31,8 +32,8 @@ class SysRole(Base):
     org_id = Column(Integer, ForeignKey("org_company.id"), nullable=True)
     is_global = Column(Boolean, nullable=False, default=False, server_default="0")
     permissions = Column(Text, nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
     org = relationship("OrgCompany", backref="roles")
 
@@ -57,8 +58,8 @@ class SysUser(Base):
     valid_until = Column(Date, nullable=True)
     single_login = Column(Boolean, default=False, nullable=False, server_default="0")
     login_session_token = Column(String(64), nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
     remark = Column(String(256))
 
     role = relationship("SysRole", backref="users")
@@ -79,8 +80,8 @@ class SysUserShortcut(Base):
     url = Column(String(256), nullable=False)
     icon = Column(String(256), nullable=True)
     sort_order = Column(Integer, nullable=False, default=0, server_default="0")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
     user = relationship("SysUser", back_populates="shortcuts")
 
@@ -100,8 +101,8 @@ class OrgCompany(Base):
     address = Column(String(256))
     remark = Column(String(256))
     jt808_group_id = Column(Integer, nullable=True, index=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
     parent = relationship(
         "OrgCompany", remote_side=[id], foreign_keys=[parent_id], backref="children"
@@ -115,8 +116,8 @@ class Fleet(Base):
     company_id = Column(Integer, ForeignKey("org_company.id"), nullable=False)
     name = Column(String(128), nullable=False)
     remark = Column(String(256))
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
     company = relationship("OrgCompany", back_populates="fleets")
 
@@ -144,8 +145,8 @@ class Driver(Base):
     native_place = Column(String(128), nullable=True)
     avatar_url = Column(String(256), nullable=True)
     remark = Column(String(256))
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
     company = relationship("OrgCompany", backref="drivers")
     vehicles = relationship("Vehicle", back_populates="driver")
@@ -212,8 +213,8 @@ class Vehicle(Base):
     icon_id = Column(Integer, default=1)
     remark = Column(Text)
     created_by = Column(Integer)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
     company = relationship("OrgCompany", backref="vehicles")
     fleet = relationship("Fleet", backref="vehicles")
@@ -237,8 +238,8 @@ class VehicleDevice(Base):
     channels = Column(JSON, nullable=True)
     is_main = Column(Boolean, default=True)
     channel_no = Column(Integer, default=1)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
     vehicle = relationship("Vehicle", back_populates="devices")
 
@@ -254,16 +255,16 @@ class VehicleTypeDict(Base):
     spec = Column(String(256), nullable=True)
     site = Column(String(128), nullable=True)
     sort_order = Column(Integer, nullable=False, default=0, server_default="0")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
 
 class ReserveTerminal(Base):
     __tablename__ = "reserve_terminal"
     id = Column(Integer, primary_key=True, autoincrement=True)
     terminal_id = Column(String(64), unique=True, index=True)
-    first_auth_at = Column(DateTime(timezone=True), server_default=func.now())
-    last_auth_at = Column(DateTime(timezone=True), server_default=func.now())
+    first_auth_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    last_auth_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
     last_peer = Column(String(256))
     remark = Column(Text)
 
@@ -277,8 +278,8 @@ class VehicleAllocRule(Base):
     fleet_id = Column(Integer, ForeignKey("fleet.id", ondelete="CASCADE"), nullable=True, index=True)
     name = Column(String(128), nullable=False)
     remark = Column(String(512))
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
     company = relationship("OrgCompany", backref="vehicle_alloc_rules")
     fleet = relationship("Fleet", backref="vehicle_alloc_rules")
@@ -313,8 +314,8 @@ class AlarmTypeDict(Base):
     alarm_level = Column(String(16), nullable=False, server_default="中级")
     data_source = Column(String(32), nullable=False, server_default="manual")
     ttx_atp_code = Column(Integer, nullable=True, index=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
 
 class ViolationTypeDict(Base):
@@ -327,8 +328,8 @@ class ViolationTypeDict(Base):
     description = Column(Text, nullable=True)
     severity = Column(String(16), nullable=False, server_default="一般")
     deduction_score = Column(Integer, nullable=False, server_default="0")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
 
 class FaultTypeDict(Base):
@@ -340,8 +341,8 @@ class FaultTypeDict(Base):
     type_name = Column(String(64), nullable=False, index=True)
     description = Column(Text, nullable=True)
     fault_level = Column(String(16), nullable=False, server_default="中")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
 
 class VehicleLocation(Base):
@@ -360,8 +361,8 @@ class VehicleLocation(Base):
     current_position = Column(String(512))
     is_online = Column(Boolean, default=False)
     source = Column(String(32), default="ttx")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive, default=china_now_naive, server_default=func.now())
 
 
 class MapApiConfig(Base):
@@ -376,7 +377,7 @@ class MapApiConfig(Base):
     default_center_lng = Column(Float, default=106.55156)
     default_center_lat = Column(Float, default=29.56301)
     remark = Column(String(255))
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
 
 class PublicMapRule(Base):
@@ -391,8 +392,8 @@ class PublicMapRule(Base):
     is_public = Column(Integer, nullable=False, default=1, server_default="1")
     geometry_json = Column(JSON, nullable=False)
     remark = Column(String(255))
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
 
 class PrivateMapRule(Base):
@@ -410,8 +411,8 @@ class PrivateMapRule(Base):
     ref_public_rule_id = Column(Integer, nullable=True, index=True)
     category_ids = Column(JSON, nullable=False, default=list)
     remark = Column(String(255))
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
     company = relationship("OrgCompany", backref="private_map_rules")
 
@@ -428,8 +429,8 @@ class PrivateMapRuleWeather(Base):
     speed_limit_kmh = Column(Integer, nullable=False)
     sort_order = Column(Integer, nullable=False, default=0, server_default="0")
     remark = Column(String(255))
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
     rule = relationship("PrivateMapRule", backref="weather_rules")
 
@@ -447,8 +448,8 @@ class MapRuleCategory(Base):
     weather_speed_limits = Column(JSON, nullable=False, default=dict)
     assigned_vehicle_ids = Column(JSON, nullable=False, default=list)
     remark = Column(String(255))
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
     company = relationship("OrgCompany", backref="map_rule_categories")
     weather_rule = relationship("PrivateMapRuleWeather")
@@ -490,7 +491,7 @@ class VehicleViolation(Base):
     appeal_submitted_at = Column(DateTime, nullable=True)
     appeal_status = Column(String(16), nullable=True)
     ai_queried = Column(Boolean, default=False, nullable=False, server_default="0")
-    created_at = Column(DateTime, server_default=func.now())
+    created_at = Column(DateTime, default=china_now_naive, server_default=func.now())
 
 
 class ViolationAiAssessment(Base):
@@ -515,8 +516,8 @@ class ViolationAiAssessment(Base):
     alarm_type_name = Column(String(64), nullable=True)
     image_count = Column(Integer, nullable=False, default=0, server_default="0")
     has_video = Column(Boolean, nullable=False, default=False, server_default="0")
-    created_at = Column(DateTime, server_default=func.now())
-    updated_at = Column(DateTime, onupdate=func.now())
+    created_at = Column(DateTime, default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=china_now_naive)
 
     violation = relationship("VehicleViolation", backref="ai_assessment", uselist=False)
 
@@ -534,7 +535,7 @@ class ViolationTicket(Base):
     amount = Column(Float, nullable=False, default=0.0)
     status = Column(String(16), nullable=False, default="待处理")
     created_by_name = Column(String(64), nullable=True)
-    created_at = Column(DateTime, server_default=func.now())
+    created_at = Column(DateTime, default=china_now_naive, server_default=func.now())
 
 
 class Jt808AlarmSyncState(Base):
@@ -548,7 +549,7 @@ class Jt808AlarmSyncState(Base):
     last_error = Column(Text, nullable=True)
     last_total = Column(Integer, nullable=False, default=0, server_default="0")
     last_inserted = Column(Integer, nullable=False, default=0, server_default="0")
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_at = Column(DateTime, default=china_now_naive, server_default=func.now(), onupdate=china_now_naive)
 
 
 class UserLoginLog(Base):
@@ -563,7 +564,7 @@ class UserLoginLog(Base):
     role_name = Column(String(64), nullable=True)
     login_ip = Column(String(64), nullable=False, server_default="")
     login_method = Column(String(32), nullable=False, server_default="web")
-    login_at = Column(DateTime, nullable=False, server_default=func.now(), index=True)
+    login_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
     logout_at = Column(DateTime, nullable=True, index=True)
     online_seconds = Column(Integer, nullable=True)
     last_heartbeat_at = Column(DateTime, nullable=True)
@@ -582,7 +583,7 @@ class UserOnlineDaily(Base):
     stat_date = Column(Date, nullable=False, index=True)
     online_seconds = Column(Integer, nullable=False, default=0, server_default="0")
     login_count = Column(Integer, nullable=False, default=0, server_default="0")
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_at = Column(DateTime, default=china_now_naive, server_default=func.now(), onupdate=china_now_naive)
 
 
 class ManualFaultReport(Base):
@@ -611,7 +612,7 @@ class ManualFaultReport(Base):
     audited_at = Column(DateTime, nullable=True)
     auditor_name = Column(String(64), nullable=True)
     audit_remark = Column(String(255), nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
 
 
 class JtDeviceFault(Base):
@@ -641,7 +642,7 @@ class JtDeviceFault(Base):
     audited_at = Column(DateTime, nullable=True)
     auditor_name = Column(String(64), nullable=True)
     audit_remark = Column(String(255), nullable=True)
-    created_at = Column(DateTime, server_default=func.now())
+    created_at = Column(DateTime, default=china_now_naive, server_default=func.now())
 
 
 class JtDeviceFaultReceipt(Base):
@@ -656,7 +657,7 @@ class JtDeviceFaultReceipt(Base):
     file_size = Column(Integer, nullable=False)
     mime_type = Column(String(128), nullable=True)
     uploader_name = Column(String(64), nullable=True)
-    created_at = Column(DateTime, server_default=func.now())
+    created_at = Column(DateTime, default=china_now_naive, server_default=func.now())
 
 
 class VehicleRepair(Base):
@@ -686,7 +687,7 @@ class VehicleRepair(Base):
     reviewed_at = Column(DateTime, nullable=True)
     repair_status = Column(String(32), nullable=False, server_default="待处理", index=True)
     completed_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, server_default=func.now())
+    created_at = Column(DateTime, default=china_now_naive, server_default=func.now())
 
 
 class VehicleRepairReceipt(Base):
@@ -702,7 +703,7 @@ class VehicleRepairReceipt(Base):
     mime_type = Column(String(128), nullable=True)
     uploader_name = Column(String(64), nullable=True)
     remark = Column(String(255), nullable=True)
-    created_at = Column(DateTime, server_default=func.now())
+    created_at = Column(DateTime, default=china_now_naive, server_default=func.now())
 
 
 class UserOperationLog(Base):
@@ -723,7 +724,7 @@ class UserOperationLog(Base):
     plate_color = Column(String(16), nullable=True)
     device_no = Column(String(64), nullable=True)
     source = Column(String(16), nullable=False, server_default="manual", index=True)
-    created_at = Column(DateTime, nullable=False, server_default=func.now(), index=True)
+    created_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
 
 
 class VehicleFaultLive(Base):
@@ -745,7 +746,7 @@ class VehicleFaultLive(Base):
     report_time = Column(DateTime, nullable=True, index=True)
     handled = Column(Boolean, nullable=False, server_default="0", index=True)
     raw = Column(Text, nullable=True)
-    created_at = Column(DateTime, nullable=False, server_default=func.now(), index=True)
+    created_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
 
 
 class ObdEnergySnapshot(Base):
@@ -767,4 +768,4 @@ class ObdEnergySnapshot(Base):
     report_time = Column(DateTime, nullable=True, index=True)
     day = Column(String(8), nullable=True, index=True)  # yyyyMMdd
     raw = Column(Text, nullable=True)
-    created_at = Column(DateTime, nullable=False, server_default=func.now(), index=True)
+    created_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)

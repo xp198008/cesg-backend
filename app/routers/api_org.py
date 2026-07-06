@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+
+from app.timeutil import china_now_naive
 from io import BytesIO
 from typing import Any
 
@@ -15,9 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import jt808_group
 from app.database import get_db
-from app.models import Fleet, OrgCompany, Vehicle
+from app.models import Driver, Fleet, OrgCompany, Vehicle
 from app.org_scope import (
     collect_org_company_subtree_ids,
+    require_user_company_subtree_ids,
     require_x_org_id_header,
     wants_org_tree_scope,
 )
@@ -279,6 +282,147 @@ def _tree_nodes_for_ui(
     return [build(x) for x in roots]
 
 
+async def _drivers_by_company_from_vehicles(
+    db: AsyncSession,
+    *,
+    scoped_company_ids: set[int] | None,
+) -> tuple[dict[int, list[dict[str, Any]]], dict[int, int]]:
+    """按车辆所属公司聚合司机（vehicle.driver_name 优先，否则关联 driver 表）。"""
+    stmt = select(Vehicle.company_id, Vehicle.driver_id, Vehicle.driver_name)
+    if scoped_company_ids is not None:
+        stmt = stmt.where(Vehicle.company_id.in_(scoped_company_ids))
+    vehicle_rows = (await db.execute(stmt)).all()
+
+    driver_ids = {int(r[1]) for r in vehicle_rows if r[1]}
+    driver_map: dict[int, str] = {}
+    if driver_ids:
+        dr = await db.execute(select(Driver.id, Driver.name).where(Driver.id.in_(driver_ids)))
+        driver_map = {int(i): (n or "").strip() for i, n in dr.all() if n}
+
+    drivers_raw: dict[int, dict[str, dict[str, Any]]] = {}
+    vehicle_count: dict[int, int] = {}
+    for company_id, driver_id, driver_name in vehicle_rows:
+        if company_id is None:
+            continue
+        cid = int(company_id)
+        vehicle_count[cid] = vehicle_count.get(cid, 0) + 1
+
+        name = (driver_name or "").strip()
+        if not name and driver_id:
+            name = driver_map.get(int(driver_id), "")
+        if not name:
+            continue
+
+        key = f"id:{int(driver_id)}" if driver_id else f"name:{name}"
+        bucket = drivers_raw.setdefault(cid, {})
+        if key not in bucket:
+            bucket[key] = {
+                "id": int(driver_id) if driver_id else None,
+                "name": name,
+            }
+
+    drivers_by_company: dict[int, list[dict[str, Any]]] = {}
+    for cid, items in drivers_raw.items():
+        drivers_by_company[cid] = sorted(items.values(), key=lambda x: x["name"])
+    return drivers_by_company, vehicle_count
+
+
+def _org_driver_tree_nodes(
+    rows: list[OrgCompany],
+    by_parent: dict[int | None, list[OrgCompany]],
+    *,
+    drivers_by_company: dict[int, list[dict[str, Any]]],
+    vehicle_count_by_company: dict[int, int],
+) -> list[dict[str, Any]]:
+    def build(node: OrgCompany) -> dict[str, Any]:
+        kids = sorted(by_parent.get(node.id, []), key=lambda x: x.id)
+        drivers = drivers_by_company.get(node.id, [])
+        return {
+            "id": node.id,
+            "org_code": node.org_code,
+            "name": node.name,
+            "parent_id": node.parent_id,
+            "vehicle_count": vehicle_count_by_company.get(node.id, 0),
+            "driver_count": len(drivers),
+            "driver_names": [d["name"] for d in drivers],
+            "drivers": drivers,
+            "children": [build(c) for c in kids],
+        }
+
+    roots = sorted(by_parent.get(None, []), key=lambda x: x.id)
+    return [build(x) for x in roots]
+
+
+def _count_tree_nodes(nodes: list[dict[str, Any]]) -> tuple[int, int, int]:
+    company_count = 0
+    driver_count = 0
+    vehicle_count = 0
+
+    def walk(node: dict[str, Any]) -> None:
+        nonlocal company_count, driver_count, vehicle_count
+        company_count += 1
+        driver_count += int(node.get("driver_count") or 0)
+        vehicle_count += int(node.get("vehicle_count") or 0)
+        for child in node.get("children") or []:
+            walk(child)
+
+    for n in nodes:
+        walk(n)
+    return company_count, driver_count, vehicle_count
+
+
+@router.get("/tree-with-drivers")
+async def org_tree_with_drivers(
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """根据车辆信息表生成公司组织架构，并在各公司节点附带司机姓名列表（JSON）。
+
+    数据范围：当前登录用户所属公司及下级公司（请求头 X-Org-Id / X-User-Id）。
+    """
+    scope_root, scoped_ids = await require_user_company_subtree_ids(
+        db, x_org_id=x_org_id, x_user_id=x_user_id
+    )
+
+    r = await db.execute(
+        select(OrgCompany).where(OrgCompany.id.in_(scoped_ids)).order_by(OrgCompany.id)
+    )
+    rows = list(r.scalars().all())
+
+    drivers_by_company, vehicle_count_by_company = await _drivers_by_company_from_vehicles(
+        db, scoped_company_ids=scoped_ids
+    )
+
+    valid_ids = {x.id for x in rows}
+    by_parent: dict[int | None, list[OrgCompany]] = {}
+    for row in rows:
+        pid = row.parent_id if row.parent_id in valid_ids else None
+        by_parent.setdefault(pid, []).append(row)
+
+    tree = _org_driver_tree_nodes(
+        rows,
+        by_parent,
+        drivers_by_company=drivers_by_company,
+        vehicle_count_by_company=vehicle_count_by_company,
+    )
+    company_count, driver_count, vehicle_count = _count_tree_nodes(tree)
+
+    return {
+        "generated_at": china_now_naive().isoformat(timespec="seconds"),
+        "scope": {
+            "root_org_id": scope_root,
+            "company_count": len(scoped_ids),
+        },
+        "summary": {
+            "company_count": company_count,
+            "driver_count": driver_count,
+            "vehicle_count": vehicle_count,
+        },
+        "tree": tree,
+    }
+
+
 @router.get("/tree")
 async def org_tree(
     exclude_id: int | None = Query(None),
@@ -519,7 +663,7 @@ async def company_update(
         row.contact_phone = (patch["contact_phone"] or "").strip() or None
     if "address" in patch:
         row.address = (patch["address"] or "").strip() or None
-    row.updated_at = datetime.now(timezone.utc)
+    row.updated_at = china_now_naive()
 
     do_edit = bool(row.jt808_group_id and (name_changed or parent_changed))
     new_fid = None

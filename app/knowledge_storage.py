@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime
+
+from app.timeutil import china_now_naive
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -140,7 +142,7 @@ def migrate_legacy_flat_dirs() -> None:
                 continue
             target = dest / p.name
             if target.exists():
-                stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                stamp = china_now_naive().strftime("%Y%m%d%H%M%S")
                 target = dest / f"{p.stem}_{stamp}{p.suffix}"
             p.rename(target)
             moved += 1

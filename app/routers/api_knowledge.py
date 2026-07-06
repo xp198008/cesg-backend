@@ -1,5 +1,7 @@
 """知识图谱文件管理 API — 按用户所属公司隔离，16 分类本地目录与 AI 知识库 category 对齐。"""
 from datetime import datetime
+
+from app.timeutil import china_now_naive
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
@@ -120,7 +122,7 @@ async def upload_files(
             raise HTTPException(status_code=400, detail=f"文件过大（>100MB）：{name}")
         target = d / name
         if target.exists():
-            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            stamp = china_now_naive().strftime("%Y%m%d%H%M%S")
             target = d / f"{Path(name).stem}_{stamp}{suffix}"
         target.write_bytes(content)
         saved.append(target.name)

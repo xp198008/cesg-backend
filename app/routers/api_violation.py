@@ -135,7 +135,7 @@ def _ticket_appeal_attachment_base_dir() -> Path:
 
 
 def _now() -> datetime:
-    return datetime.now()
+    return china_now_naive()
 
 
 def _json_loads(raw: str | None, fallback: Any) -> Any:

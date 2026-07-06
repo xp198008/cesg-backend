@@ -17,6 +17,8 @@ from app.models import SysRole, SysUser, SysUserShortcut
 
 router = APIRouter(prefix="/api/shortcut", tags=["shortcut"])
 
+_DEPRECATED_PERMISSION_IDS = frozenset({"7", "71", "72", "73"})
+
 _DATA_FILE = Path(__file__).resolve().parent.parent / "data" / "permission_menu.json"
 
 # permission_id → Vue 路由（与 jt808-vue3 shortcutRoutes.js 对齐；点击跳转以前端 MAP 为准）
@@ -72,10 +74,6 @@ _SHORTCUT_META: dict[str, dict[str, str]] = {
     "642": {"url": "/main/report/travel-fuel", "icon": "./images/svg/icon-tongji.svg"},
     "651": {"url": "/main/report/alarm-statistics", "icon": "./images/svg/icon-tongji.svg"},
     "652": {"url": "/main/report/alarm-key-query", "icon": "./images/svg/icon-tongji.svg"},
-    "7": {"url": "/main/rule/fatigue", "icon": "./images/svg/icon-yunying.svg"},
-    "71": {"url": "/main/rule/fatigue", "icon": "./images/svg/icon-yunying.svg"},
-    "72": {"url": "/main/map/private-speed", "icon": "./images/svg/icon-yunying.svg"},
-    "73": {"url": "/main/rule/sensor", "icon": "./images/svg/icon-yunying.svg"},
     "8": {"url": "/main/safety/active-alarm", "icon": "./images/svg/icon-anquan.svg"},
     "81": {"url": "/main/safety/active-alarm", "icon": "./images/svg/icon-anquan.svg"},
     "82": {"url": "/main/safety/alarm-audit", "icon": "./images/svg/icon-anquan.svg"},
@@ -209,6 +207,18 @@ def _filter_tree(
     return out
 
 
+async def _purge_deprecated_shortcuts(db: AsyncSession, user_id: int) -> None:
+    if not _DEPRECATED_PERMISSION_IDS:
+        return
+    await db.execute(
+        delete(SysUserShortcut).where(
+            SysUserShortcut.user_id == user_id,
+            SysUserShortcut.permission_id.in_(list(_DEPRECATED_PERMISSION_IDS)),
+        )
+    )
+    await db.flush()
+
+
 async def _selected_ids(db: AsyncSession, user_id: int) -> set[str]:
     rows = (
         await db.execute(select(SysUserShortcut.permission_id).where(SysUserShortcut.user_id == user_id))
@@ -228,6 +238,7 @@ async def shortcut_home_stats(
 @router.get("/permission-tree")
 async def shortcut_permission_tree(user_id: int = Query(..., ge=1), db: AsyncSession = Depends(get_db)):
     user = await _load_user(db, user_id)
+    await _purge_deprecated_shortcuts(db, user_id)
     allowed_ids = _role_permission_ids(user.role, user.username)
     checked_ids = await _selected_ids(db, user_id)
     return {"ok": True, "tree": _filter_tree(_read_tree(), allowed_ids, checked_ids)}
@@ -278,6 +289,7 @@ async def _migrate_legacy_board_shortcuts(
 @router.get("/list")
 async def shortcut_list(user_id: int = Query(..., ge=1), db: AsyncSession = Depends(get_db)):
     user = await _load_user(db, user_id)
+    await _purge_deprecated_shortcuts(db, user_id)
     allowed = _allowed_shortcut_entries(user)
     rows = (
         await db.execute(

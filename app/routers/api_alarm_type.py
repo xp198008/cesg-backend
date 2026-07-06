@@ -4,6 +4,8 @@ from __future__ import annotations
 import secrets
 from datetime import datetime
 
+from app.timeutil import china_now_naive
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -18,7 +20,7 @@ _ALLOWED_LEVEL = frozenset({"高级", "中级", "低级"})
 
 
 def _gen_type_code() -> str:
-    return f"AT{datetime.now().strftime('%Y%m%d%H%M%S')}{secrets.token_hex(2).upper()}"
+    return f"AT{china_now_naive().strftime('%Y%m%d%H%M%S')}{secrets.token_hex(2).upper()}"
 
 
 async def _allocate_unique_type_code(db: AsyncSession) -> str:

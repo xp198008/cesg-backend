@@ -22,6 +22,8 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+
+from app.timeutil import china_now_naive
 from pathlib import Path
 from typing import Any
 
@@ -384,7 +386,7 @@ async def run_obd_speed_check_once() -> ObdSyncResult:
     await redis.aclose()
 
     result.scanned_keys = len(payloads)
-    now = datetime.now()
+    now = china_now_naive()
     min_speed = float(settings.obd_min_speed_kmh)
     stale_after = timedelta(seconds=max(30, int(settings.obd_stale_seconds)))
 
@@ -543,7 +545,7 @@ def _persist_enabled(value: bool) -> None:
         _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _STATE_FILE.write_text(
             json.dumps(
-                {"enabled": value, "updated_at": datetime.now().isoformat(sep=" ", timespec="seconds")},
+                {"enabled": value, "updated_at": china_now_naive().isoformat(sep=" ", timespec="seconds")},
                 ensure_ascii=False,
                 indent=2,
             ),
@@ -617,7 +619,7 @@ class ObdSpeedScheduler:
 
     async def run_once(self) -> ObdSyncResult:
         result = await run_obd_speed_check_once()
-        self._last_run_at = datetime.now()
+        self._last_run_at = china_now_naive()
         self._last_result = {k: v for k, v in result.__dict__.items() if k != "detail"} | {
             "detail": result.detail[:20]
         }

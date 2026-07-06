@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dashboard_stats import build_board_stats, build_home_stats
+from app.dashboard_stats import _FAULT_LEVEL_MAP, _fmt_dt, build_board_stats, build_home_stats
 from app.database import AsyncSessionLocal, get_db
+from app.models import VehicleFaultLive
 from app.redis_queue_consumer import peek_queue, redis_queue_scheduler
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -52,10 +54,32 @@ async def dashboard_redis_queue_status():
     return redis_queue_scheduler.status()
 
 
+@router.get("/fault-live/{tid}")
+async def dashboard_fault_live_detail(tid: int, db: AsyncSession = Depends(get_db)):
+    """智慧看板跳转：系统实时故障详情（vehicle_fault_live）。"""
+    row = await db.get(VehicleFaultLive, tid)
+    if row is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    return {
+        "ok": True,
+        "data": {
+            "id": row.id,
+            "source": "live",
+            "biz_no": f"SYS{row.id:08d}",
+            "plate_no": row.plate_no or "—",
+            "device_no": row.device_no or "—",
+            "fault_code": row.fault_code or "—",
+            "level": _FAULT_LEVEL_MAP.get(str(row.fault_level or "中"), "二级故障"),
+            "status": "已处理" if row.handled else "待处理",
+            "report_time": _fmt_dt(row.report_time, "%Y-%m-%d %H:%M:%S"),
+        },
+    }
+
+
 @router.get("/redis-queue/recent")
 async def dashboard_redis_queue_recent(limit: int = Query(20, ge=1, le=100)):
     """最近落库的故障 / OBD 能耗记录，用于在调试页面验证消费是否生效。"""
-    from app.models import ObdEnergySnapshot, VehicleFaultLive
+    from app.models import ObdEnergySnapshot
 
     async with AsyncSessionLocal() as db:
         try:

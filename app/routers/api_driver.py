@@ -1,5 +1,7 @@
 """司机基础信息 API — 与公司信息 org_company 关联，供基础数据司机信息页 CRUD。"""
 from datetime import date, datetime
+
+from app.timeutil import china_now_naive
 from pathlib import Path
 from uuid import uuid4
 
@@ -138,7 +140,7 @@ async def driver_avatar_upload(file: UploadFile = File(...)):
     if len(content) > 2 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="图片不能超过 2MB")
 
-    filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid4().hex}{suffix}"
+    filename = f"{china_now_naive().strftime('%Y%m%d%H%M%S')}_{uuid4().hex}{suffix}"
     target = _AVATAR_DIR / filename
     target.write_bytes(content)
     if not target.exists():

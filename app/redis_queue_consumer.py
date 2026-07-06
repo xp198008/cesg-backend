@@ -27,6 +27,7 @@ from app.database import AsyncSessionLocal
 from app.jt808_alarm_sync import _vehicle_by_terminal
 from app.jt808_vehicle import _terminal_variants
 from app.models import ObdEnergySnapshot, VehicleFaultLive
+from app.timeutil import china_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +184,7 @@ async def _resolve_vehicle(db: AsyncSession, device_no: str):
 async def _handle_fault(db: AsyncSession, data: dict, raw_text: str) -> None:
     device_no = _pick(data, _DEVICE_KEYS)
     plate_raw = _pick(data, _PLATE_KEYS)
-    report_time = _parse_ts(_pick(data, _TS_KEYS)) or datetime.now()
+    report_time = _parse_ts(_pick(data, _TS_KEYS)) or china_now_naive()
     fault_code = _pick(data, _FAULT_CODE_KEYS)
     fault_level = _normalize_fault_level(_pick(data, _FAULT_LEVEL_KEYS))
 
@@ -235,7 +236,7 @@ def _accumulate_oil_fuel(
 
 async def _handle_obd(db: AsyncSession, data: dict, raw_text: str, energy_type: str) -> None:
     device_no = _pick(data, _DEVICE_KEYS)
-    report_time = _parse_ts(_pick(data, _TS_KEYS)) or datetime.now()
+    report_time = _parse_ts(_pick(data, _TS_KEYS)) or china_now_naive()
     day = report_time.strftime("%Y%m%d")
 
     existing = None
@@ -267,7 +268,7 @@ async def _handle_obd(db: AsyncSession, data: dict, raw_text: str, energy_type: 
         "report_time": report_time,
         "day": day,
         "raw": raw_text[:2000],
-        "created_at": datetime.utcnow(),
+        "created_at": china_now_naive(),
     }
     stmt = sqlite_insert(ObdEnergySnapshot).values(**values)
     stmt = stmt.on_conflict_do_update(
@@ -285,7 +286,7 @@ async def _handle_obd(db: AsyncSession, data: dict, raw_text: str, energy_type: 
 
 
 async def _purge_old_faults(db: AsyncSession) -> int:
-    cutoff = datetime.utcnow() - timedelta(hours=int(settings.redis_queue_fault_ttl_hours))
+    cutoff = china_now_naive() - timedelta(hours=int(settings.redis_queue_fault_ttl_hours))
     result = await db.execute(
         delete(VehicleFaultLive).where(VehicleFaultLive.created_at < cutoff)
     )
@@ -422,7 +423,7 @@ class RedisQueueScheduler:
 
     async def run_once(self) -> dict[str, Any]:
         result = await consume_once()
-        self._last_run_at = datetime.now()
+        self._last_run_at = china_now_naive()
         self._last_result = result
         self._last_error = result.get("error")
         if any((result.get("gzm", 0), result.get("obd_yc", 0), result.get("obd_dc", 0))):
