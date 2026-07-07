@@ -229,6 +229,16 @@ class VehicleSavePayload(BaseModel):
     vin: str | None = None
     driving_license_no: str | None = None
     engine_no: str | None = None
+    product_model_code: str | None = None
+    frame_no: str | None = None
+    vehicle_type_code: str | None = None
+    vehicle_length: float | None = None
+    vehicle_width: float | None = None
+    vehicle_height: float | None = None
+    loaded_weight: float | None = None
+    vehicle_payload: float | None = None
+    curb_weight: float | None = None
+    urea_info: str | None = None
     short_name: str | None = None
     company_id: int = Field(..., ge=1)
     fleet_id: int | None = None
@@ -367,6 +377,16 @@ def _apply_vehicle_payload(v: Vehicle, co: OrgCompany, payload: VehicleSavePaylo
     v.vin = _norm(payload.vin) or None
     v.driving_license_no = _norm(payload.driving_license_no) or None
     v.engine_no = _norm(payload.engine_no) or None
+    v.product_model_code = _norm(payload.product_model_code) or None
+    v.frame_no = _norm(payload.frame_no) or None
+    v.vehicle_type_code = _norm(payload.vehicle_type_code) or None
+    v.vehicle_length = _to_float(payload.vehicle_length, None)
+    v.vehicle_width = _to_float(payload.vehicle_width, None)
+    v.vehicle_height = _to_float(payload.vehicle_height, None)
+    v.loaded_weight = _to_float(payload.loaded_weight, None)
+    v.vehicle_payload = _to_float(payload.vehicle_payload, None)
+    v.curb_weight = _to_float(payload.curb_weight, None)
+    v.urea_info = _norm(payload.urea_info) or None
     v.short_name = _norm(payload.short_name) or None
     v.company_id = payload.company_id
     v.company_org_code = _norm(co.org_code) or None
@@ -484,6 +504,16 @@ async def vehicle_detail(
             "vin": v.vin,
             "driving_license_no": v.driving_license_no,
             "engine_no": v.engine_no,
+            "product_model_code": v.product_model_code,
+            "frame_no": v.frame_no,
+            "vehicle_type_code": v.vehicle_type_code,
+            "vehicle_length": float(v.vehicle_length) if v.vehicle_length is not None else None,
+            "vehicle_width": float(v.vehicle_width) if v.vehicle_width is not None else None,
+            "vehicle_height": float(v.vehicle_height) if v.vehicle_height is not None else None,
+            "loaded_weight": float(v.loaded_weight) if v.loaded_weight is not None else None,
+            "vehicle_payload": float(v.vehicle_payload) if v.vehicle_payload is not None else None,
+            "curb_weight": float(v.curb_weight) if v.curb_weight is not None else None,
+            "urea_info": v.urea_info,
             "short_name": v.short_name,
             "company_id": v.company_id,
             "fleet_id": v.fleet_id,

@@ -126,6 +126,16 @@ async def init_models() -> None:
                     ("battery_no", "VARCHAR(64)"),
                     ("motor_no", "VARCHAR(64)"),
                     ("mileage_offset", "NUMERIC(10, 2)"),
+                    ("product_model_code", "VARCHAR(64)"),
+                    ("frame_no", "VARCHAR(64)"),
+                    ("vehicle_type_code", "VARCHAR(32)"),
+                    ("vehicle_length", "NUMERIC(10, 2)"),
+                    ("vehicle_width", "NUMERIC(10, 2)"),
+                    ("vehicle_height", "NUMERIC(10, 2)"),
+                    ("loaded_weight", "NUMERIC(12, 2)"),
+                    ("vehicle_payload", "NUMERIC(12, 2)"),
+                    ("curb_weight", "NUMERIC(12, 2)"),
+                    ("urea_info", "VARCHAR(256)"),
                 ):
                     if col_name not in names:
                         await conn.exec_driver_sql(f"ALTER TABLE vehicle ADD COLUMN {col_name} {col_type}")
