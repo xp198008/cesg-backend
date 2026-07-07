@@ -884,7 +884,11 @@ async def user_monitor_scope(
     db: AsyncSession = Depends(get_db),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
-    """实时监控：返回当前用户可见车辆键（车牌/设备号），供 808 树前端过滤。"""
+    """实时监控：返回当前用户可见车辆键（车牌/设备号/808 car_id），供 808 树过滤与外部同步。
+
+    admin：scoped=false，返回 CESG 全部车辆列表；
+    普通用户：按车辆分配规则或所属公司及下级公司聚合。
+    """
     user_id = parse_user_id_header(x_user_id)
     if user_id is None:
         raise HTTPException(status_code=400, detail="缺少请求头 X-User-Id")

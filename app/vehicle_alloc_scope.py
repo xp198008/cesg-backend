@@ -40,6 +40,96 @@ def _is_admin_user(user: SysUser) -> bool:
     return code == "admin"
 
 
+def _effective_user_org_id(user: SysUser) -> int | None:
+    if user.org_id is not None:
+        return int(user.org_id)
+    role = user.role
+    if role and role.org_id is not None:
+        return int(role.org_id)
+    return None
+
+
+async def _resolve_scope_vehicle_ids(db: AsyncSession, user: SysUser) -> tuple[set[int], bool]:
+    """计算监控范围车辆 id。
+
+    返回 (vehicle_ids, unrestricted)：
+    - unrestricted=True：admin 全量，scoped 应为 false，但仍返回完整车辆列表供同步使用；
+    - unrestricted=False：按分配规则或所属公司子树限制。
+    """
+    if _is_admin_user(user):
+        rows = (await db.execute(select(Vehicle.id))).scalars().all()
+        return {int(vid) for vid in rows}, True
+
+    rule_ids = list(
+        (
+            await db.execute(
+                select(VehicleAllocRuleUser.rule_id).where(VehicleAllocRuleUser.user_id == user.id)
+            )
+        ).scalars().all()
+    )
+    if rule_ids:
+        vehicle_ids = (
+            await db.execute(
+                select(VehicleAllocRuleVehicle.vehicle_id).where(
+                    VehicleAllocRuleVehicle.rule_id.in_(rule_ids)
+                )
+            )
+        ).scalars().all()
+        return {int(vid) for vid in vehicle_ids}, False
+
+    org_id = _effective_user_org_id(user)
+    if org_id is None:
+        return set(), False
+
+    from app.org_scope import collect_org_company_subtree_ids
+
+    subtree = await collect_org_company_subtree_ids(db, org_id)
+    rows = (
+        await db.execute(select(Vehicle.id).where(Vehicle.company_id.in_(subtree)))
+    ).scalars().all()
+    return {int(vid) for vid in rows}, False
+
+
+async def _build_monitor_scope_payload(
+    db: AsyncSession,
+    vehicle_ids: set[int],
+    *,
+    unrestricted: bool,
+) -> dict[str, object]:
+    if not vehicle_ids:
+        return {
+            "scoped": not unrestricted,
+            "plates": [],
+            "device_nos": [],
+            "car_ids": [],
+        }
+
+    plate_rows = (
+        await db.execute(select(Vehicle.plate_no).where(Vehicle.id.in_(vehicle_ids)))
+    ).scalars().all()
+    plates = sorted({(p or "").strip() for p in plate_rows if (p or "").strip()})
+
+    device_nos: set[str] = set()
+    device_rows = (
+        await db.execute(
+            select(VehicleDevice.device_no).where(
+                VehicleDevice.vehicle_id.in_(vehicle_ids),
+                VehicleDevice.is_main.is_(True),
+            )
+        )
+    ).scalars().all()
+    for dev in device_rows:
+        device_nos.update(_normalize_device_no(str(dev) if dev is not None else ""))
+    device_list = sorted(device_nos)
+    car_ids = _lookup_jt808_car_ids(plates, device_list)
+    return {
+        "scoped": not unrestricted,
+        "plates": plates,
+        "device_nos": device_list,
+        "car_ids": car_ids,
+    }
+
+
 async def resolve_allowed_vehicle_ids(
     db: AsyncSession,
     user_id: int | None,
@@ -153,30 +243,22 @@ async def resolve_monitor_scope(
     db: AsyncSession,
     user_id: int | None,
 ) -> dict[str, object]:
-    """返回实时监控树过滤信息：scoped=True 时前端仅展示允许车辆。"""
-    allowed_ids = await resolve_allowed_vehicle_ids(db, user_id)
-    if allowed_ids is None:
-        return {"scoped": False, "plates": [], "device_nos": [], "car_ids": []}
+    """返回实时监控树过滤信息：scoped=True 时前端仅展示允许车辆。
 
-    if not allowed_ids:
+    无论是否 admin，均返回 plates/device_nos/car_ids 实际列表，避免调用方把空数组误判为「无车」。
+    admin 返回 scoped=false 且全量车辆；未绑分配规则的用户返回所属公司及下级车辆。
+    """
+    if user_id is None:
         return {"scoped": True, "plates": [], "device_nos": [], "car_ids": []}
 
-    plate_rows = (
-        await db.execute(select(Vehicle.plate_no).where(Vehicle.id.in_(allowed_ids)))
-    ).scalars().all()
-    plates = sorted({(p or "").strip() for p in plate_rows if (p or "").strip()})
+    user = await db.scalar(
+        select(SysUser)
+        .options(selectinload(SysUser.role))
+        .where(SysUser.id == user_id)
+        .limit(1)
+    )
+    if user is None or not user.is_active:
+        return {"scoped": True, "plates": [], "device_nos": [], "car_ids": []}
 
-    device_nos: set[str] = set()
-    device_rows = (
-        await db.execute(
-            select(VehicleDevice.device_no).where(
-                VehicleDevice.vehicle_id.in_(allowed_ids),
-                VehicleDevice.is_main.is_(True),
-            )
-        )
-    ).scalars().all()
-    for dev in device_rows:
-        device_nos.update(_normalize_device_no(str(dev) if dev is not None else ""))
-    device_list = sorted(device_nos)
-    car_ids = _lookup_jt808_car_ids(plates, device_list)
-    return {"scoped": True, "plates": plates, "device_nos": device_list, "car_ids": car_ids}
+    vehicle_ids, unrestricted = await _resolve_scope_vehicle_ids(db, user)
+    return await _build_monitor_scope_payload(db, vehicle_ids, unrestricted=unrestricted)
