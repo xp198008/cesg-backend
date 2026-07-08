@@ -258,6 +258,17 @@ async def _descendant_ids(db: AsyncSession, root_id: int) -> set[int]:
     return out
 
 
+def _resolve_org_tree_icon(name: str | None) -> str:
+    text = (name or "").strip()
+    if "车队" in text:
+        return "truck"
+    if "项目" in text or "组" in text:
+        return "folder"
+    if "监控" in text and "中心" in text:
+        return "monitor"
+    return "building"
+
+
 def _tree_nodes_for_ui(
     rows: list[OrgCompany],
     by_parent: dict[int | None, list[OrgCompany]],
@@ -274,7 +285,7 @@ def _tree_nodes_for_ui(
         return {
             "id": str(node.id),
             "label": label,
-            "icon": "building",
+            "icon": _resolve_org_tree_icon(node.name),
             "children": [build(c) for c in kids],
         }
 
@@ -287,17 +298,11 @@ async def _drivers_by_company_from_vehicles(
     *,
     scoped_company_ids: set[int] | None,
 ) -> tuple[dict[int, list[dict[str, Any]]], dict[int, int]]:
-    """按车辆所属公司聚合司机（vehicle.driver_name 优先，否则关联 driver 表）。"""
+    """按车辆所属公司聚合司机（仅 vehicle.driver_name，未录入则跳过）。"""
     stmt = select(Vehicle.company_id, Vehicle.driver_id, Vehicle.driver_name)
     if scoped_company_ids is not None:
         stmt = stmt.where(Vehicle.company_id.in_(scoped_company_ids))
     vehicle_rows = (await db.execute(stmt)).all()
-
-    driver_ids = {int(r[1]) for r in vehicle_rows if r[1]}
-    driver_map: dict[int, str] = {}
-    if driver_ids:
-        dr = await db.execute(select(Driver.id, Driver.name).where(Driver.id.in_(driver_ids)))
-        driver_map = {int(i): (n or "").strip() for i, n in dr.all() if n}
 
     drivers_raw: dict[int, dict[str, dict[str, Any]]] = {}
     vehicle_count: dict[int, int] = {}
@@ -308,8 +313,6 @@ async def _drivers_by_company_from_vehicles(
         vehicle_count[cid] = vehicle_count.get(cid, 0) + 1
 
         name = (driver_name or "").strip()
-        if not name and driver_id:
-            name = driver_map.get(int(driver_id), "")
         if not name:
             continue
 
