@@ -31,7 +31,6 @@ from app.config import settings
 from app.database import init_models
 from app.jt808_alarm_sync import (
     cleanup_jt808_violations_unknown_type,
-    cleanup_jt808_violations_without_evidence,
     cleanup_jt808_violations_without_vehicle,
     jt808_alarm_scheduler,
 )
@@ -39,6 +38,7 @@ from app.obd_speed_monitor import obd_speed_scheduler
 from app.redis_queue_consumer import redis_queue_scheduler
 from app.routers import (
     api_ai,
+    api_alarm_filter_rule,
     api_alarm_type,
     api_dashboard,
     api_device_fault,
@@ -47,6 +47,7 @@ from app.routers import (
     api_jt808_alarm_sync,
     api_knowledge,
     api_manual_fault,
+    api_map_grasp,
     api_map_rules,
     api_media,
     api_obd_speed,
@@ -118,9 +119,11 @@ app.include_router(api_vehicle.router)
 app.include_router(api_vehicle_type.router)
 app.include_router(api_driver.router)
 app.include_router(api_alarm_type.router)
+app.include_router(api_alarm_filter_rule.router)
 app.include_router(api_fault_type.router)
 app.include_router(api_jt808_alarm_sync.router)
 app.include_router(api_map_rules.router)
+app.include_router(api_map_grasp.router)
 app.include_router(api_obd_speed.router)
 app.include_router(api_permission_menu.router)
 app.include_router(api_vehicle_alloc.router)
@@ -219,6 +222,30 @@ async def _ensure_default_admin() -> None:
         await s.commit()
 
 
+async def _background_address_backfill() -> None:
+    """启动后连续多批补地址，尽快清空历史空地址。"""
+    await asyncio.sleep(5)
+    from app.database import AsyncSessionLocal
+    from app.violation_address_backfill import (
+        backfill_vehicle_location_addresses,
+        backfill_violation_addresses,
+    )
+
+    try:
+        for round_no in range(1, 26):
+            async with AsyncSessionLocal() as s:
+                v = await backfill_violation_addresses(s, limit=40)
+                l = await backfill_vehicle_location_addresses(s, limit=20)
+                await s.commit()
+            if v == 0 and l == 0:
+                logger.info("报警地址启动回填已完成（第 %s 轮无待补记录）", round_no)
+                break
+            logger.info("报警地址启动回填第 %s 轮：违章 %s 条，位置 %s 条", round_no, v, l)
+            await asyncio.sleep(0.5)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("报警地址启动回填失败: %s", exc)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     await init_models()
@@ -230,20 +257,66 @@ async def _startup() -> None:
         if filled:
             logger.info("已补全 %s 条登录明细的所属公司", filled)
         rebuilt = await rebuild_daily_from_login_logs(s)
+        from app.violation_risk_backfill import backfill_violation_risk_levels
+
+        risk_updated = await backfill_violation_risk_levels(s)
         await s.commit()
         if rebuilt:
             logger.info("已重建 %s 条登录会话的用户按日在线记录", rebuilt)
-    await cleanup_jt808_violations_without_evidence()
+    asyncio.create_task(_background_address_backfill())
+    # 不再启动时删除「无图片/视频证据」的 JT808 报警：证据常晚于报警到达，删掉会导致
+    # 安全监控/安全管理只剩 OBD 等无需证据的来源。保留无车辆关联与未知类型清理。
     await cleanup_jt808_violations_without_vehicle()
     deleted_unknown = await cleanup_jt808_violations_unknown_type()
     if deleted_unknown:
         logger.info("启动时已清理未知报警类型记录 %s 条", deleted_unknown)
     await _ensure_default_map_config()
     await _ensure_default_admin()
+    try:
+        from app.amap_web_service_key import sync_web_service_key_from_jt808
+        from app.database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as s:
+            key = await sync_web_service_key_from_jt808(s, force_refresh=False)
+            await s.commit()
+            if key:
+                logger.info("Web 服务 Key：已确保 map_api_config.web_service_key 可用（来源 808/库）")
+            else:
+                logger.info("Web 服务 Key：库为空且 808 appkey1 未同步到，纠偏/逆地理将在调用时再尝试")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("启动同步 Web 服务 Key 失败: %s", exc)
+    from app.permission_bootstrap import ensure_alarm_filter_rule_permission
+
+    await ensure_alarm_filter_rule_permission()
     await api_vehicle_type.ensure_default_vehicle_types()
     jt808_alarm_scheduler.start()
     obd_speed_scheduler.start()
+    try:
+        from app.address_backfill_scheduler import address_backfill_scheduler
+
+        address_backfill_scheduler.start()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("地址定时回填未启用: %s", exc)
     redis_queue_scheduler.start()
+    try:
+        from app.amap_web_service_key import get_stored_web_service_key
+        from app.database import AsyncSessionLocal
+        from app.jt808_address import get_jt808_config, get_jt808_regeo_amap_key
+
+        async with AsyncSessionLocal() as s:
+            stored = await get_stored_web_service_key(s)
+        jt808_key = await asyncio.to_thread(get_jt808_regeo_amap_key)
+        if stored:
+            logger.info("逆地理/纠偏 Key：使用 CESG 库 web_service_key")
+        elif jt808_key:
+            logger.info(
+                "逆地理/纠偏 Key：库为空，808 appkey1 可用（type1=%s）",
+                await asyncio.to_thread(get_jt808_config, "lingx.jt808.type1", "gaode"),
+            )
+        else:
+            logger.info("逆地理/纠偏 Key：库与 808 appkey1 均未就绪")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取逆地理/纠偏 Key 状态失败: %s", exc)
     logger.info("CESG 业务后端已就绪：http://127.0.0.1:%s", settings.app_port)
 
 
@@ -251,6 +324,12 @@ async def _startup() -> None:
 async def _shutdown() -> None:
     await jt808_alarm_scheduler.stop()
     await obd_speed_scheduler.stop()
+    try:
+        from app.address_backfill_scheduler import address_backfill_scheduler
+
+        await address_backfill_scheduler.stop()
+    except Exception:
+        pass
     await redis_queue_scheduler.stop()
 
 

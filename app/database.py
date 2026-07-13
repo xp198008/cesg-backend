@@ -76,6 +76,12 @@ async def init_models() -> None:
                     await conn.exec_driver_sql("ALTER TABLE sys_user ADD COLUMN identity VARCHAR(64)")
                 if "phone" not in names:
                     await conn.exec_driver_sql("ALTER TABLE sys_user ADD COLUMN phone VARCHAR(32)")
+            cols = await conn.exec_driver_sql("PRAGMA table_info(map_api_config)")
+            names = {row[1] for row in cols.fetchall()}
+            if names and "web_service_key" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE map_api_config ADD COLUMN web_service_key VARCHAR(255)"
+                )
             cols = await conn.exec_driver_sql("PRAGMA table_info(map_rule_category)")
             names = {row[1] for row in cols.fetchall()}
             if "weather_types" not in names:
@@ -105,6 +111,10 @@ async def init_models() -> None:
                     await conn.exec_driver_sql("ALTER TABLE vehicle_violation ADD COLUMN ticket_appeal_attachment_refs TEXT")
                 if "ai_queried" not in names:
                     await conn.exec_driver_sql("ALTER TABLE vehicle_violation ADD COLUMN ai_queried BOOLEAN DEFAULT 0")
+                if "risk_level" not in names:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE vehicle_violation ADD COLUMN risk_level VARCHAR(8) DEFAULT 'low'"
+                    )
             cols = await conn.exec_driver_sql("PRAGMA table_info(vehicle_location)")
             names = {row[1] for row in cols.fetchall()}
             if names and "source" not in names:

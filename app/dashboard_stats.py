@@ -19,6 +19,7 @@ from app.models import (
     VehicleViolation,
 )
 from app.org_scope import collect_org_company_subtree_ids, require_x_org_id_header, wants_org_tree_scope
+from app.alarm_filter import load_enabled_rules
 from app.violation_filters import violation_list_visibility
 
 
@@ -51,9 +52,11 @@ def _violation_scope_clause(scoped_company_ids: set[int] | None):
 async def build_home_stats(db: AsyncSession, x_org_id: str | None) -> dict:
     scoped_company_ids = await _scoped_company_ids(db, x_org_id)
     scope = _violation_scope_clause(scoped_company_ids)
+    filter_rules = await load_enabled_rules(db)
+    visibility = violation_list_visibility(filter_rules)
 
     pending_q = select(func.count()).select_from(VehicleViolation).where(
-        violation_list_visibility(),
+        visibility,
         or_(
             VehicleViolation.status == "待处理",
             and_(VehicleViolation.status == "待审核", VehicleViolation.pre_audit_kind == "preprocess"),
@@ -64,7 +67,7 @@ async def build_home_stats(db: AsyncSession, x_org_id: str | None) -> dict:
 
     start_iso, end_iso = _today_iso_range()
     completed_q = select(func.count()).select_from(VehicleViolation).where(
-        violation_list_visibility(),
+        visibility,
         VehicleViolation.status == "已处理",
     )
     try:
@@ -126,11 +129,12 @@ async def _board_vehicles(db: AsyncSession, scoped_company_ids: set[int] | None)
     return {"total": total, "online": online}
 
 
-async def _board_warnings(db: AsyncSession, scope, now: datetime) -> dict:
+async def _board_warnings(db: AsyncSession, scope, now: datetime, filter_rules) -> dict:
     day_start = _day_start(now)
+    visibility = violation_list_visibility(filter_rules)
 
     def scoped(q):
-        q = q.where(violation_list_visibility())
+        q = q.where(visibility)
         if scope is not None:
             q = q.where(scope)
         return q
@@ -469,9 +473,10 @@ async def build_board_stats(db: AsyncSession, x_org_id: str | None) -> dict:
     scoped_company_ids = await _scoped_company_ids(db, x_org_id)
     scope = _violation_scope_clause(scoped_company_ids)
     now = china_now_naive()
+    filter_rules = await load_enabled_rules(db)
 
     vehicles = await _board_vehicles(db, scoped_company_ids)
-    warnings = await _board_warnings(db, scope, now)
+    warnings = await _board_warnings(db, scope, now, filter_rules)
     faults = await _board_faults(db, scoped_company_ids)
     drivers = await _board_drivers(db, scoped_company_ids)
     energy = await _board_energy(db, scoped_company_ids)

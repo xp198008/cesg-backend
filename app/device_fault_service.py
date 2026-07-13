@@ -204,7 +204,11 @@ def _apply_device_fault_filters(q, *, terminal_id, terminal_id_contains, plate_n
     if receipt_eligible_only:
         q = q.where(or_(JtDeviceFault.handle_status == "已通过", JtDeviceFault.handle_status == "已处理"))
     elif handle_status and handle_status.strip():
-        q = q.where(JtDeviceFault.handle_status == handle_status.strip())
+        hs = handle_status.strip()
+        if hs == "未处理":
+            q = q.where(or_(JtDeviceFault.handle_status == "未处理", JtDeviceFault.handle_status == "待处理"))
+        else:
+            q = q.where(JtDeviceFault.handle_status == hs)
     return q
 
 

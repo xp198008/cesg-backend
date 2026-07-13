@@ -116,6 +116,25 @@ def _channel_num(n) -> int:
     return min(n, 32)
 
 
+def _channel_num_from_data(data: dict) -> int:
+    """综合 channel_count、channels、device_channel_no 计算 808 通道数。"""
+    n = 0
+    try:
+        n = int(data.get("channel_count") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    raw = data.get("channels")
+    if isinstance(raw, (list, tuple)) and raw:
+        n = max(n, len(raw))
+    try:
+        dno = int(data.get("device_channel_no") or 0)
+        if dno > 0:
+            n = max(n, dno)
+    except (TypeError, ValueError):
+        pass
+    return _channel_num(n)
+
+
 def _json_val(v: Any) -> Any:
     if v is None:
         return None
@@ -143,9 +162,34 @@ def _device_type(data: dict) -> str:
     return t or DEFAULT_VERSION
 
 
+_CHANNEL_FLAG_MAX = 7
+
+
+def _channel_flags(data: dict) -> dict[str, int]:
+    """CH1~CH7 选中标记：勾选为 1、未勾选为 0。
+
+    优先使用设备通道明细（channels，如 ["CH1","CH3"]）；
+    历史数据无明细时按 channel_count 前 N 路视为选中。
+    """
+    selected: set[int] = set()
+    raw = data.get("channels")
+    if isinstance(raw, (list, tuple)) and raw:
+        for item in raw:
+            text = str(item or "").strip().upper()
+            num = text[2:] if text.startswith("CH") else text
+            if num.isdigit():
+                n = int(num)
+                if 1 <= n <= _CHANNEL_FLAG_MAX:
+                    selected.add(n)
+    else:
+        count = _channel_num(data.get("channel_count"))
+        selected = set(range(1, min(count, _CHANNEL_FLAG_MAX) + 1))
+    return {f"CH{i}": (1 if i in selected else 0) for i in range(1, _CHANNEL_FLAG_MAX + 1)}
+
+
 def _build_ext_json(data: dict) -> str:
     """1251 扩展字段：标准列 + CESG 业务字段（含偏移量）。"""
-    ch = _channel_num(data.get("channel_count"))
+    ch = _channel_num_from_data(data)
     ext: dict[str, Any] = {
         "sim": (data.get("sim_no") or "").strip(),
         "czxm": (data.get("driver_name") or data.get("contact_name") or "").strip(),
@@ -155,6 +199,7 @@ def _build_ext_json(data: dict) -> str:
         "channel_num": ch,
         "remark": (data.get("remark") or "CESG同步").strip(),
     }
+    ext.update(_channel_flags(data))
     optional_keys = (
         "engine_no",
         "product_model_code",
@@ -418,7 +463,7 @@ async def _sync_upsert(data: dict, trace: dict | None = None) -> bool:
         else:
             car_id = await _lookup_car_id(dev)
 
-    await asyncio.to_thread(_sync_channels_mysql, tid, _channel_num(data.get("channel_count")), car_id)
+    await asyncio.to_thread(_sync_channels_mysql, tid, _channel_num_from_data(data), car_id)
     logger.info("JT808 1251 车辆同步成功 vehicle_id=%s tid=%s carno=%s", data.get("id"), tid, plate)
     return True
 
@@ -552,6 +597,7 @@ async def _load_vehicle(vehicle_id: int) -> dict | None:
             "curb_weight": v.curb_weight,
             "urea_info": v.urea_info,
             "channel_count": v.channel_count,
+            "channels": (d.channels if d and d.channels else []),
             "contact_name": v.contact_name,
             "contact_phone": v.contact_phone,
             "owner_name": v.owner_name,

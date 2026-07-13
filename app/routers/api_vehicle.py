@@ -405,7 +405,9 @@ def _apply_vehicle_payload(v: Vehicle, co: OrgCompany, payload: VehicleSavePaylo
     v.service_end_date = _to_date(payload.service_end_date)
     v.status = _norm(payload.status) or "正常"
     v.last_online_at = _to_datetime(payload.last_online_at)
-    v.channel_count = _to_int(payload.channel_count, 0) or 0
+    channels = payload.channels or []
+    cc = _to_int(payload.channel_count, 0) or 0
+    v.channel_count = max(cc, len(channels)) if channels else cc
     v.engine_displacement = _norm(payload.engine_displacement) or None
     v.fuel_tank_capacity = _norm(payload.fuel_tank_capacity) or None
     v.battery_capacity = _norm(payload.battery_capacity) or None

@@ -93,6 +93,7 @@ _SHORTCUT_META: dict[str, dict[str, str]] = {
     "105": {"url": "/main/base/org", "icon": "./images/svg/icon-jichushuju.svg"},
     "106": {"url": "/main/base/vehicle-assignment", "icon": "./images/svg/icon-jichushuju.svg"},
     "107": {"url": "/main/base/alarms", "icon": "./images/svg/icon-jichushuju.svg"},
+    "111": {"url": "/main/base/alarm-filter-rules", "icon": "./images/svg/icon-jichushuju.svg"},
     "108": {"url": "/main/base/roles", "icon": "./images/svg/icon-jichushuju.svg"},
     "109": {"url": "/main/base/faults", "icon": "./images/svg/icon-jichushuju.svg"},
     "110": {"url": "/main/base/speed-rules", "icon": "./images/svg/icon-jichushuju.svg"},

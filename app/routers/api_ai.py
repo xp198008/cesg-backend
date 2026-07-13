@@ -150,6 +150,7 @@ async def ai_chat(
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         },
     )
 

@@ -27,11 +27,16 @@ from app.org_scope import collect_org_company_subtree_ids, require_x_org_id_head
 from app.plate_util import norm_plate
 from app.routers.api_vehicle import _vehicle_list_company_fleet_names
 from app.timeutil import china_now_naive
+from app.violation_alert_cache import get_alerts_after, push_violation_alert, violation_alert_payload
+from app.violation_risk import derive_risk_level, risk_level_label
+from app.amap_regeo import resolve_address_wgs84
+from app.violation_address_fill import ensure_violation_address
 from app.violation_ai_assessment import (
     get_violation_ai_assessment,
     run_violation_ai_assessment,
     stream_violation_ai_assessment,
 )
+from app.alarm_filter import load_enabled_rules
 from app.violation_filters import violation_list_visibility
 
 router = APIRouter(prefix="/api/violation", tags=["violation"])
@@ -147,6 +152,39 @@ def _json_loads(raw: str | None, fallback: Any) -> Any:
         return fallback
 
 
+def _coerce_positive_int(value: Any) -> int | None:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _speed_limit_display_from_row(row: VehicleViolation) -> str | None:
+    """列表「限速值」列：OBD 从 raw_preview.limit_kmh 解析；其它来源尝试常见字段。"""
+    preview = _json_loads(row.raw_preview, {})
+    if not isinstance(preview, dict):
+        return None
+    source = (row.source or "").strip()
+    if source == "obd_speed":
+        limit = _coerce_positive_int(preview.get("limit_kmh"))
+        return str(limit) if limit is not None else None
+    for key in (
+        "speed_limit",
+        "speedLimit",
+        "limit_speed",
+        "limitSpeed",
+        "speed_limit_kmh",
+        "xssd",
+        "xsxz",
+        "bjxs",
+    ):
+        limit = _coerce_positive_int(preview.get(key))
+        if limit is not None:
+            return str(limit)
+    return None
+
+
 async def _save_ticket_appeal_upload(violation_id: int, file: StarletteUploadFile) -> dict[str, Any]:
     original = _resolve_ticket_appeal_filename(file)
     ext = Path(original).suffix.lower()
@@ -253,6 +291,7 @@ async def _rows_out(
 
     company_map, parent_map, fleet_map = await _load_org_company_maps(db)
     items: list[dict[str, Any]] = []
+    fill_budget = 3
     for row in rows:
         out = _row_out(row, ticket_by_biz)
         vehicle = vehicles.get(int(row.vehicle_id)) if row.vehicle_id else None
@@ -266,11 +305,20 @@ async def _rows_out(
             fleet_map=fleet_map,
             drivers=drivers,
         )
+        if fill_budget > 0 and not (out.get("address") or "").strip():
+            try:
+                addr = await ensure_violation_address(db, row)
+                if addr:
+                    out["address"] = addr
+                    fill_budget -= 1
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("列表补地址跳过 id=%s: %s", row.id, exc)
         items.append(out)
     return items
 
 
 async def _row_out_enriched(db: AsyncSession, row: VehicleViolation, ticket_by_biz: dict[str, ViolationTicket] | None = None) -> dict[str, Any]:
+    await ensure_violation_address(db, row)
     items = await _rows_out(db, [row], ticket_by_biz)
     return items[0]
 
@@ -290,6 +338,8 @@ def _row_out(row: VehicleViolation, ticket_by_biz: dict[str, ViolationTicket] | 
         "company_id": row.company_id,
         "violation_type_code": row.violation_type_code,
         "violation_type_name": row.violation_type_name,
+        "risk_level": row.risk_level or derive_risk_level(row.violation_type_name),
+        "risk_level_label": risk_level_label(row.risk_level or derive_risk_level(row.violation_type_name)),
         "violation_time": _dt_text(row.violation_time),
         "lat": row.lat,
         "lng": row.lng,
@@ -329,12 +379,16 @@ def _row_out(row: VehicleViolation, ticket_by_biz: dict[str, ViolationTicket] | 
             "jt808_adas": "JT808 ADAS",
             "jt808_dsm": "JT808 DSM",
             "manual": "人工录入",
+            "obd_speed": "OBD超速",
         }.get((row.source or "").strip(), row.source or ""),
+        "speed_limit_display": _speed_limit_display_from_row(row),
     }
 
 
-async def _scoped_query(db: AsyncSession, x_org_id: str | None):
-    q = select(VehicleViolation).where(violation_list_visibility())
+async def _scoped_query(db: AsyncSession, x_org_id: str | None, filter_rules=None):
+    if filter_rules is None:
+        filter_rules = await load_enabled_rules(db)
+    q = select(VehicleViolation).where(violation_list_visibility(filter_rules))
     if x_org_id:
         root = require_x_org_id_header(x_org_id)
         exists = await db.scalar(select(OrgCompany.id).where(OrgCompany.id == root).limit(1))
@@ -409,19 +463,26 @@ async def violation_list(
     biz_no: str | None = Query(None),
     terminal_id: str | None = Query(None),
     source: str | None = Query(None),
+    violation_type_dict_id: int | None = Query(None, ge=1),
     start_time: str | None = Query(None),
     end_time: str | None = Query(None),
     followed_only: bool = Query(False),
     user_id: int | None = Query(None, ge=1),
+    apply_alarm_filter: bool = Query(
+        True,
+        description="是否应用报警过滤规则软隐藏；安全监控传 false 以展示全部设备报警",
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     limit: int | None = Query(None, ge=1, le=2000),
     offset: int | None = Query(None, ge=0),
+    min_id: int | None = Query(None, ge=0),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
-    q = await _scoped_query(db, x_org_id)
+    filter_rules = await load_enabled_rules(db) if apply_alarm_filter else []
+    q = await _scoped_query(db, x_org_id, filter_rules)
     q = await _apply_followed_only_filter(
         db,
         q,
@@ -449,6 +510,10 @@ async def violation_list(
         q = q.where(VehicleViolation.terminal_id.ilike(f"%{terminal_id.strip()}%"))
     if source:
         q = q.where(VehicleViolation.source == source.strip())
+    if violation_type_dict_id is not None:
+        vt_row = await db.get(ViolationTypeDict, int(violation_type_dict_id))
+        if vt_row is not None and (vt_row.type_name or "").strip():
+            q = q.where(VehicleViolation.violation_type_name == (vt_row.type_name or "").strip())
     if start_time:
         try:
             q = q.where(VehicleViolation.violation_time >= datetime.fromisoformat(start_time.replace("/", "-")))
@@ -459,11 +524,18 @@ async def violation_list(
             q = q.where(VehicleViolation.violation_time <= datetime.fromisoformat(end_time.replace("/", "-")))
         except ValueError:
             pass
+    if min_id is not None and min_id > 0:
+        q = q.where(VehicleViolation.id > min_id)
 
     total = await db.scalar(select(func.count()).select_from(q.subquery())) or 0
     lim = limit or page_size
     off = offset if offset is not None else (page - 1) * page_size
-    rows = (await db.execute(q.order_by(VehicleViolation.violation_time.desc(), VehicleViolation.id.desc()).offset(off).limit(lim))).scalars().all()
+    order = (
+        (VehicleViolation.id.asc(),)
+        if min_id is not None and min_id > 0
+        else (VehicleViolation.violation_time.desc(), VehicleViolation.id.desc())
+    )
+    rows = (await db.execute(q.order_by(*order).offset(off).limit(lim))).scalars().all()
     biz = [x.biz_no for x in rows if x.biz_no]
     ticket_by_biz: dict[str, ViolationTicket] = {}
     if biz:
@@ -476,7 +548,123 @@ async def violation_list(
         "items": await _rows_out(db, list(rows), ticket_by_biz),
         "page": page,
         "page_size": page_size,
+        "filter_meta": {
+            "engine": "alarm-filter-v2",
+            "apply_alarm_filter": apply_alarm_filter,
+            "active_rules": len(filter_rules),
+            "rules": [
+                {
+                    "id": r.id,
+                    "rule_code": r.rule_name,
+                    "alarm_type_name": r.alarm_type_name,
+                    "alarm_level": r.alarm_level,
+                }
+                for r in filter_rules
+            ],
+        },
     }
+
+
+@router.get("/recent-pending")
+async def violation_recent_pending(
+    after_id: int = Query(0, ge=0),
+    start_time: str | None = Query(None),
+    end_time: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    followed_only: bool = Query(False),
+    user_id: int | None = Query(None, ge=1),
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """增量拉取待处理报警：id > after_id，供安全监控弹窗轮询（每入库一条触发一次）。"""
+    filter_rules = await load_enabled_rules(db)
+    q = await _scoped_query(db, x_org_id, filter_rules)
+    q = await _apply_followed_only_filter(
+        db,
+        q,
+        followed_only=followed_only,
+        user_id=user_id,
+        x_user_id=x_user_id,
+    )
+    q = q.where(
+        or_(
+            VehicleViolation.status == "待处理",
+            and_(VehicleViolation.status == "待审核", VehicleViolation.pre_audit_kind == "preprocess"),
+        )
+    )
+    if after_id > 0:
+        q = q.where(VehicleViolation.id > after_id)
+    if start_time:
+        try:
+            q = q.where(VehicleViolation.violation_time >= datetime.fromisoformat(start_time.replace("/", "-")))
+        except ValueError:
+            pass
+    if end_time:
+        try:
+            q = q.where(VehicleViolation.violation_time <= datetime.fromisoformat(end_time.replace("/", "-")))
+        except ValueError:
+            pass
+
+    rows = (
+        await db.execute(
+            q.order_by(VehicleViolation.id.asc()).limit(limit)
+        )
+    ).scalars().all()
+    biz = [x.biz_no for x in rows if x.biz_no]
+    ticket_by_biz: dict[str, ViolationTicket] = {}
+    if biz:
+        for ticket in (await db.execute(select(ViolationTicket).where(ViolationTicket.biz_no.in_(biz)))).scalars().all():
+            if ticket.biz_no:
+                ticket_by_biz[ticket.biz_no] = ticket
+    max_id = await db.scalar(select(func.max(VehicleViolation.id)).select_from(q.subquery()))
+    max_id = int(max_id or after_id)
+    return {
+        "ok": True,
+        "items": await _rows_out(db, list(rows), ticket_by_biz),
+        "after_id": after_id,
+        "max_id": max_id,
+    }
+
+
+@router.get("/alert-cache")
+async def violation_alert_cache(
+    after_seq: int = Query(-1, ge=-1),
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """新增报警缓存增量。after_seq=-1 只取当前水位（登录时调用一次），
+    之后带上次返回的 max_seq 轮询，有新条目即弹窗。按 X-Org-Id 过滤可见公司。"""
+    alerts, max_seq = get_alerts_after(after_seq)
+    if alerts and x_org_id:
+        try:
+            root = require_x_org_id_header(x_org_id)
+            exists = await db.scalar(select(OrgCompany.id).where(OrgCompany.id == root).limit(1))
+            if exists:
+                subtree = await collect_org_company_subtree_ids(db, root)
+                alerts = [a for a in alerts if a.get("company_id") is None or a.get("company_id") in subtree]
+        except HTTPException:
+            pass
+    return {"ok": True, "items": alerts, "max_seq": max_seq}
+
+
+@router.get("/pending-watermark")
+async def violation_pending_watermark(
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """当前可见范围内待处理报警的最大 id，用于登录后建立弹窗轮询水位。"""
+    filter_rules = await load_enabled_rules(db)
+    q = await _scoped_query(db, x_org_id, filter_rules)
+    q = q.where(
+        or_(
+            VehicleViolation.status == "待处理",
+            and_(VehicleViolation.status == "待审核", VehicleViolation.pre_audit_kind == "preprocess"),
+        )
+    )
+    max_id = await db.scalar(select(func.max(VehicleViolation.id)).select_from(q.subquery()))
+    return {"ok": True, "max_id": int(max_id or 0)}
 
 
 @router.post("/manual")
@@ -541,6 +729,8 @@ async def violation_manual(
                 lat_out, lng_out = float(loc_row.lat), float(loc_row.lng)
             if not addr_out and (loc_row.current_position or "").strip():
                 addr_out = str(loc_row.current_position).strip()[:500]
+            if not addr_out and lat_out is not None and lng_out is not None:
+                addr_out = await resolve_address_wgs84(db, lat_out, lng_out) or None
 
     row = VehicleViolation(
         biz_no=_gen_biz_no(),
@@ -550,6 +740,7 @@ async def violation_manual(
         company_id=company_id,
         violation_type_code=None,
         violation_type_name=vtype_name,
+        risk_level=derive_risk_level(vtype_name),
         violation_time=vt,
         lat=lat_out,
         lng=lng_out,
@@ -562,6 +753,7 @@ async def violation_manual(
     db.add(row)
     await db.commit()
     await db.refresh(row)
+    push_violation_alert(violation_alert_payload(row))
     return {"ok": True, "id": row.id, "biz_no": row.biz_no}
 
 
@@ -581,7 +773,7 @@ async def violation_fetch_device_media(violation_id: int, db: AsyncSession = Dep
     evidence = normalize_evidence_payload(_json_loads(row.ttx_evidence_refs, {}))
     return {
         "ok": True,
-        "message": "已读取本地同步的 JT808 证据",
+        "message": "",
         "images": evidence.get("images", []),
         "videos": evidence.get("videos", []),
         "downlink": [],
@@ -793,6 +985,6 @@ async def violation_ai_assessment_analyze_stream(
     return StreamingResponse(
         stream_violation_ai_assessment(violation_id=violation_id, user_id=user_id, force=force),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
 

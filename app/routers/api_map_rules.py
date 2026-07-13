@@ -54,6 +54,7 @@ class MapApiConfigBody(BaseModel):
     provider: str = "amap"
     api_key: str | None = None
     secret_key: str | None = None
+    web_service_key: str | None = None
     default_zoom: int | None = Field(None, ge=1, le=20)
     default_center_lng: float | None = None
     default_center_lat: float | None = None
@@ -66,6 +67,7 @@ def _map_config_out(row: MapApiConfig) -> dict:
         "provider": row.provider,
         "api_key": row.api_key,
         "secret_key": row.secret_key,
+        "web_service_key": row.web_service_key,
         "default_zoom": row.default_zoom,
         "default_center_lng": row.default_center_lng,
         "default_center_lat": row.default_center_lat,
@@ -94,6 +96,7 @@ async def map_api_config_put(body: MapApiConfigBody, db: AsyncSession = Depends(
         db.add(row)
     row.api_key = (body.api_key or "").strip() or None
     row.secret_key = (body.secret_key or "").strip() or None
+    # web_service_key 只读：仅允许启动/失败回退/sync 接口从 808 写入
     if body.default_zoom is not None:
         row.default_zoom = body.default_zoom
     if body.default_center_lng is not None:
@@ -104,6 +107,25 @@ async def map_api_config_put(body: MapApiConfigBody, db: AsyncSession = Depends(
     await db.flush()
     await db.refresh(row)
     return {"ok": True, "data": _map_config_out(row)}
+
+
+@router.post("/map-api-config/sync-web-service-key")
+async def map_api_config_sync_web_service_key(
+    provider: str = Query("amap"),
+    db: AsyncSession = Depends(get_db),
+):
+    """从 808 appkey1 强制同步 Web 服务 Key 到 CESG 库。"""
+    from app.amap_web_service_key import sync_web_service_key_from_jt808
+
+    if (provider or "amap").strip() != "amap":
+        return {"ok": False, "message": "仅支持 amap"}
+    key = await sync_web_service_key_from_jt808(db, force_refresh=True)
+    row = await db.scalar(select(MapApiConfig).where(MapApiConfig.provider == "amap").limit(1))
+    return {
+        "ok": bool(key),
+        "message": "已同步" if key else "808 未返回可用 Web 服务 Key（检查 type1=gaode 与 appkey1）",
+        "data": _map_config_out(row) if row else None,
+    }
 
 
 class PublicMapRuleCreateBody(BaseModel):
@@ -223,6 +245,7 @@ class PrivateMapRuleCreateBody(BaseModel):
 
 class PrivateMapRuleUpdateBody(BaseModel):
     rule_name: str | None = Field(None, min_length=1, max_length=200)
+    draw_shape_type: str | None = Field(None, min_length=1, max_length=32)
     geometry_json: dict[str, Any] | list[Any] | None = None
     speed_limit_kmh: int | None = Field(None, ge=0, le=500)
     ref_public_rule_id: int | None = None
@@ -723,6 +746,8 @@ async def private_map_rule_update(
         row.rule_name = body.rule_name.strip()
     if "geometry_json" in data:
         row.geometry_json = body.geometry_json
+    if "draw_shape_type" in data and body.draw_shape_type is not None:
+        row.draw_shape_type = body.draw_shape_type.strip()
     if "speed_limit_kmh" in data and body.speed_limit_kmh is not None:
         row.speed_limit_kmh = body.speed_limit_kmh
     if "ref_public_rule_id" in data:
@@ -762,6 +787,7 @@ async def private_map_rules_batch_from_public(
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
     db: AsyncSession = Depends(get_db),
 ):
+    """根据勾选的公用规则，为本公司批量生成/更新私有规则（对照复制）。"""
     cid = await _resolve_company_id(db, x_org_id)
     created = updated = skipped = 0
     for public_id in list(dict.fromkeys(body.public_rule_ids)):
@@ -771,21 +797,35 @@ async def private_map_rules_batch_from_public(
             continue
         code = f"PRV-C{cid}-P{public_id}"
         row = await db.scalar(
-            select(PrivateMapRule).where(PrivateMapRule.company_id == cid, PrivateMapRule.ref_public_rule_id == public_id).limit(1)
+            select(PrivateMapRule).where(
+                PrivateMapRule.company_id == cid,
+                PrivateMapRule.ref_public_rule_id == public_id,
+            ).limit(1)
         )
+        # 公用规则表无 speed_limit_kmh 字段；私有规则限速由类别/天气规则维护，复制时置 0
         if row is None:
-            row = PrivateMapRule(company_id=cid, rule_code=code)
+            row = PrivateMapRule(
+                company_id=cid,
+                rule_code=code,
+                rule_name=pub.rule_name,
+                rule_type_code=pub.rule_type_code,
+                draw_shape_type=pub.draw_shape_type,
+                geometry_json=pub.geometry_json,
+                speed_limit_kmh=0,
+                ref_public_rule_id=public_id,
+                category_ids=[],
+                remark=pub.remark,
+            )
             db.add(row)
             created += 1
         else:
+            row.rule_name = pub.rule_name
+            row.rule_type_code = pub.rule_type_code
+            row.draw_shape_type = pub.draw_shape_type
+            row.geometry_json = pub.geometry_json
+            row.ref_public_rule_id = public_id
+            row.remark = pub.remark
             updated += 1
-        row.rule_name = pub.rule_name
-        row.rule_type_code = pub.rule_type_code
-        row.draw_shape_type = pub.draw_shape_type
-        row.geometry_json = pub.geometry_json
-        row.speed_limit_kmh = pub.speed_limit_kmh or 0
-        row.ref_public_rule_id = public_id
-        row.remark = pub.remark
     await db.flush()
     return {"ok": True, "created": created, "updated": updated, "skipped": skipped}
 

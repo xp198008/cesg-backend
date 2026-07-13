@@ -18,9 +18,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import AsyncSessionLocal
+from app.alarm_filter import find_matching_rule, log_filtered_alarm
 from app.jt808_openapi_client import Jt808OpenApiError, jt808_openapi_client
 from app.models import Jt808AlarmSyncState, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTicket
 from app.plate_util import norm_plate
+from app.amap_regeo import resolve_address_wgs84
+from app.violation_alert_cache import push_violation_alert, violation_alert_payload
+from app.violation_risk import derive_risk_level
 from app.violation_filters import is_unknown_violation_type_name
 
 logger = logging.getLogger(__name__)
@@ -60,6 +64,19 @@ _DSM_ALARM_NAMES = {
     22: "喝水报警",
 }
 
+# BSD 盲区监测（808 字典 BSD_BJLX）
+_BSD_ALARM_NAMES = {
+    1: "后方接近报警",
+    2: "左侧后方接近报警",
+    3: "右侧后方接近报警",
+    81: "后方接近预警",
+    82: "左侧后方接近预警",
+    83: "右侧后方接近预警",
+    97: "后方接近提示事件",
+    98: "左侧后方提示事件",
+    99: "右侧后方提示事件",
+}
+
 
 @dataclass
 class SyncResult:
@@ -69,6 +86,7 @@ class SyncResult:
     skipped_no_evidence: int = 0
     skipped_no_vehicle: int = 0
     skipped_unknown_type: int = 0
+    skipped_filtered: int = 0
     updated_positions: int = 0
     error: str | None = None
 
@@ -133,25 +151,32 @@ def _external_alarm_id(source: str, item: dict[str, Any]) -> str:
     return f"jt808:{source}:{digest}"
 
 
+_LEVEL_SUFFIX = {1: "一级", 2: "二级"}
+
+
 def _alarm_type_name(source: str, item: dict[str, Any]) -> str:
     direct = str(item.get("name") or "").strip()
     if direct:
         level = _as_int(item.get("bjjb"))
-        if level in (1, 2) and direct.endswith("报警"):
-            return f"{direct}{level}级"
+        if level in _LEVEL_SUFFIX and direct.endswith("报警"):
+            return f"{direct}{_LEVEL_SUFFIX[level]}"
         return direct
     code = _as_int(item.get("bjlx") if item.get("bjlx") is not None else item.get("bjid"))
     if source == _SOURCE_ADAS:
-        # 1208 合并返回 ADAS/DSM 类型码：先 ADAS 字典，未命中再试 DSM。
-        base = _ADAS_ALARM_NAMES.get(code or -1) or _DSM_ALARM_NAMES.get(code or -1)
+        # 1208 合并返回 ADAS/DSM/BSD 类型码：依次尝试各字典。
+        base = (
+            _ADAS_ALARM_NAMES.get(code or -1)
+            or _DSM_ALARM_NAMES.get(code or -1)
+            or _BSD_ALARM_NAMES.get(code or -1)
+        )
     else:
         base = _DSM_ALARM_NAMES.get(code or -1)
     if not base:
         prefix = "主动安全报警"
         base = f"{prefix}{code}" if code is not None else prefix
     level = _as_int(item.get("bjjb"))
-    if level in (1, 2) and base.endswith("报警"):
-        return f"{base}{level}级"
+    if level in _LEVEL_SUFFIX and base.endswith("报警"):
+        return f"{base}{_LEVEL_SUFFIX[level]}"
     return base
 
 
@@ -422,10 +447,29 @@ async def _sync_alarm_source(db: AsyncSession, source: str, start_at: datetime, 
                     result.skipped_unknown_type += 1
                     continue
                 alarm_time = _parse_api_time(item.get("gpstime") or item.get("ts")) or end_at
+                type_name = _alarm_type_name(source, item)
+                level = _as_int(item.get("bjjb"))
+                matched_rule = await find_matching_rule(db, type_name, level)
+                # 命中过滤规则仍入库：安全管理列表软隐藏；安全监控可全量展示。
+                # 证据可后补（处理页 fetch-device-media）。
                 media = _split_media_files(item.get("files"))
+                if matched_rule is not None:
+                    log_filtered_alarm(
+                        source=source,
+                        external_id=ext_id,
+                        alarm_type_name=type_name,
+                        alarm_level=level,
+                        rule=matched_rule,
+                        plate=plate,
+                    )
+                    result.skipped_filtered += 1
                 if not _has_image_or_video_evidence(media):
                     result.skipped_no_evidence += 1
-                    continue
+                lat = _as_float(item.get("lat"))
+                lng = _as_float(item.get("lng"))
+                address = await resolve_address_wgs84(
+                    db, lat, lng, existing=str(item.get("address") or "")
+                )
                 row = VehicleViolation(
                     biz_no=_stable_biz_no(source, ext_id, alarm_time),
                     external_alarm_id=ext_id,
@@ -434,11 +478,12 @@ async def _sync_alarm_source(db: AsyncSession, source: str, start_at: datetime, 
                     plate_no=vehicle.plate_no[:16],
                     company_id=vehicle.company_id,
                     violation_type_code=_as_int(item.get("bjlx") if item.get("bjlx") is not None else item.get("bjid")),
-                    violation_type_name=_alarm_type_name(source, item),
+                    violation_type_name=type_name,
+                    risk_level=derive_risk_level(type_name),
                     violation_time=alarm_time,
-                    lat=_as_float(item.get("lat")),
-                    lng=_as_float(item.get("lng")),
-                    address=str(item.get("address") or ""),
+                    lat=lat,
+                    lng=lng,
+                    address=address,
                     source=source,
                     transparent_type=_as_int(item.get("bjid")),
                     raw_preview=json.dumps(item, ensure_ascii=False)[:4000],
@@ -446,6 +491,8 @@ async def _sync_alarm_source(db: AsyncSession, source: str, start_at: datetime, 
                     status="待处理",
                 )
                 db.add(row)
+                await db.flush()
+                push_violation_alert(violation_alert_payload(row))
                 result.inserted += 1
                 if terminal_id:
                     terminals.add(terminal_id)
@@ -479,11 +526,15 @@ async def _sync_positions(db: AsyncSession, terminals: list[str], result: SyncRe
             loc.plate_no = vehicle.plate_no
             loc.company_id = vehicle.company_id
             loc.terminal_id = terminal_id
-            loc.lat = _as_float(item.get("lat"))
-            loc.lng = _as_float(item.get("lng"))
+            lat = _as_float(item.get("lat"))
+            lng = _as_float(item.get("lng"))
+            loc.lat = lat
+            loc.lng = lng
             loc.speed = _as_float(item.get("speed"))
             loc.pos_time = _parse_api_time(item.get("gpstime") or item.get("systime"))
-            loc.current_position = str(item.get("address") or "")
+            loc.current_position = await resolve_address_wgs84(
+                db, lat, lng, existing=str(item.get("address") or "")
+            )
             loc.is_online = bool(_as_int(item.get("online")) == 1)
             loc.source = "jt808_openapi"
             result.updated_positions += 1

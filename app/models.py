@@ -342,6 +342,22 @@ class ViolationTypeDict(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
 
+class AlarmFilterRule(Base):
+    """基础数据：主动安全报警入库过滤规则。"""
+
+    __tablename__ = "alarm_filter_rule"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_name = Column(String(64), nullable=False, index=True)
+    alarm_type_name = Column(String(64), nullable=False, index=True)
+    alarm_level = Column(String(8), nullable=True)
+    remark = Column(Text, nullable=True)
+    enabled = Column(Boolean, nullable=False, server_default="1", default=True)
+    created_by = Column(Integer, nullable=True)
+    created_by_name = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
+
+
 class FaultTypeDict(Base):
     """基础数据：故障类型字典，供人工报障等业务选用。"""
 
@@ -381,8 +397,9 @@ class MapApiConfig(Base):
     __tablename__ = "map_api_config"
     id = Column(Integer, primary_key=True, autoincrement=True)
     provider = Column(String(50), nullable=False, unique=True, default="amap")
-    api_key = Column(String(255))
-    secret_key = Column(String(255))
+    api_key = Column(String(255))  # Web 端 / JS API Key（前端画地图）
+    secret_key = Column(String(255))  # JS 安全密钥
+    web_service_key = Column(String(255))  # Web 服务 Key（逆地理/纠偏，常从 808 appkey1 同步）
     default_zoom = Column(Integer, default=12)
     default_center_lng = Column(Float, default=106.55156)
     default_center_lat = Column(Float, default=29.56301)
@@ -478,6 +495,7 @@ class VehicleViolation(Base):
     company_id = Column(Integer, nullable=True, index=True)
     violation_type_code = Column(Integer, nullable=True)
     violation_type_name = Column(String(64), nullable=True)
+    risk_level = Column(String(8), nullable=False, default="low", server_default="low")
     violation_time = Column(DateTime, nullable=False, index=True)
     lat = Column(Float, nullable=True)
     lng = Column(Float, nullable=True)

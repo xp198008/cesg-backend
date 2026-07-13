@@ -4,8 +4,10 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 
+from app.database import AsyncSessionLocal
+
 from app.jt808_openapi_client import jt808_openapi_client
-from app.obd_speed_monitor import obd_speed_scheduler, ping_redis
+from app.obd_speed_monitor import backfill_obd_speed_violation_limits, obd_speed_scheduler, ping_redis
 
 router = APIRouter(tags=["obd-speed-check"])
 
@@ -34,17 +36,28 @@ async def obd_speed_check_run_once():
     return {"ok": True, "result": result.__dict__}
 
 
+@router.post("/api/obd-speed-check/backfill-limits")
+async def obd_speed_check_backfill_limits():
+    """重算已有 OBD 超速记录的限速值，并清零围栏规则遗留的自身限速。"""
+    async with AsyncSessionLocal() as db:
+        try:
+            stats = await backfill_obd_speed_violation_limits(db)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **stats}
+
+
 @router.post("/api/obd-speed-check/start")
 async def obd_speed_check_start():
-    """启动定时调度，并持久化到配置文件（重启后自动恢复运行）。"""
-    obd_speed_scheduler.start(force=True, persist=True)
+    """启动定时调度。"""
+    obd_speed_scheduler.start()
     return {"ok": True, "scheduler": obd_speed_scheduler.status()}
 
 
 @router.post("/api/obd-speed-check/stop")
 async def obd_speed_check_stop():
-    """停止定时调度，并持久化到配置文件（重启后保持停止）。"""
-    await obd_speed_scheduler.stop(persist=True)
+    """停止定时调度（服务重启后会再次自动启动）。"""
+    await obd_speed_scheduler.stop()
     return {"ok": True, "scheduler": obd_speed_scheduler.status()}
 
 
@@ -138,13 +151,14 @@ function renderStatus(data) {
   const s = data.scheduler || {};
   schedRunning = !!s.running;
   renderToggleBtn();
-  $("dotSched").className = "dot " + (s.running ? "ok" : (s.enabled ? "warn" : "bad"));
+  $("dotSched").className = "dot " + (s.running ? "ok" : "bad");
   $("tblSched").innerHTML =
-    row("重启后自动运行", (s.enabled ? '<span class="okc">是</span>' : '否') + `（来源：${esc(s.config_source || ".env")}，页面启停会自动保存）`) +
+    row("运行说明", "服务启动后默认自动运行，重启后也会自动恢复") +
     row("循环运行中", s.running ? '<span class="okc">运行中</span>' : '<span class="err">已停止</span>') +
     row("检测间隔", esc(s.interval_seconds) + " 秒") +
     row("Redis 目标", esc(s.redis)) +
     row("最低处理时速", esc(s.min_speed_kmh) + " km/h") +
+    row("轨迹纠偏", '<span class="okc">已启用（高德 GraspRoad）</span>') +
     row("JT808 定位接口", data.jt808_openapi_configured ? '<span class="okc">已配置</span>' : '<span class="err">未配置（无法取车辆坐标）</span>') +
     row("最近执行时间", esc(s.last_run_at || "从未执行"));
   renderRun(s.last_result, s.last_error);
@@ -167,6 +181,8 @@ function renderRun(r, err) {
     row("无坐标跳过", esc(r.skipped_no_position)) +
     row("无适用规则", esc(r.skipped_no_rule)) +
     row("完成规则判定", esc(r.checked)) +
+    row("轨迹纠偏成功", esc(r.grasp_road_corrected ?? 0)) +
+    row("轨迹纠偏回落", esc(r.grasp_road_fallback ?? 0)) +
     row("新增违章", `<b>${esc(r.violations_inserted)}</b> 条`);
   if (bad) html += row("错误", `<span class="err">${esc(bad)}</span>`);
   if (r.detail && r.detail.length) {

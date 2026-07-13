@@ -5,7 +5,8 @@ from typing import Any
 
 from sqlalchemy import and_, not_, or_
 
-from app.models import VehicleViolation
+from app.alarm_filter import build_alarm_filter_exclusion_clause
+from app.models import AlarmFilterRule, VehicleViolation
 
 _UNKNOWN_VIOLATION_TYPE_MARKERS = (
     "未知报警类型",
@@ -43,12 +44,13 @@ def violation_type_is_known_clause():
     )
 
 
-def violation_list_visibility():
-    """不展示 JT808 同步且未关联 CESG 车辆（vehicle_id 为空）的记录；不展示未知报警类型。"""
+def violation_list_visibility(filter_rules: list[AlarmFilterRule] | None = None):
+    """不展示 JT808 同步且未关联 CESG 车辆（vehicle_id 为空）的记录；不展示未知报警类型；按过滤规则软隐藏。"""
     return and_(
         violation_type_is_known_clause(),
         or_(
             ~VehicleViolation.source.ilike("jt808%"),
             VehicleViolation.vehicle_id.isnot(None),
         ),
+        build_alarm_filter_exclusion_clause(filter_rules),
     )

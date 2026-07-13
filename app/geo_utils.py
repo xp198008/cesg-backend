@@ -49,6 +49,31 @@ def wgs84_to_gcj02(lng: float, lat: float) -> tuple[float, float]:
     return lng + d_lng, lat + d_lat
 
 
+def bearing_deg(lng1: float, lat1: float, lng2: float, lat2: float) -> float:
+    """两点方位角（度，正北为 0，顺时针）。"""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_lambda = math.radians(lng2 - lng1)
+    y = math.sin(d_lambda) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(d_lambda)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+def offset_point_m(lng: float, lat: float, bearing: float, distance_m: float) -> tuple[float, float]:
+    """沿方位角平移指定距离（米），返回新经纬度。"""
+    brng = math.radians(bearing)
+    lat1 = math.radians(lat)
+    lng1 = math.radians(lng)
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(distance_m / _EARTH_R)
+        + math.cos(lat1) * math.sin(distance_m / _EARTH_R) * math.cos(brng)
+    )
+    lng2 = lng1 + math.atan2(
+        math.sin(brng) * math.sin(distance_m / _EARTH_R) * math.cos(lat1),
+        math.cos(distance_m / _EARTH_R) - math.sin(lat1) * math.sin(lat2),
+    )
+    return math.degrees(lng2), math.degrees(lat2)
+
+
 def haversine_m(lng1: float, lat1: float, lng2: float, lat2: float) -> float:
     """两点球面距离（米）。"""
     phi1, phi2 = math.radians(lat1), math.radians(lat2)

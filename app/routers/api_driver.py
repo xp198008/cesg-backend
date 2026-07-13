@@ -11,7 +11,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import Driver, OrgCompany
+from app.models import Driver, Fleet, OrgCompany, Vehicle, VehicleDevice
 
 router = APIRouter(prefix="/api/driver", tags=["driver"])
 
@@ -117,6 +117,125 @@ async def _ensure_company(db: AsyncSession, company_id: int) -> None:
     cid = await db.scalar(select(OrgCompany.id).where(OrgCompany.id == company_id).limit(1))
     if cid is None:
         raise HTTPException(status_code=400, detail="所属公司不存在")
+
+
+def _vehicle_control_item(v: Vehicle, main_dev: VehicleDevice | None, fleet_name: str | None) -> dict:
+    return {
+        "vehicle_id": v.id,
+        "plate_no": v.plate_no,
+        "plate_color": v.plate_color,
+        "vehicle_type": v.vehicle_type,
+        "status": v.status,
+        "fleet_id": v.fleet_id,
+        "fleet_name": fleet_name,
+        "device_no": main_dev.device_no if main_dev else None,
+        "terminal_id": main_dev.device_no if main_dev else None,
+        "device_sn": main_dev.device_sn if main_dev else None,
+        "sim_no": main_dev.sim_no if main_dev else None,
+        "actual_sim": main_dev.actual_sim if main_dev else None,
+        "terminal_type": main_dev.terminal_type if main_dev else None,
+        "channel_count": int(v.channel_count) if v.channel_count is not None else 0,
+    }
+
+
+async def _main_device_map(db: AsyncSession, vehicle_ids: list[int]) -> dict[int, VehicleDevice]:
+    if not vehicle_ids:
+        return {}
+    dr = await db.execute(
+        select(VehicleDevice)
+        .where(VehicleDevice.vehicle_id.in_(vehicle_ids))
+        .order_by(VehicleDevice.is_main.desc(), VehicleDevice.id.asc())
+    )
+    out: dict[int, VehicleDevice] = {}
+    for d in dr.scalars().all():
+        if d.vehicle_id not in out:
+            out[d.vehicle_id] = d
+    return out
+
+
+@router.get("/control-vehicles")
+async def driver_control_vehicles(
+    company_name: str | None = Query(None, description="公司名称，支持模糊匹配"),
+    driver_name: str | None = Query(None, description="司机姓名，支持模糊匹配"),
+    db: AsyncSession = Depends(get_db),
+):
+    """查询司机管控车辆。
+
+    - 传公司名称、司机姓名：返回匹配司机及其绑定车辆（车牌、终端号等）
+    - 参数均为空：返回全公司所有司机及其管控车辆
+    """
+    company_kw = (company_name or "").strip()
+    driver_kw = (driver_name or "").strip()
+
+    conds = []
+    if company_kw:
+        conds.append(OrgCompany.name.ilike(f"%{company_kw}%"))
+    if driver_kw:
+        conds.append(Driver.name.ilike(f"%{driver_kw}%"))
+
+    q = (
+        select(Driver, OrgCompany.name.label("company_name"))
+        .outerjoin(OrgCompany, OrgCompany.id == Driver.company_id)
+        .order_by(OrgCompany.name.asc(), Driver.name.asc(), Driver.id.asc())
+    )
+    if conds:
+        q = q.where(*conds)
+    driver_rows = (await db.execute(q)).all()
+
+    driver_ids = [int(d.id) for d, _ in driver_rows]
+    vehicles_by_driver: dict[int, list[Vehicle]] = {did: [] for did in driver_ids}
+    if driver_ids:
+        vq = select(Vehicle).where(Vehicle.driver_id.in_(driver_ids)).order_by(Vehicle.plate_no.asc())
+        if company_kw:
+            company_ids = {
+                int(d.company_id)
+                for d, _ in driver_rows
+                if d.company_id is not None
+            }
+            if company_ids:
+                vq = vq.where(Vehicle.company_id.in_(company_ids))
+        for v in (await db.execute(vq)).scalars().all():
+            if v.driver_id and int(v.driver_id) in vehicles_by_driver:
+                vehicles_by_driver[int(v.driver_id)].append(v)
+
+    all_vehicle_ids = [v.id for vs in vehicles_by_driver.values() for v in vs]
+    dev_map = await _main_device_map(db, all_vehicle_ids)
+
+    fleet_map: dict[int, str | None] = {}
+    fleet_ids = {v.fleet_id for vs in vehicles_by_driver.values() for v in vs if v.fleet_id}
+    if fleet_ids:
+        for fid, fname in (await db.execute(select(Fleet.id, Fleet.name).where(Fleet.id.in_(fleet_ids)))).all():
+            fleet_map[int(fid)] = fname
+
+    items = []
+    for d, cn in driver_rows:
+        vehicles = vehicles_by_driver.get(int(d.id), [])
+        items.append(
+            {
+                "driver_id": d.id,
+                "driver_name": d.name,
+                "company_id": d.company_id,
+                "company_name": cn or "—",
+                "phone": d.phone,
+                "driver_license_no": d.driver_license_no,
+                "vehicle_count": len(vehicles),
+                "vehicles": [
+                    _vehicle_control_item(v, dev_map.get(v.id), fleet_map.get(v.fleet_id) if v.fleet_id else None)
+                    for v in vehicles
+                ],
+            }
+        )
+
+    return {
+        "ok": True,
+        "total": len(items),
+        "vehicle_total": sum(i["vehicle_count"] for i in items),
+        "items": items,
+        "filters": {
+            "company_name": company_kw or None,
+            "driver_name": driver_kw or None,
+        },
+    }
 
 
 @router.post("/batch-delete")

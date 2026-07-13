@@ -164,6 +164,14 @@ def _ensure_icon_size(content: bytes, suffix: str) -> None:
         raise HTTPException(status_code=400, detail=f"车型图标尺寸必须为 {_ICON_SIZE}×{_ICON_SIZE} 像素")
 
 
+def _fmt_dt(dt) -> str | None:
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _row_out(row: VehicleTypeDict, vehicle_count: int = 0) -> dict:
     return {
         "id": row.id,
@@ -174,8 +182,8 @@ def _row_out(row: VehicleTypeDict, vehicle_count: int = 0) -> dict:
         "site": row.site,
         "sort_order": row.sort_order,
         "vehicle_count": vehicle_count,
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "created_at": _fmt_dt(row.created_at),
+        "updated_at": _fmt_dt(row.updated_at),
     }
 
 

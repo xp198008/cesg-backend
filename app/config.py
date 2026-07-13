@@ -59,7 +59,6 @@ class Settings(BaseSettings):
 
     # ---- OBD 时速违章监测：定时读 Redis OBD 数据，按私有地图规则判定超速 ----
     # 部署在服务器上时 Redis 走本机回环；本地开发可用 SSH 隧道改 host/port。
-    obd_speed_check_enabled: bool = False
     obd_speed_check_interval_seconds: int = 30
     obd_redis_host: str = "127.0.0.1"
     obd_redis_port: int = 6379
