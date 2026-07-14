@@ -580,6 +580,7 @@ async def _load_vehicle(vehicle_id: int) -> dict | None:
         dname = None
         if v.driver_id:
             dname = await s.scalar(select(Driver.name).where(Driver.id == v.driver_id).limit(1))
+        driver_name = (v.driver_name or dname or "").strip() or None
         return {
             "id": v.id,
             "plate_no": v.plate_no,
@@ -606,7 +607,7 @@ async def _load_vehicle(vehicle_id: int) -> dict | None:
             "sim_no": (d.sim_no if d else None),
             "terminal_type": (d.terminal_type if d else None),
             "group_id": gid,
-            "driver_name": dname,
+            "driver_name": driver_name,
             "vehicle_category": v.vehicle_category,
             "vehicle_type": v.vehicle_type,
             "vehicle_type_ii": v.vehicle_type_ii,

@@ -824,6 +824,16 @@ async def vehicle_list(
             if d.vehicle_id not in main_dev_map:
                 main_dev_map[d.vehicle_id] = d
 
+    driver_ids = sorted({int(r.driver_id) for r in rows if r.driver_id})
+    driver_map: dict[int, str] = {}
+    if driver_ids:
+        for did, dname in (
+            await db.execute(select(Driver.id, Driver.name).where(Driver.id.in_(driver_ids)))
+        ).all():
+            name = (dname or "").strip()
+            if name:
+                driver_map[int(did)] = name
+
     osrc = str(online_source or "db").strip().lower()
     use_db_connect = osrc in ("db", "snapshot", "ttx_db", "cache")
     omit_online = osrc in ("omit", "none", "skip", "0", "false")
@@ -839,6 +849,9 @@ async def vehicle_list(
         display_company_name, display_fleet_name = _vehicle_list_company_fleet_names(
             r.company_id, r.fleet_id, company_map, parent_map, fleet_map
         )
+        bound_driver_name = (r.driver_name or "").strip() or (
+            driver_map.get(int(r.driver_id)) if r.driver_id else None
+        )
         items.append(
             {
                 "id": r.id,
@@ -853,6 +866,8 @@ async def vehicle_list(
                 "company_org_code": (r.company_org_code or company_org_map.get(r.company_id) or None),
                 "fleet_id": r.fleet_id,
                 "fleet_name": display_fleet_name,
+                "driver_id": r.driver_id,
+                "driver_name": bound_driver_name,
                 "install_date": str(r.install_date) if r.install_date else None,
                 "service_end_date": str(r.service_end_date) if r.service_end_date else None,
                 "status": r.status,
