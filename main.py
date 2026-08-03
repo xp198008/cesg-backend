@@ -1,5 +1,9 @@
-"""CESG 涓氬姟鍚庣鍏ュ彛锛堢嫭绔?FastAPI 鏈嶅姟锛岄粯璁ょ鍙?8100锛夈€?
-鍙礋璐?涓庤澶囨棤鍏崇殑涓氬姟鍔熻兘"锛氱敤鎴?/ 瑙掕壊 / 鏈烘瀯 / 杞﹁締 / 鍙告満锛?骞跺湪澧炲垹鏀规椂 best-effort 鍚屾鍩虹妗ｆ鍒?808 骞冲彴銆?璁惧 / 瑙嗛 / 瀹炴椂 / 鍘嗗彶鍥炴斁 / 808 鎺у埗鐢?808 骞冲彴璐熻矗锛屾湰鏈嶅姟涓嶆秹鍙娿€?"""
+"""CESG 业务后端入口（独立 FastAPI 服务，默认端口 8100）。
+
+只负责"与设备无关的业务功能"：用户 / 角色 / 机构 / 车辆 / 司机，
+并在增删改时 best-effort 同步基础档案到 808 平台。
+设备 / 视频 / 实时 / 历史回放 / 808 控制由 808 平台负责，本服务不涉及。
+"""
 import asyncio
 import logging
 import sys
@@ -66,7 +70,7 @@ from app.routers import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="CESG 涓氬姟鍚庣", version="1.0.0")
+app = FastAPI(title="CESG 业务后端", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -84,10 +88,10 @@ _vehicle_type_icon_media_dir.mkdir(parents=True, exist_ok=True)
 async def vehicle_type_icon_file(filename: str):
     suffix = Path(filename).suffix.lower()
     if Path(filename).name != filename or suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
-        raise HTTPException(status_code=404, detail="鍥剧墖涓嶅瓨鍦?)
+        raise HTTPException(status_code=404, detail="图片不存在")
     target = _vehicle_type_icon_media_dir / filename
     if not target.exists():
-        raise HTTPException(status_code=404, detail="鍥剧墖涓嶅瓨鍦?)
+        raise HTTPException(status_code=404, detail="图片不存在")
     return FileResponse(target)
 
 
@@ -102,10 +106,10 @@ _violation_snapshot_media_dir.mkdir(parents=True, exist_ok=True)
 async def driver_avatar_file(filename: str):
     suffix = Path(filename).suffix.lower()
     if Path(filename).name != filename or suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
-        raise HTTPException(status_code=404, detail="鍥剧墖涓嶅瓨鍦?)
+        raise HTTPException(status_code=404, detail="图片不存在")
     target = _driver_avatar_media_dir / filename
     if not target.exists():
-        raise HTTPException(status_code=404, detail="鍥剧墖涓嶅瓨鍦?)
+        raise HTTPException(status_code=404, detail="图片不存在")
     return FileResponse(target)
 
 
@@ -160,7 +164,7 @@ app.mount(
 
 
 async def _ensure_default_map_config() -> None:
-    """搴撲腑鏃犲湴鍥鹃厤缃椂琛ヤ竴鏉￠珮寰烽粯璁よ褰曪紝閬垮厤鍦板浘鎺ュ彛绠＄悊椤电┖鐧姐€?""
+    """库中无地图配置时补一条高德默认记录，避免地图接口管理页空白。"""
     from sqlalchemy import select
 
     from app.database import AsyncSessionLocal
@@ -176,14 +180,14 @@ async def _ensure_default_map_config() -> None:
                 default_zoom=12,
                 default_center_lng=106.55156,
                 default_center_lat=29.56301,
-                remark="绯荤粺榛樿",
+                remark="系统默认",
             )
         )
         await s.commit()
 
 
 async def _ensure_default_admin() -> None:
-    """搴撲腑鏃犱换浣曠敤鎴锋椂琛ヤ竴鏉￠粯璁?admin锛堢敤鎴峰悕 admin / 瀵嗙爜 123456锛夈€?""
+    """库中无任何用户时补一条默认 admin（用户名 admin / 密码 123456）。"""
     import bcrypt
     from sqlalchemy import func, select
 
@@ -197,12 +201,12 @@ async def _ensure_default_admin() -> None:
         company = await s.scalar(select(OrgCompany).order_by(OrgCompany.id).limit(1))
         role = await s.scalar(select(SysRole).order_by(SysRole.id).limit(1))
         if not company:
-            company = OrgCompany(name="鐜崼闆嗗洟", short_name="鐜崼闆嗗洟")
+            company = OrgCompany(name="环卫集团", short_name="环卫集团")
             s.add(company)
             await s.flush()
             company.org_code = f"{company.id:04d}"
         if not role:
-            role = SysRole(name="绯荤粺绠＄悊鍛?, code="admin", remark="鍏ㄩ儴妯″潡", is_global=True, permissions="[]")
+            role = SysRole(name="系统管理员", code="admin", remark="全部模块", is_global=True, permissions="[]")
             s.add(role)
             await s.flush()
         s.add(
@@ -210,7 +214,7 @@ async def _ensure_default_admin() -> None:
                 username="admin",
                 password_hash=bcrypt.hashpw(b"123456", bcrypt.gensalt()).decode("utf-8"),
                 password_plain="123456",
-                real_name="绠＄悊鍛?,
+                real_name="管理员",
                 role_id=role.id,
                 org_id=company.id,
                 allow_pwd_edit=True,
@@ -221,7 +225,7 @@ async def _ensure_default_admin() -> None:
 
 
 async def _background_address_backfill() -> None:
-    """鍚姩鍚庤繛缁鎵硅ˉ鍦板潃锛屽敖蹇竻绌哄巻鍙茬┖鍦板潃銆?""
+    """启动后连续多批补地址，尽快清空历史空地址。"""
     await asyncio.sleep(5)
     from app.database import AsyncSessionLocal
     from app.violation_address_backfill import (
@@ -236,12 +240,12 @@ async def _background_address_backfill() -> None:
                 l = await backfill_vehicle_location_addresses(s, limit=20)
                 await s.commit()
             if v == 0 and l == 0:
-                logger.info("鎶ヨ鍦板潃鍚姩鍥炲～宸插畬鎴愶紙绗?%s 杞棤寰呰ˉ璁板綍锛?, round_no)
+                logger.info("报警地址启动回填已完成（第 %s 轮无待补记录）", round_no)
                 break
-            logger.info("鎶ヨ鍦板潃鍚姩鍥炲～绗?%s 杞細杩濈珷 %s 鏉★紝浣嶇疆 %s 鏉?, round_no, v, l)
+            logger.info("报警地址启动回填第 %s 轮：违章 %s 条，位置 %s 条", round_no, v, l)
             await asyncio.sleep(0.5)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("鎶ヨ鍦板潃鍚姩鍥炲～澶辫触: %s", exc)
+        logger.warning("报警地址启动回填失败: %s", exc)
 
 
 @app.on_event("startup")
@@ -253,20 +257,21 @@ async def _startup() -> None:
     async with AsyncSessionLocal() as s:
         filled = await backfill_login_log_org_names(s)
         if filled:
-            logger.info("宸茶ˉ鍏?%s 鏉＄櫥褰曟槑缁嗙殑鎵€灞炲叕鍙?, filled)
+            logger.info("已补全 %s 条登录明细的所属公司", filled)
         rebuilt = await rebuild_daily_from_login_logs(s)
         from app.violation_risk_backfill import backfill_violation_risk_levels
 
         risk_updated = await backfill_violation_risk_levels(s)
         await s.commit()
         if rebuilt:
-            logger.info("宸查噸寤?%s 鏉＄櫥褰曚細璇濈殑鐢ㄦ埛鎸夋棩鍦ㄧ嚎璁板綍", rebuilt)
+            logger.info("已重建 %s 条登录会话的用户按日在线记录", rebuilt)
     asyncio.create_task(_background_address_backfill())
-    # 涓嶅啀鍚姩鏃跺垹闄ゃ€屾棤鍥剧墖/瑙嗛璇佹嵁銆嶇殑 JT808 鎶ヨ锛氳瘉鎹父鏅氫簬鎶ヨ鍒拌揪锛屽垹鎺変細瀵艰嚧
-    # 瀹夊叏鐩戞帶/瀹夊叏绠＄悊鍙墿 OBD 绛夋棤闇€璇佹嵁鐨勬潵婧愩€備繚鐣欐棤杞﹁締鍏宠仈涓庢湭鐭ョ被鍨嬫竻鐞嗐€?    await cleanup_jt808_violations_without_vehicle()
+    # 不再启动时删除「无图片/视频证据」的 JT808 报警：证据常晚于报警到达，删掉会导致
+    # 安全监控/安全管理只剩 OBD 等无需证据的来源。保留无车辆关联与未知类型清理。
+    await cleanup_jt808_violations_without_vehicle()
     deleted_unknown = await cleanup_jt808_violations_unknown_type()
     if deleted_unknown:
-        logger.info("鍚姩鏃跺凡娓呯悊鏈煡鎶ヨ绫诲瀷璁板綍 %s 鏉?, deleted_unknown)
+        logger.info("启动时已清理未知报警类型记录 %s 条", deleted_unknown)
     await _ensure_default_map_config()
     await _ensure_default_admin()
     try:
@@ -277,11 +282,11 @@ async def _startup() -> None:
             key = await sync_web_service_key_from_jt808(s, force_refresh=False)
             await s.commit()
             if key:
-                logger.info("Web 鏈嶅姟 Key锛氬凡纭繚 map_api_config.web_service_key 鍙敤锛堟潵婧?808/搴擄級")
+                logger.info("Web 服务 Key：已确保 map_api_config.web_service_key 可用（来源 808/库）")
             else:
-                logger.info("Web 鏈嶅姟 Key锛氬簱涓虹┖涓?808 appkey1 鏈悓姝ュ埌锛岀籂鍋?閫嗗湴鐞嗗皢鍦ㄨ皟鐢ㄦ椂鍐嶅皾璇?)
+                logger.info("Web 服务 Key：库为空且 808 appkey1 未同步到，纠偏/逆地理将在调用时再尝试")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("鍚姩鍚屾 Web 鏈嶅姟 Key 澶辫触: %s", exc)
+        logger.warning("启动同步 Web 服务 Key 失败: %s", exc)
     from app.permission_bootstrap import ensure_alarm_filter_rule_permission
 
     await ensure_alarm_filter_rule_permission()
@@ -293,7 +298,7 @@ async def _startup() -> None:
 
         address_backfill_scheduler.start()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("鍦板潃瀹氭椂鍥炲～鏈惎鐢? %s", exc)
+        logger.warning("地址定时回填未启用: %s", exc)
     redis_queue_scheduler.start()
     try:
         from app.amap_web_service_key import get_stored_web_service_key
@@ -304,17 +309,17 @@ async def _startup() -> None:
             stored = await get_stored_web_service_key(s)
         jt808_key = await asyncio.to_thread(get_jt808_regeo_amap_key)
         if stored:
-            logger.info("閫嗗湴鐞?绾犲亸 Key锛氫娇鐢?CESG 搴?web_service_key")
+            logger.info("逆地理/纠偏 Key：使用 CESG 库 web_service_key")
         elif jt808_key:
             logger.info(
-                "閫嗗湴鐞?绾犲亸 Key锛氬簱涓虹┖锛?08 appkey1 鍙敤锛坱ype1=%s锛?,
+                "逆地理/纠偏 Key：库为空，808 appkey1 可用（type1=%s）",
                 await asyncio.to_thread(get_jt808_config, "lingx.jt808.type1", "gaode"),
             )
         else:
-            logger.info("閫嗗湴鐞?绾犲亸 Key锛氬簱涓?808 appkey1 鍧囨湭灏辩华")
+            logger.info("逆地理/纠偏 Key：库与 808 appkey1 均未就绪")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("璇诲彇閫嗗湴鐞?绾犲亸 Key 鐘舵€佸け璐? %s", exc)
-    logger.info("CESG 涓氬姟鍚庣宸插氨缁細http://127.0.0.1:%s", settings.app_port)
+        logger.warning("读取逆地理/纠偏 Key 状态失败: %s", exc)
+    logger.info("CESG 业务后端已就绪：http://127.0.0.1:%s", settings.app_port)
 
 
 @app.on_event("shutdown")
@@ -337,7 +342,7 @@ def favicon():
 
 @app.get("/")
 async def root():
-    return {"service": "CESG 涓氬姟鍚庣", "ok": True}
+    return {"service": "CESG 业务后端", "ok": True}
 
 
 if __name__ == "__main__":
