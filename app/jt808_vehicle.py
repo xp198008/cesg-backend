@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -63,11 +64,20 @@ async def _post(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _login() -> str:
-    enc = _encode_password(settings.jt808_admin_password, settings.jt808_admin_account)
-    r = await _post({"apicode": 8003, "account": settings.jt808_admin_account, "password": enc})
+    from app.jt808_openapi_credentials import load_service_password_plain, service_openapi_username
+
+    account = service_openapi_username()
+    password = await load_service_password_plain()
+    enc = _encode_password(password, account)
+    r = await _post({"apicode": 8003, "account": account, "password": enc})
     if r.get("code") != 1 or not r.get("token"):
         raise RuntimeError(f"JT808 登录失败: {r.get('message') or r}")
     return r["token"]
+
+
+def invalidate_token() -> None:
+    global _token
+    _token = None
 
 
 async def _ensure_token(force: bool = False) -> str:
@@ -135,6 +145,39 @@ def _channel_num_from_data(data: dict) -> int:
     return _channel_num(n)
 
 
+# 体积/容量类字段：同步 808 时去掉末尾单位（如 100L → 100）
+_UNIT_STRIP_KEYS = frozenset(
+    {
+        "fuel_tank_capacity",
+        "fuel_tank",
+        "urea_info",
+        "engine_displacement",
+        "battery_capacity",
+        "vehicle_payload",
+        "loaded_weight",
+        "curb_weight",
+    }
+)
+_TRAILING_UNIT_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)\s*[A-Za-z%]+\s*$")
+_LEADING_NUMBER_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
+
+
+def _strip_trailing_unit(raw: Any) -> Any:
+    """去掉数值后的单位后缀（L/kg/% 等），非「数字+单位」原样返回。"""
+    if raw is None or isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float, Decimal)):
+        return raw
+    text = str(raw).strip()
+    if not text:
+        return text
+    m = _TRAILING_UNIT_RE.match(text)
+    if not m:
+        return text
+    num = m.group(1)
+    return int(num) if re.fullmatch(r"[+-]?\d+", num) else float(num)
+
+
 def _json_val(v: Any) -> Any:
     if v is None:
         return None
@@ -148,11 +191,24 @@ def _json_val(v: Any) -> Any:
 
 
 def _oil_box(data: dict) -> int:
-    raw = (data.get("fuel_tank_capacity") or "").strip()
-    if not raw:
+    """本地 fuel_tank_capacity（常为 100L）→ 1251 oilBox 整数升。"""
+    raw = data.get("fuel_tank_capacity")
+    cleaned = _strip_trailing_unit(raw)
+    if cleaned is None or cleaned == "":
+        return 0
+    if isinstance(cleaned, (int, float, Decimal)):
+        try:
+            return int(float(cleaned))
+        except (TypeError, ValueError):
+            return 0
+    text = str(cleaned).strip()
+    if not text:
+        return 0
+    m = _LEADING_NUMBER_RE.search(text)
+    if not m:
         return 0
     try:
-        return int(float(raw))
+        return int(float(m.group(0)))
     except (TypeError, ValueError):
         return 0
 
@@ -212,6 +268,12 @@ def _build_ext_json(data: dict) -> str:
         "vehicle_payload",
         "curb_weight",
         "urea_info",
+        "coolant_temp_high_threshold",
+        "fuel_level_low_threshold",
+        "reagent_level_low_threshold",
+        "dpf_pressure_high_threshold",
+        "scr_downstream_abnormal_threshold",
+        "nox_abnormal_threshold",
         "plate_color",
         "vehicle_category",
         "vehicle_type",
@@ -223,6 +285,9 @@ def _build_ext_json(data: dict) -> str:
         "manufacturer",
         "engine_displacement",
         "fuel_tank_capacity",
+        "fuel_tank",
+        "rapid_acceleration",
+        "rapid_deceleration",
         "battery_capacity",
         "range_mileage",
         "battery_no",
@@ -248,6 +313,10 @@ def _build_ext_json(data: dict) -> str:
         val = _json_val(data.get(key))
         if val is None or val == "":
             continue
+        if key in _UNIT_STRIP_KEYS:
+            val = _strip_trailing_unit(val)
+            if val is None or val == "":
+                continue
         ext[key] = val
     for date_key in ("install_date", "service_start_date", "service_end_date", "scrap_date", "inspect_date"):
         val = data.get(date_key)
@@ -597,6 +666,12 @@ async def _load_vehicle(vehicle_id: int) -> dict | None:
             "vehicle_payload": v.vehicle_payload,
             "curb_weight": v.curb_weight,
             "urea_info": v.urea_info,
+            "coolant_temp_high_threshold": v.coolant_temp_high_threshold,
+            "fuel_level_low_threshold": v.fuel_level_low_threshold,
+            "reagent_level_low_threshold": v.reagent_level_low_threshold,
+            "dpf_pressure_high_threshold": v.dpf_pressure_high_threshold,
+            "scr_downstream_abnormal_threshold": v.scr_downstream_abnormal_threshold,
+            "nox_abnormal_threshold": v.nox_abnormal_threshold,
             "channel_count": v.channel_count,
             "channels": (d.channels if d and d.channels else []),
             "contact_name": v.contact_name,
@@ -618,6 +693,9 @@ async def _load_vehicle(vehicle_id: int) -> dict | None:
             "manufacturer": v.manufacturer,
             "engine_displacement": v.engine_displacement,
             "fuel_tank_capacity": v.fuel_tank_capacity,
+            "fuel_tank": v.fuel_tank,
+            "rapid_acceleration": v.rapid_acceleration,
+            "rapid_deceleration": v.rapid_deceleration,
             "battery_capacity": v.battery_capacity,
             "range_mileage": v.range_mileage,
             "battery_no": v.battery_no,

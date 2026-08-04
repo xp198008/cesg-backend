@@ -11,10 +11,9 @@ from typing import Any
 
 import httpx
 from fastapi import Request
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import MapApiConfig
+from app.amap_web_service_key import ensure_web_service_key, refresh_web_service_key_after_failure
 
 _logger = logging.getLogger(__name__)
 
@@ -74,6 +73,21 @@ def _short_city_name(city: str) -> str:
     return s or _DEFAULT_CITY
 
 
+def humidity_label_zh(humidity: str | int | float | None) -> str:
+    """将湿度百分比映射为设计稿文案。"""
+    if humidity is None or humidity == "":
+        return ""
+    try:
+        n = float(str(humidity).strip().replace("%", ""))
+    except (TypeError, ValueError):
+        return ""
+    if n >= 70:
+        return "湿度较高"
+    if n <= 40:
+        return "湿度较低"
+    return "湿度适中"
+
+
 def weather_icon_char(weather: str) -> str:
     w = (weather or "").strip()
     if not w:
@@ -128,9 +142,24 @@ def _wmo_to_zh(code: int) -> str:
     return mapping.get(code, "多云")
 
 
-async def _amap_key(db: AsyncSession) -> str:
-    row = await db.scalar(select(MapApiConfig).where(MapApiConfig.provider == "amap").limit(1))
-    return (row.api_key if row else "") or ""
+async def _amap_web_key(db: AsyncSession) -> str:
+    """顶栏天气必须用 Web 服务 Key；勿用地图 JS Key（会 USERKEY_PLAT_NOMATCH）。"""
+    key, _source = await ensure_web_service_key(db)
+    return (key or "").strip()
+
+
+def _amap_key_unusable(info: str) -> bool:
+    s = (info or "").upper()
+    return any(
+        x in s
+        for x in (
+            "INVALID_USER_KEY",
+            "USERKEY_PLAT_NOMATCH",
+            "DAILY_QUERY_OVER_LIMIT",
+            "USER_KEY_RECYCLED",
+            "INVALID_USER_SCODE",
+        )
+    )
 
 
 async def _discover_egress_public_ip(client: httpx.AsyncClient) -> str:
@@ -162,58 +191,59 @@ def resolve_lookup_ip(request: Request, client_ip_hint: str | None, egress_ip: s
     return req_ip or ""
 
 
-async def _fetch_amap_weather_by_ip(db: AsyncSession, ip: str) -> dict[str, Any]:
-    key = (await _amap_key(db)).strip()
-    if not key:
-        return {"error": "未配置高德 Web 服务 Key"}
-
+async def _amap_ip_and_weather(client: httpx.AsyncClient, key: str, ip_param: str) -> dict[str, Any]:
     adcode = _DEFAULT_ADCODE
     city = _DEFAULT_CITY
     province = ""
-    ip_param = ip if _is_public_ip(ip) else ""
+    ip_data: dict[str, Any] = {}
+    try:
+        ip_params: dict[str, str] = {"key": key, "output": "JSON"}
+        if ip_param:
+            ip_params["ip"] = ip_param
+        res = await client.get("https://restapi.amap.com/v3/ip", params=ip_params)
+        res.raise_for_status()
+        ip_data = res.json()
+    except Exception as e:
+        _logger.warning("amap ip 失败: %s", e)
 
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-        ip_data: dict[str, Any] = {}
-        try:
-            ip_params: dict[str, str] = {"key": key, "output": "JSON"}
-            if ip_param:
-                ip_params["ip"] = ip_param
-            res = await client.get("https://restapi.amap.com/v3/ip", params=ip_params)
-            res.raise_for_status()
-            ip_data = res.json()
-        except Exception as e:
-            _logger.warning("amap ip 失败: %s", e)
+    ip_info = str(ip_data.get("info") or "")
+    if str(ip_data.get("status") or "") == "1":
+        adcode = str(ip_data.get("adcode") or "").strip() or adcode
+        city = str(ip_data.get("city") or ip_data.get("province") or city).strip() or city
+        province = str(ip_data.get("province") or "").strip()
+    elif _amap_key_unusable(ip_info):
+        return {"error": ip_info or "高德 Key 不可用", "key_bad": True}
 
-        if str(ip_data.get("status") or "") == "1":
-            adcode = str(ip_data.get("adcode") or "").strip() or adcode
-            city = str(ip_data.get("city") or ip_data.get("province") or city).strip() or city
-            province = str(ip_data.get("province") or "").strip()
+    if not adcode:
+        adcode = _DEFAULT_ADCODE
 
-        if not adcode:
-            adcode = _DEFAULT_ADCODE
+    try:
+        res = await client.get(
+            "https://restapi.amap.com/v3/weather/weatherInfo",
+            params={
+                "key": key,
+                "city": adcode,
+                "extensions": "base",
+                "output": "JSON",
+            },
+        )
+        res.raise_for_status()
+        w_data = res.json()
+    except Exception as e:
+        _logger.warning("amap weather 失败: %s", e)
+        return {"error": f"天气查询失败：{e}"}
 
-        try:
-            res = await client.get(
-                "https://restapi.amap.com/v3/weather/weatherInfo",
-                params={
-                    "key": key,
-                    "city": adcode,
-                    "extensions": "base",
-                    "output": "JSON",
-                },
-            )
-            res.raise_for_status()
-            w_data = res.json()
-        except Exception as e:
-            _logger.warning("amap weather 失败: %s", e)
-            return {"error": f"天气查询失败：{e}"}
-
+    w_info = str(w_data.get("info") or "")
     if str(w_data.get("status") or "") != "1":
-        return {"error": str(w_data.get("info") or "天气接口异常")}
+        return {
+            "error": w_info or "天气接口异常",
+            "key_bad": _amap_key_unusable(w_info),
+        }
 
     live = (w_data.get("lives") or [{}])[0]
     weather = str(live.get("weather") or "").strip()
     temp = str(live.get("temperature") or "").strip()
+    humidity = str(live.get("humidity") or "").strip()
     live_city = str(live.get("city") or city).strip() or city
     reporttime = str(live.get("reporttime") or "").strip()
     icon = weather_icon_char(weather)
@@ -221,6 +251,8 @@ async def _fetch_amap_weather_by_ip(db: AsyncSession, ip: str) -> dict[str, Any]
     return {
         "weather": weather,
         "temperature": temp,
+        "humidity": humidity,
+        "humidity_label": humidity_label_zh(humidity),
         "city": _short_city_name(live_city),
         "province": province or str(live.get("province") or "").strip(),
         "adcode": adcode,
@@ -228,8 +260,28 @@ async def _fetch_amap_weather_by_ip(db: AsyncSession, ip: str) -> dict[str, Any]
         "display": display,
         "report_time": reporttime,
         "source": "amap",
-        "client_ip": ip_param or ip or "local",
+        "client_ip": ip_param or "local",
     }
+
+
+async def _fetch_amap_weather_by_ip(db: AsyncSession, ip: str) -> dict[str, Any]:
+    key = await _amap_web_key(db)
+    if not key:
+        return {"error": "未配置高德 Web 服务 Key（请在地图接口管理配置或从 808 同步）"}
+
+    ip_param = ip if _is_public_ip(ip) else ""
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        result = await _amap_ip_and_weather(client, key, ip_param)
+        if result.get("key_bad"):
+            refreshed = (await refresh_web_service_key_after_failure(db) or "").strip()
+            if refreshed and refreshed != key:
+                result = await _amap_ip_and_weather(client, refreshed, ip_param)
+        result.pop("key_bad", None)
+        if result.get("error"):
+            return result
+        if not result.get("client_ip"):
+            result["client_ip"] = ip_param or ip or "local"
+        return result
 
 
 async def _fetch_open_meteo_fallback(ip: str) -> dict[str, Any] | None:
@@ -259,7 +311,7 @@ async def _fetch_open_meteo_fallback(ip: str) -> dict[str, Any] | None:
                 params={
                     "latitude": str(lat),
                     "longitude": str(lon),
-                    "current": "temperature_2m,weather_code",
+                    "current": "temperature_2m,weather_code,relative_humidity_2m",
                     "timezone": "Asia/Shanghai",
                 },
             )
@@ -277,12 +329,21 @@ async def _fetch_open_meteo_fallback(ip: str) -> dict[str, Any] | None:
             temp = str(int(round(float(temp))))
         except ValueError:
             pass
+    humidity = ""
+    rh = cur.get("relative_humidity_2m")
+    if rh is not None and rh != "":
+        try:
+            humidity = str(int(round(float(rh))))
+        except (TypeError, ValueError):
+            humidity = str(rh).strip()
     weather = _wmo_to_zh(code)
     icon = weather_icon_char(weather)
     display = _build_display(weather, temp, city)
     return {
         "weather": weather,
         "temperature": temp,
+        "humidity": humidity,
+        "humidity_label": humidity_label_zh(humidity),
         "city": _short_city_name(city),
         "icon": icon,
         "display": display,
@@ -306,7 +367,7 @@ async def _fetch_weather_by_coords(lat: float, lon: float, city_hint: str = "") 
                 params={
                     "latitude": str(flat),
                     "longitude": str(flon),
-                    "current": "temperature_2m,weather_code",
+                    "current": "temperature_2m,weather_code,relative_humidity_2m",
                     "timezone": "Asia/Shanghai",
                 },
             )
@@ -324,6 +385,13 @@ async def _fetch_weather_by_coords(lat: float, lon: float, city_hint: str = "") 
             temp = str(int(round(float(temp))))
         except ValueError:
             pass
+    humidity = ""
+    rh = cur.get("relative_humidity_2m")
+    if rh is not None and rh != "":
+        try:
+            humidity = str(int(round(float(rh))))
+        except (TypeError, ValueError):
+            humidity = str(rh).strip()
     weather = _wmo_to_zh(code)
     if not city:
         city = _DEFAULT_CITY
@@ -332,6 +400,8 @@ async def _fetch_weather_by_coords(lat: float, lon: float, city_hint: str = "") 
     return {
         "weather": weather,
         "temperature": temp,
+        "humidity": humidity,
+        "humidity_label": humidity_label_zh(humidity),
         "city": _short_city_name(city),
         "icon": icon,
         "display": display,
@@ -390,5 +460,8 @@ async def get_header_weather_for_request(
     result["located_by"] = "public_ip" if _is_public_ip(lookup_ip) else "fallback"
     result["client_ip"] = lookup_ip or result.get("client_ip") or "local"
     result["cached"] = False
-    _cache_set(cache_key, result)
+    # 失败占位不要缓存，避免高德/兜底短暂不可用后 15 分钟内一直「—」
+    weather_ok = str(result.get("weather") or "").strip() not in ("", "—", "-")
+    if weather_ok and not result.get("error"):
+        _cache_set(cache_key, result)
     return result

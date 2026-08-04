@@ -35,10 +35,11 @@ from app.jt808_alarm_sync import (
     jt808_alarm_scheduler,
 )
 from app.obd_speed_monitor import obd_speed_scheduler
+from app.park_alarm_scheduler import park_alarm_scheduler
 from app.redis_queue_consumer import redis_queue_scheduler
+from app.violation_ai_assessment_scheduler import violation_ai_assessment_scheduler
 from app.routers import (
     api_ai,
-    api_alarm_filter_rule,
     api_alarm_type,
     api_dashboard,
     api_device_fault,
@@ -50,18 +51,24 @@ from app.routers import (
     api_map_grasp,
     api_map_rules,
     api_media,
+    api_obd_fuel,
     api_obd_speed,
+    api_park_alarm_report,
     api_org,
     api_permission_menu,
     api_repair,
     api_risk_profile,
     api_role,
+    api_route_plan,
     api_shortcut,
     api_user,
     api_vehicle,
     api_vehicle_alloc,
     api_vehicle_type,
+    api_vehicle_violation,
+    api_video_preview,
     api_violation,
+    api_violation_ai_assess,
     api_violation_ticket,
     api_violation_type,
     api_weather,
@@ -120,27 +127,32 @@ app.include_router(api_vehicle.router)
 app.include_router(api_vehicle_type.router)
 app.include_router(api_driver.router)
 app.include_router(api_alarm_type.router)
-app.include_router(api_alarm_filter_rule.router)
 app.include_router(api_fault_type.router)
 app.include_router(api_jt808_alarm_sync.router)
 app.include_router(api_map_rules.router)
 app.include_router(api_map_grasp.router)
+app.include_router(api_obd_fuel.router)
 app.include_router(api_obd_speed.router)
+app.include_router(api_park_alarm_report.router)
+app.include_router(api_violation_ai_assess.router)
 app.include_router(api_permission_menu.router)
 app.include_router(api_vehicle_alloc.router)
 app.include_router(api_violation.router)
+app.include_router(api_vehicle_violation.router)
 app.include_router(api_media.router)
 app.include_router(api_violation_ticket.router)
 app.include_router(api_violation_type.router)
 app.include_router(api_manual_fault.router)
 app.include_router(api_device_fault.router)
 app.include_router(api_repair.router)
+app.include_router(api_route_plan.router)
 app.include_router(api_shortcut.router)
 app.include_router(api_knowledge.router)
 app.include_router(api_dashboard.router)
 app.include_router(api_weather.router)
 app.include_router(api_ai.router)
 app.include_router(api_risk_profile.router)
+app.include_router(api_video_preview.router)
 
 _ticket_appeal_media_dir = Path(__file__).resolve().parent / "data" / "ticket_appeal_attachments"
 _ticket_appeal_media_dir.mkdir(parents=True, exist_ok=True)
@@ -262,9 +274,21 @@ async def _startup() -> None:
         from app.violation_risk_backfill import backfill_violation_risk_levels
 
         risk_updated = await backfill_violation_risk_levels(s)
+        from app.jt808_violation_sync import backfill_violation_company_names
+
+        company_name_stats = await backfill_violation_company_names(s)
         await s.commit()
         if rebuilt:
             logger.info("已重建 %s 条登录会话的用户按日在线记录", rebuilt)
+        remote_stats = company_name_stats.get("remote") or {}
+        logger.info(
+            "启动回填安全报警公司名称完成：本地补写=%s，808补齐=%s，808空值 %s→%s，错误=%s",
+            company_name_stats.get("local_updated"),
+            remote_stats.get("updated_rows"),
+            remote_stats.get("empty_before"),
+            remote_stats.get("empty_after"),
+            remote_stats.get("error"),
+        )
     asyncio.create_task(_background_address_backfill())
     # 不再启动时删除「无图片/视频证据」的 JT808 报警：证据常晚于报警到达，删掉会导致
     # 安全监控/安全管理只剩 OBD 等无需证据的来源。保留无车辆关联与未知类型清理。
@@ -279,7 +303,10 @@ async def _startup() -> None:
         from app.database import AsyncSessionLocal
 
         async with AsyncSessionLocal() as s:
-            key = await sync_web_service_key_from_jt808(s, force_refresh=False)
+            # 仅库为空时从 808 补全，不覆盖地图接口管理页已保存的 Key
+            key = await sync_web_service_key_from_jt808(
+                s, force_refresh=False, only_if_empty=True,
+            )
             await s.commit()
             if key:
                 logger.info("Web 服务 Key：已确保 map_api_config.web_service_key 可用（来源 808/库）")
@@ -287,12 +314,13 @@ async def _startup() -> None:
                 logger.info("Web 服务 Key：库为空且 808 appkey1 未同步到，纠偏/逆地理将在调用时再尝试")
     except Exception as exc:  # noqa: BLE001
         logger.warning("启动同步 Web 服务 Key 失败: %s", exc)
-    from app.permission_bootstrap import ensure_alarm_filter_rule_permission
-
-    await ensure_alarm_filter_rule_permission()
     await api_vehicle_type.ensure_default_vehicle_types()
     jt808_alarm_scheduler.start()
     obd_speed_scheduler.start()
+    try:
+        violation_ai_assessment_scheduler.start()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("安全报警自动 AI 评估未启用: %s", exc)
     try:
         from app.address_backfill_scheduler import address_backfill_scheduler
 
@@ -300,6 +328,10 @@ async def _startup() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("地址定时回填未启用: %s", exc)
     redis_queue_scheduler.start()
+    try:
+        park_alarm_scheduler.start()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("停车超限报警调度未启用: %s", exc)
     try:
         from app.amap_web_service_key import get_stored_web_service_key
         from app.database import AsyncSessionLocal
@@ -327,12 +359,20 @@ async def _shutdown() -> None:
     await jt808_alarm_scheduler.stop()
     await obd_speed_scheduler.stop()
     try:
+        await violation_ai_assessment_scheduler.stop()
+    except Exception:
+        pass
+    try:
         from app.address_backfill_scheduler import address_backfill_scheduler
 
         await address_backfill_scheduler.stop()
     except Exception:
         pass
     await redis_queue_scheduler.stop()
+    try:
+        await park_alarm_scheduler.stop()
+    except Exception:
+        pass
 
 
 @app.get("/favicon.ico")

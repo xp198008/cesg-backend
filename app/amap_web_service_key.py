@@ -56,13 +56,19 @@ async def sync_web_service_key_from_jt808(
     db: AsyncSession,
     *,
     force_refresh: bool = True,
+    only_if_empty: bool = False,
 ) -> str:
-    """从 808 读取 appkey1；有值则写入 CESG 库并返回。"""
+    """从 808 读取 appkey1；有值则写入 CESG 库并返回。
+
+    only_if_empty=True 时：库内已有手工配置则不覆盖（启动补全用）。
+    """
+    stored = await get_stored_web_service_key(db)
+    if only_if_empty and stored:
+        return stored
     key = await fetch_jt808_web_service_key(force_refresh=force_refresh)
     if not key:
         _logger.info("808 appkey1 未配置或 type1 非 gaode，无法同步 Web 服务 Key")
-        return ""
-    stored = await get_stored_web_service_key(db)
+        return stored
     if key != stored:
         await save_web_service_key(db, key)
         _logger.info("已从 808 同步 Web 服务 Key 到 map_api_config")

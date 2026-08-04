@@ -18,13 +18,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import AsyncSessionLocal
-from app.alarm_filter import find_matching_rule, log_filtered_alarm
+from app.alarm_type_gate import evaluate_alarm_type_ingest, log_alarm_type_gate
 from app.jt808_openapi_client import Jt808OpenApiError, jt808_openapi_client
+from app.jt808_openapi_credentials import service_openapi_username
+from app.jt808_violation_sync import lookup_company_name, notify_violation_created
 from app.models import Jt808AlarmSyncState, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTicket
 from app.plate_util import norm_plate
 from app.amap_regeo import resolve_address_wgs84
-from app.violation_alert_cache import push_violation_alert, violation_alert_payload
-from app.violation_risk import derive_risk_level
 from app.violation_filters import is_unknown_violation_type_name
 
 logger = logging.getLogger(__name__)
@@ -64,7 +64,7 @@ _DSM_ALARM_NAMES = {
     22: "喝水报警",
 }
 
-# BSD 盲区监测（808 字典 BSD_BJLX）
+# BSD 盲区监测（808 字典 BSD_BJLX）——不分级
 _BSD_ALARM_NAMES = {
     1: "后方接近报警",
     2: "左侧后方接近报警",
@@ -77,6 +77,65 @@ _BSD_ALARM_NAMES = {
     99: "右侧后方提示事件",
 }
 
+_BSD_TYPE_NAMES = frozenset(_BSD_ALARM_NAMES.values())
+_LEVEL_SUFFIX = {1: "一级", 2: "二级", 3: "三级"}
+_LEVEL_STRIP_RE = re.compile(r"(一级|二级|三级|1级|2级|3级)$")
+_ALARM_LEVEL_LABELS = ("一级", "二级", "三级")
+
+
+def _strip_alarm_level_suffix(name: str) -> str:
+    return _LEVEL_STRIP_RE.sub("", (name or "").strip()).strip()
+
+
+def _is_bsd_type_name(name: str) -> bool:
+    base = _strip_alarm_level_suffix(name)
+    return base in _BSD_TYPE_NAMES
+
+
+def _type_supports_levels(base_name: str) -> bool:
+    """ADAS/DSM 的「报警」分一/二/三级；BSD 与「事件/预警」不分级（与 808 弹窗配置一致）。"""
+    base = _strip_alarm_level_suffix(base_name)
+    if not base:
+        return False
+    if base in _BSD_TYPE_NAMES:
+        return False
+    if base.endswith("事件") or base.endswith("预警"):
+        return False
+    return base.endswith("报警")
+
+
+def jt808_alarm_type_base_catalog() -> list[str]:
+    """808 主动安全报警基础类型名（ADAS/DSM/BSD 去重，不含级别后缀）。"""
+    seen: set[str] = set()
+    names: list[str] = []
+    for mapping in (_ADAS_ALARM_NAMES, _DSM_ALARM_NAMES, _BSD_ALARM_NAMES):
+        for name in mapping.values():
+            text = str(name or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            names.append(text)
+    return names
+
+
+def jt808_alarm_type_catalog() -> list[str]:
+    """
+    报警类型字典灌库目录（按 808 真实规则）：
+    - ADAS/DSM 报警：每种拆成一级/二级/三级
+    - BSD、事件、预警：只保留基础名，不带级别后缀
+    - OBD 超速：单独一条（不分级），供超速监测入库闸门使用
+    """
+    names: list[str] = []
+    for base in jt808_alarm_type_base_catalog():
+        if _type_supports_levels(base):
+            for suffix in _ALARM_LEVEL_LABELS:
+                names.append(f"{base}{suffix}")
+        else:
+            names.append(base)
+    if "OBD超速" not in names:
+        names.append("OBD超速")
+    return names
+
 
 @dataclass
 class SyncResult:
@@ -86,7 +145,8 @@ class SyncResult:
     skipped_no_evidence: int = 0
     skipped_no_vehicle: int = 0
     skipped_unknown_type: int = 0
-    skipped_filtered: int = 0
+    skipped_filtered: int = 0  # 停用或不在报警类型字典
+    skipped_interval: int = 0  # 最小间隔内同车同类型
     updated_positions: int = 0
     error: str | None = None
 
@@ -151,19 +211,12 @@ def _external_alarm_id(source: str, item: dict[str, Any]) -> str:
     return f"jt808:{source}:{digest}"
 
 
-_LEVEL_SUFFIX = {1: "一级", 2: "二级"}
-
-
-def _alarm_type_name(source: str, item: dict[str, Any]) -> str:
+def _resolve_base_alarm_name(source: str, item: dict[str, Any]) -> str:
     direct = str(item.get("name") or "").strip()
-    if direct:
-        level = _as_int(item.get("bjjb"))
-        if level in _LEVEL_SUFFIX and direct.endswith("报警"):
-            return f"{direct}{_LEVEL_SUFFIX[level]}"
-        return direct
     code = _as_int(item.get("bjlx") if item.get("bjlx") is not None else item.get("bjid"))
+    if direct:
+        return _strip_alarm_level_suffix(direct) or direct
     if source == _SOURCE_ADAS:
-        # 1208 合并返回 ADAS/DSM/BSD 类型码：依次尝试各字典。
         base = (
             _ADAS_ALARM_NAMES.get(code or -1)
             or _DSM_ALARM_NAMES.get(code or -1)
@@ -171,13 +224,21 @@ def _alarm_type_name(source: str, item: dict[str, Any]) -> str:
         )
     else:
         base = _DSM_ALARM_NAMES.get(code or -1)
-    if not base:
-        prefix = "主动安全报警"
-        base = f"{prefix}{code}" if code is not None else prefix
+    if base:
+        return base
+    prefix = "主动安全报警"
+    return f"{prefix}{code}" if code is not None else prefix
+
+
+def _alarm_type_name(source: str, item: dict[str, Any]) -> str:
+    """按 808 真实规则生成类型名，必须能与 alarm_type_dict 对上。"""
+    base = _resolve_base_alarm_name(source, item)
+    if not _type_supports_levels(base):
+        return base
     level = _as_int(item.get("bjjb"))
-    if level in _LEVEL_SUFFIX and base.endswith("报警"):
-        return f"{base}{_LEVEL_SUFFIX[level]}"
-    return base
+    if level not in _LEVEL_SUFFIX:
+        level = 1
+    return f"{base}{_LEVEL_SUFFIX[level]}"
 
 
 def _is_unknown_alarm_item(source: str, item: dict[str, Any]) -> bool:
@@ -421,6 +482,7 @@ async def _sync_alarm_source(db: AsyncSession, source: str, start_at: datetime, 
     list_func = jt808_openapi_client.list_adas_alarms
     terminals: set[str] = set()
     car_id_cache: dict[str, dict[str, str]] = {}
+    company_name_cache: dict[int, str | None] = {}
     try:
         for page in range(1, max_pages + 1):
             data = await list_func(_fmt_api_time(start_at), _fmt_api_time(end_at), page=page, rows=page_size)
@@ -448,28 +510,38 @@ async def _sync_alarm_source(db: AsyncSession, source: str, start_at: datetime, 
                     continue
                 alarm_time = _parse_api_time(item.get("gpstime") or item.get("ts")) or end_at
                 type_name = _alarm_type_name(source, item)
-                level = _as_int(item.get("bjjb"))
-                matched_rule = await find_matching_rule(db, type_name, level)
-                # 命中过滤规则仍入库：安全管理列表软隐藏；安全监控可全量展示。
-                # 证据可后补（处理页 fetch-device-media）。
-                media = _split_media_files(item.get("files"))
-                if matched_rule is not None:
-                    log_filtered_alarm(
+                gate = await evaluate_alarm_type_ingest(
+                    db,
+                    type_name=type_name,
+                    vehicle_id=vehicle.id,
+                    alarm_time=alarm_time,
+                )
+                if not gate.get("allow"):
+                    reason = str(gate.get("reason") or "filtered")
+                    log_alarm_type_gate(
                         source=source,
                         external_id=ext_id,
                         alarm_type_name=type_name,
-                        alarm_level=level,
-                        rule=matched_rule,
+                        reason=reason,
                         plate=plate,
+                        interval_minutes=getattr(gate.get("alarm_type"), "min_interval_minutes", None),
                     )
-                    result.skipped_filtered += 1
+                    if reason == "interval":
+                        result.skipped_interval += 1
+                    else:
+                        result.skipped_filtered += 1
+                    continue
+                # 808 主动安全：无图片/视频证据一律不入库（OBD 超速走独立通道，不受此限制）。
+                media = _split_media_files(item.get("files"))
                 if not _has_image_or_video_evidence(media):
                     result.skipped_no_evidence += 1
+                    continue
                 lat = _as_float(item.get("lat"))
                 lng = _as_float(item.get("lng"))
                 address = await resolve_address_wgs84(
                     db, lat, lng, existing=str(item.get("address") or "")
                 )
+                company_name = await lookup_company_name(db, vehicle.company_id, company_name_cache)
                 row = VehicleViolation(
                     biz_no=_stable_biz_no(source, ext_id, alarm_time),
                     external_alarm_id=ext_id,
@@ -477,9 +549,10 @@ async def _sync_alarm_source(db: AsyncSession, source: str, start_at: datetime, 
                     vehicle_id=vehicle.id,
                     plate_no=vehicle.plate_no[:16],
                     company_id=vehicle.company_id,
+                    company_name=company_name,
                     violation_type_code=_as_int(item.get("bjlx") if item.get("bjlx") is not None else item.get("bjid")),
                     violation_type_name=type_name,
-                    risk_level=derive_risk_level(type_name),
+                    risk_level=gate.get("risk_level") or "mid",
                     violation_time=alarm_time,
                     lat=lat,
                     lng=lng,
@@ -492,7 +565,7 @@ async def _sync_alarm_source(db: AsyncSession, source: str, start_at: datetime, 
                 )
                 db.add(row)
                 await db.flush()
-                push_violation_alert(violation_alert_payload(row))
+                await notify_violation_created(db, row)
                 result.inserted += 1
                 if terminal_id:
                     terminals.add(terminal_id)
@@ -623,6 +696,8 @@ class Jt808AlarmScheduler:
             "configured": jt808_openapi_client.configured(),
             "base_url": (settings.jt808_openapi_base_url or "").strip(),
             "auth_mode": jt808_openapi_client.auth_mode(),
+            "credential_password_source": "database",
+            "service_account": service_openapi_username(),
             "running": self.running,
             "interval_seconds": settings.jt808_alarm_sync_interval_seconds,
             "lookback_minutes": settings.jt808_alarm_sync_lookback_minutes,

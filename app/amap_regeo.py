@@ -69,28 +69,37 @@ def _parse_regeo_body(data: dict[str, Any]) -> str | None:
     return text[:_MAX_ADDRESS_LEN] if text else None
 
 
-async def regeo_wgs84(api_key: str, lat: float, lng: float) -> str | None:
+async def _regeo_gcj_location(
+    api_key: str,
+    lat_gcj: float,
+    lng_gcj: float,
+    *,
+    cache_lat: float | None = None,
+    cache_lng: float | None = None,
+) -> str | None:
+    """高德逆地理：location 须为 GCJ02。缓存键可用原始查询坐标。"""
     key = (api_key or "").strip()
-    if not key or not _valid_coord(lat, lng):
+    if not key or not _valid_coord(lat_gcj, lng_gcj):
         return None
-    ck = _cache_key(lat, lng)
+    ck_lat = float(cache_lat if cache_lat is not None else lat_gcj)
+    ck_lng = float(cache_lng if cache_lng is not None else lng_gcj)
+    ck = _cache_key(ck_lat, ck_lng)
     cached = _mem_cache.get(ck)
     if cached is not None:
         return cached or None
 
-    jt808_cached = await asyncio.to_thread(lookup_jt808_address_cache, lat, lng)
+    jt808_cached = await asyncio.to_thread(lookup_jt808_address_cache, ck_lat, ck_lng)
     if jt808_cached:
         _mem_cache[ck] = jt808_cached
         return jt808_cached
 
-    lng_gcj, lat_gcj = wgs84_to_gcj02(float(lng), float(lat))
     try:
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
             resp = await client.get(
                 _REGEO_URL,
                 params={
                     "key": key,
-                    "location": f"{lng_gcj},{lat_gcj}",
+                    "location": f"{float(lng_gcj)},{float(lat_gcj)}",
                     "extensions": "all",
                     "roadlevel": "0",
                 },
@@ -112,8 +121,22 @@ async def regeo_wgs84(api_key: str, lat: float, lng: float) -> str | None:
     address = _parse_regeo_body(data if isinstance(data, dict) else {})
     _mem_cache[ck] = address or ""
     if address:
-        await asyncio.to_thread(save_jt808_address_cache, lat, lng, address)
+        await asyncio.to_thread(save_jt808_address_cache, ck_lat, ck_lng, address)
     return address
+
+
+async def regeo_wgs84(api_key: str, lat: float, lng: float) -> str | None:
+    if not _valid_coord(lat, lng):
+        return None
+    lng_gcj, lat_gcj = wgs84_to_gcj02(float(lng), float(lat))
+    return await _regeo_gcj_location(
+        api_key, lat_gcj, lng_gcj, cache_lat=float(lat), cache_lng=float(lng)
+    )
+
+
+async def regeo_gcj02(api_key: str, lat: float, lng: float) -> str | None:
+    """坐标已是 GCJ02 时直接逆地理（停车报警落库坐标）。"""
+    return await _regeo_gcj_location(api_key, float(lat), float(lng))
 
 
 async def resolve_address_wgs84(
@@ -150,4 +173,37 @@ async def resolve_address_wgs84(
         _logger.debug("逆地理成功 source=%s", source)
         return str(resolved).strip()[:_MAX_ADDRESS_LEN]
     _logger.debug("无可用逆地理结果（web_service_key / 808 appkey1）")
+    return ""
+
+
+async def resolve_address_gcj02(
+    db: AsyncSession,
+    lat: float | None,
+    lng: float | None,
+    *,
+    existing: str | None = None,
+) -> str:
+    """落库已是 GCJ02 的坐标补全地址（勿再走 WGS→GCJ）。"""
+    if (existing or "").strip():
+        return str(existing).strip()[:_MAX_ADDRESS_LEN]
+    if not _valid_coord(lat, lng):
+        return ""
+
+    jt808_cached = await asyncio.to_thread(lookup_jt808_address_cache, float(lat), float(lng))
+    if jt808_cached:
+        return jt808_cached[:_MAX_ADDRESS_LEN]
+
+    async def _call(key: str) -> str | None:
+        ck = _cache_key(float(lat), float(lng))
+        _mem_cache.pop(ck, None)
+        return await regeo_gcj02(key, float(lat), float(lng))
+
+    resolved, _key, source = await with_web_service_key(
+        db,
+        _call,
+        is_success=lambda addr: bool(addr and str(addr).strip()),
+    )
+    if resolved:
+        _logger.debug("GCJ逆地理成功 source=%s", source)
+        return str(resolved).strip()[:_MAX_ADDRESS_LEN]
     return ""

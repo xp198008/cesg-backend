@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.jt808_alarm_sync import jt808_alarm_scheduler
+from app.jt808_violation_sync import backfill_violation_company_names
 from app.models import Jt808AlarmSyncState
 
 router = APIRouter(prefix="/api/jt808-alarm-sync", tags=["jt808-alarm-sync"])
@@ -46,10 +47,10 @@ async def jt808_alarm_sync_run_once():
 
 @router.post("/backfill")
 async def jt808_alarm_sync_backfill(
-    lookback_minutes: int = Query(120, ge=1, le=1440),
-    reset_state: bool = Query(True),
+    lookback_minutes: int = Query(1440, ge=5, le=10080, description="回填最近多少分钟内的报警"),
+    reset_state: bool = Query(False, description="是否重置同步水位后回填"),
 ):
-    """按时间窗口回补历史主动安全报警（首次部署或排查时可用）。"""
+    """断档恢复后补拉历史报警（如今日白天同步中断期间的数据）。"""
     try:
         results = await jt808_alarm_scheduler.run_backfill(
             lookback_minutes=lookback_minutes,
@@ -58,4 +59,16 @@ async def jt808_alarm_sync_backfill(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "lookback_minutes": lookback_minutes, "reset_state": reset_state, "results": [x.__dict__ for x in results]}
+
+
+@router.post("/backfill-company-names")
+async def jt808_backfill_company_names(db: AsyncSession = Depends(get_db)):
+    """补齐本地 + 808 镜像表已有报警的 company_name（只填空，不删记录）。"""
+    try:
+        stats = await backfill_violation_company_names(db)
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"ok": True, **stats}
 

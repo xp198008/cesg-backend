@@ -34,6 +34,11 @@ from app.org_scope import (
     require_x_org_id_header,
     wants_org_tree_scope,
 )
+from app.risk_profile_service import (
+    expand_company_filter_ids,
+    load_org_company_maps,
+    resolve_selected_to_local_org_ids,
+)
 from app.vehicle_alloc_scope import (
     apply_vehicle_id_scope,
     parse_user_id_header,
@@ -113,6 +118,45 @@ def _vehicle_list_company_fleet_names(
 
     # 4) 其它情况维持原逻辑
     return company_name, fleet_map.get(fleet_id) if fleet_id else None
+
+
+def _org_level_names(
+    org_id: int | None,
+    company_map: dict[int, str | None],
+    parent_map: dict[int, int | None],
+    max_levels: int = 4,
+) -> list[str | None]:
+    """车辆所属组织沿 parent_id 上溯到根，映射为一至四级名称。
+
+    一级一般为集团总公司（根节点）；不足四级的位置返回 None（前端显示 --）。
+    超过四级时：前三级各占一位，第四位为第 4 级及以下名称用 "/" 拼接。
+    """
+    if not org_id:
+        return [None] * max_levels
+    chain: list[int] = []
+    current: int | None = int(org_id)
+    visited: set[int] = set()
+    while current and current not in visited:
+        visited.add(current)
+        chain.append(current)
+        current = parent_map.get(current)
+    chain.reverse()
+    full_names: list[str] = []
+    for cid in chain:
+        name = company_map.get(cid)
+        text = (name or "").strip() if isinstance(name, str) else ""
+        if text:
+            full_names.append(text)
+    names: list[str | None] = [
+        full_names[0] if len(full_names) > 0 else None,
+        full_names[1] if len(full_names) > 1 else None,
+        full_names[2] if len(full_names) > 2 else None,
+        ("/".join(full_names[3:]) if len(full_names) > 3 else None),
+    ]
+    # 保持返回长度与历史一致（固定 4）
+    while len(names) < max_levels:
+        names.append(None)
+    return names[:max_levels]
 
 
 def _norm(s) -> str:
@@ -239,6 +283,12 @@ class VehicleSavePayload(BaseModel):
     vehicle_payload: float | None = None
     curb_weight: float | None = None
     urea_info: str | None = None
+    coolant_temp_high_threshold: float | None = None
+    fuel_level_low_threshold: float | None = None
+    reagent_level_low_threshold: float | None = None
+    dpf_pressure_high_threshold: float | None = None
+    scr_downstream_abnormal_threshold: float | None = None
+    nox_abnormal_threshold: float | None = None
     short_name: str | None = None
     company_id: int = Field(..., ge=1)
     fleet_id: int | None = None
@@ -259,6 +309,9 @@ class VehicleSavePayload(BaseModel):
     channel_count: int | None = None
     engine_displacement: str | None = None
     fuel_tank_capacity: str | None = None
+    fuel_tank: str | None = None
+    rapid_acceleration: str | None = None
+    rapid_deceleration: str | None = None
     battery_capacity: str | None = None
     range_mileage: str | None = None
     battery_no: str | None = None
@@ -387,6 +440,12 @@ def _apply_vehicle_payload(v: Vehicle, co: OrgCompany, payload: VehicleSavePaylo
     v.vehicle_payload = _to_float(payload.vehicle_payload, None)
     v.curb_weight = _to_float(payload.curb_weight, None)
     v.urea_info = _norm(payload.urea_info) or None
+    v.coolant_temp_high_threshold = _to_float(payload.coolant_temp_high_threshold, None)
+    v.fuel_level_low_threshold = _to_float(payload.fuel_level_low_threshold, None)
+    v.reagent_level_low_threshold = _to_float(payload.reagent_level_low_threshold, None)
+    v.dpf_pressure_high_threshold = _to_float(payload.dpf_pressure_high_threshold, None)
+    v.scr_downstream_abnormal_threshold = _to_float(payload.scr_downstream_abnormal_threshold, None)
+    v.nox_abnormal_threshold = _to_float(payload.nox_abnormal_threshold, None)
     v.short_name = _norm(payload.short_name) or None
     v.company_id = payload.company_id
     v.company_org_code = _norm(co.org_code) or None
@@ -410,6 +469,9 @@ def _apply_vehicle_payload(v: Vehicle, co: OrgCompany, payload: VehicleSavePaylo
     v.channel_count = max(cc, len(channels)) if channels else cc
     v.engine_displacement = _norm(payload.engine_displacement) or None
     v.fuel_tank_capacity = _norm(payload.fuel_tank_capacity) or None
+    v.fuel_tank = _norm(payload.fuel_tank) or None
+    v.rapid_acceleration = _norm(payload.rapid_acceleration) or None
+    v.rapid_deceleration = _norm(payload.rapid_deceleration) or None
     v.battery_capacity = _norm(payload.battery_capacity) or None
     v.range_mileage = _norm(payload.range_mileage) or None
     v.battery_no = _norm(payload.battery_no) or None
@@ -516,6 +578,26 @@ async def vehicle_detail(
             "vehicle_payload": float(v.vehicle_payload) if v.vehicle_payload is not None else None,
             "curb_weight": float(v.curb_weight) if v.curb_weight is not None else None,
             "urea_info": v.urea_info,
+            "coolant_temp_high_threshold": (
+                float(v.coolant_temp_high_threshold) if v.coolant_temp_high_threshold is not None else None
+            ),
+            "fuel_level_low_threshold": (
+                float(v.fuel_level_low_threshold) if v.fuel_level_low_threshold is not None else None
+            ),
+            "reagent_level_low_threshold": (
+                float(v.reagent_level_low_threshold) if v.reagent_level_low_threshold is not None else None
+            ),
+            "dpf_pressure_high_threshold": (
+                float(v.dpf_pressure_high_threshold) if v.dpf_pressure_high_threshold is not None else None
+            ),
+            "scr_downstream_abnormal_threshold": (
+                float(v.scr_downstream_abnormal_threshold)
+                if v.scr_downstream_abnormal_threshold is not None
+                else None
+            ),
+            "nox_abnormal_threshold": (
+                float(v.nox_abnormal_threshold) if v.nox_abnormal_threshold is not None else None
+            ),
             "short_name": v.short_name,
             "company_id": v.company_id,
             "fleet_id": v.fleet_id,
@@ -536,6 +618,9 @@ async def vehicle_detail(
             "channel_count": v.channel_count,
             "engine_displacement": v.engine_displacement,
             "fuel_tank_capacity": v.fuel_tank_capacity,
+            "fuel_tank": v.fuel_tank,
+            "rapid_acceleration": v.rapid_acceleration,
+            "rapid_deceleration": v.rapid_deceleration,
             "battery_capacity": v.battery_capacity,
             "range_mileage": v.range_mileage,
             "battery_no": v.battery_no,
@@ -572,15 +657,103 @@ async def vehicle_detail(
     }
 
 
+# 车辆批量导入模板表头（与单车新增必填/808同步字段对齐）
+_VEHICLE_IMPORT_HEADERS = [
+    "车牌号",
+    "车牌颜色",
+    "车辆识别代码VIN",
+    "车辆发动机号",
+    "车辆产品型号代码",
+    "车架号",
+    "所属公司",
+    "车队",
+    "设备号",
+    "设备类型",
+    "SIM卡号",
+    "车辆类别",
+    "车辆品牌",
+    "车辆型号",
+    "使用状态",
+    "服务开始日",
+    "服务到期日",
+    "安装日期",
+    "通道数",
+]
+
+
+def _vehicle_import_cell(row: tuple, idx: int | None):
+    if idx is None or idx < 0 or idx >= len(row):
+        return None
+    return row[idx]
+
+
+def _norm_vehicle_category(raw) -> str | None:
+    t = _norm(raw)
+    if not t:
+        return None
+    low = t.lower()
+    if low in ("fuel", "燃油", "燃油车"):
+        return "fuel"
+    if low in ("new", "新能源", "新能源车", "ev", "电动", "电动车"):
+        return "new"
+    return t
+
+
+def _header_index(headers: list[str], *names: str, required: bool = True) -> int | None:
+    for n in names:
+        if n in headers:
+            return headers.index(n)
+    if required:
+        raise HTTPException(
+            status_code=400,
+            detail=f"缺少表头（需与模板一致，下列其一）：{', '.join(names)}",
+        )
+    return None
+
+
 @router.get("/import-template-carinfos")
 async def download_vehicle_import_template():
     wb = Workbook()
     ws = wb.active
     ws.title = "车辆信息导入"
+    ws.append(list(_VEHICLE_IMPORT_HEADERS))
+    # 示例行（导入前请删除或改成真实数据）
     ws.append(
-        ["车牌号", "车牌颜色", "车架号", "所属公司", "车队", "服务开始日", "服务到期日",
-         "安装日期", "车辆品牌", "使用状态", "最后上线时间", "通道数目", "设备1编号", "设备1类型", "设备1SIM"]
+        [
+            "测A12345",
+            "黄牌",
+            "LSVXXXXXXXXXXXXXXX",
+            "ENG001",
+            "PMC001",
+            "FRAME001",
+            "请填写系统中已有公司全称",
+            "",
+            "123456789012",
+            "JT808",
+            "",
+            "燃油车",
+            "",
+            "",
+            "正常",
+            "",
+            "",
+            "",
+            "4",
+        ]
     )
+    tip = wb.create_sheet("填写说明")
+    tip.append(["说明"])
+    for line in (
+        "1. 请使用本模板填写后上传 .xlsx；带*为导入必填，与页面「添加车辆」一致。",
+        "2. 必填：车牌号、车辆识别代码VIN、车辆发动机号、车辆产品型号代码、所属公司、设备号。",
+        "3. 所属公司必须与「组织架构」中公司名称完全一致；该公司需已配置 JT808 分组才能同步到 808。",
+        "4. 车队可空；填写时须为该公司下已存在的车队名称。",
+        "5. 车辆类别可填：燃油车/新能源车（或 fuel/new）。",
+        "6. 车牌已存在则更新该车；设备号不可被其它车辆占用。",
+        "7. 导入成功后会自动同步到 808 平台（与单车保存相同逻辑）。",
+        "8. 填写完请删除本说明页中的示例数据行，或整行改成真实车辆后再导入。",
+    ):
+        tip.append([line])
     bio = BytesIO()
     wb.save(bio)
     bio.seek(0)
@@ -604,117 +777,208 @@ async def import_vehicle_from_carinfos(file: UploadFile = File(...), db: AsyncSe
     ws = wb.active
     headers = [_norm(v) for v in next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())]
 
-    def idx(name: str) -> int:
-        try:
-            return headers.index(name)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"缺少表头：{name}") from e
+    i_plate = _header_index(headers, "车牌号")
+    i_plate_color = _header_index(headers, "车牌颜色", required=False)
+    i_vin = _header_index(headers, "车辆识别代码VIN", "VIN", "车辆识别代码", required=False)
+    i_engine = _header_index(headers, "车辆发动机号", "发动机号", required=False)
+    i_pmc = _header_index(headers, "车辆产品型号代码", "产品型号代码", required=False)
+    i_frame = _header_index(headers, "车架号", required=False)
+    # 兼容旧模板：无「所属公司」时用「车队」列当作公司名
+    i_company = _header_index(headers, "所属公司", required=False)
+    i_fleet = _header_index(headers, "车队", required=False)
+    if i_company is None and i_fleet is None:
+        raise HTTPException(status_code=400, detail="缺少表头：所属公司")
+    i_start = _header_index(headers, "服务开始日", required=False)
+    i_end = _header_index(headers, "服务到期日", required=False)
+    i_install = _header_index(headers, "安装日期", required=False)
+    i_brand = _header_index(headers, "车辆品牌", required=False)
+    i_model = _header_index(headers, "车辆型号", required=False)
+    i_category = _header_index(headers, "车辆类别", required=False)
+    i_status = _header_index(headers, "使用状态", required=False)
+    i_channel = _header_index(headers, "通道数", "通道数目", required=False)
+    i_dev_no = _header_index(headers, "设备号", "设备1编号")
+    i_dev_type = _header_index(headers, "设备类型", "设备1类型", required=False)
+    i_dev_sim = _header_index(headers, "SIM卡号", "设备1SIM", required=False)
 
-    def idx_any(*names: str) -> int:
-        for n in names:
-            if n in headers:
-                return headers.index(n)
-        raise HTTPException(status_code=400, detail=f"缺少表头（需与模板一致，下列其一）：{', '.join(names)}")
-
-    i_plate = idx("车牌号")
-    i_plate_color = idx("车牌颜色")
-    i_vin = idx("车架号")
-    i_fleet = idx("车队")
-    i_start = idx("服务开始日")
-    i_end = idx("服务到期日")
-    i_install = idx("安装日期")
-    i_brand = idx("车辆品牌")
-    i_status = idx("使用状态")
-    i_last = idx("最后上线时间")
-    i_channel = idx_any("通道数目", "通道数")
-    i_dev_no = idx("设备1编号")
-    i_dev_type = idx("设备1类型")
-    i_dev_sim = idx("设备1SIM")
+    # 旧模板把 VIN 写在「车架号」列：无 VIN 列时回退用车架号列作为 vin
+    legacy_vin_from_frame = i_vin is None and i_frame is not None
+    if i_vin is None and not legacy_vin_from_frame:
+        raise HTTPException(status_code=400, detail="缺少表头：车辆识别代码VIN")
 
     companies = (await db.execute(select(OrgCompany).order_by(OrgCompany.id))).scalars().all()
     company_name_map: dict[str, list[OrgCompany]] = {}
     for c in companies:
         company_name_map.setdefault((c.name or "").strip(), []).append(c)
 
-    def resolve_company_from_fleet_column(name_key: str) -> OrgCompany:
+    fleets = (await db.execute(select(Fleet).order_by(Fleet.id))).scalars().all()
+    fleet_by_company: dict[int, dict[str, Fleet]] = {}
+    for fl in fleets:
+        fleet_by_company.setdefault(int(fl.company_id), {})[(fl.name or "").strip()] = fl
+
+    def resolve_company(name_key: str) -> OrgCompany:
         cs = company_name_map.get(name_key, [])
         if len(cs) == 1:
             return cs[0]
         if len(cs) > 1:
-            raise HTTPException(status_code=400, detail=f"公司名称重名无法唯一匹配：{name_key}")
-        raise HTTPException(status_code=400, detail=f"公司信息中无此名称：{name_key}")
+            raise ValueError(f"公司名称重名无法唯一匹配：{name_key}")
+        raise ValueError(f"公司信息中无此名称：{name_key}")
 
     errors: list[str] = []
     skipped_rows: list[tuple[int, str]] = []
     imported = 0
     updated = 0
+    # (vehicle_id, old_device_no|None)
+    sync_queue: list[tuple[int, str | None]] = []
+    seen_plates: set[str] = set()
+    seen_devices: set[str] = set()
 
     for ridx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-        plate = _norm(row[i_plate] if len(row) > i_plate else "")
-        company_name_key = _norm(row[i_fleet] if len(row) > i_fleet else "")
-        if not plate and not company_name_key:
-            continue
-        if not plate:
-            errors.append(f"第 {ridx} 行缺少车牌号")
-            skipped_rows.append((ridx, "缺少车牌号"))
-            continue
-        if not company_name_key:
-            errors.append(f"第 {ridx} 行缺少车队")
-            skipped_rows.append((ridx, "缺少车队"))
-            continue
-        try:
-            company = resolve_company_from_fleet_column(company_name_key)
-        except HTTPException as e:
-            errors.append(f"第 {ridx} 行{e.detail}")
-            skipped_rows.append((ridx, str(e.detail)))
+        plate = _norm(_vehicle_import_cell(row, i_plate))
+        company_name = _norm(_vehicle_import_cell(row, i_company)) if i_company is not None else ""
+        fleet_name = _norm(_vehicle_import_cell(row, i_fleet)) if i_fleet is not None else ""
+        # 旧模板：所属公司空、车队列实际填公司名
+        if not company_name and fleet_name and i_company is None:
+            company_name = fleet_name
+            fleet_name = ""
+
+        if not plate and not company_name and not _norm(_vehicle_import_cell(row, i_dev_no)):
             continue
 
-        org_code = _norm(company.org_code) or f"{company.id:04d}"
+        def skip(reason: str) -> None:
+            errors.append(f"第 {ridx} 行{reason}")
+            skipped_rows.append((ridx, reason))
+
+        if not plate:
+            skip("缺少车牌号")
+            continue
+        if plate in seen_plates:
+            skip(f"Excel 内车牌号重复：{plate}")
+            continue
+        if not company_name:
+            skip("缺少所属公司")
+            continue
+
+        vin = _norm(_vehicle_import_cell(row, i_vin)) if i_vin is not None else ""
+        if legacy_vin_from_frame and not vin:
+            vin = _norm(_vehicle_import_cell(row, i_frame))
+        frame_no = _norm(_vehicle_import_cell(row, i_frame)) if i_frame is not None else ""
+        if legacy_vin_from_frame:
+            frame_no = ""
+        engine_no = _norm(_vehicle_import_cell(row, i_engine)) if i_engine is not None else ""
+        product_model_code = _norm(_vehicle_import_cell(row, i_pmc)) if i_pmc is not None else ""
+        dev_no = _norm(_vehicle_import_cell(row, i_dev_no))
+
+        if not vin:
+            skip("缺少车辆识别代码VIN")
+            continue
+        if not engine_no:
+            skip("缺少车辆发动机号")
+            continue
+        if not product_model_code:
+            skip("缺少车辆产品型号代码")
+            continue
+        if not dev_no:
+            skip("缺少设备号")
+            continue
+        if dev_no in seen_devices:
+            skip(f"Excel 内设备号重复：{dev_no}")
+            continue
+
+        try:
+            company = resolve_company(company_name)
+        except ValueError as e:
+            skip(str(e))
+            continue
+
+        fleet_id = None
+        if fleet_name:
+            fl = fleet_by_company.get(int(company.id), {}).get(fleet_name)
+            if fl is None:
+                skip(f"车队不存在或不属于该公司：{fleet_name}")
+                continue
+            fleet_id = fl.id
+
         v = (await db.execute(select(Vehicle).where(Vehicle.plate_no == plate))).scalar_one_or_none()
-        if v is None:
+        old_dev = None
+        if v is not None:
+            old_dev = await db.scalar(
+                select(VehicleDevice.device_no).where(
+                    VehicleDevice.vehicle_id == v.id, VehicleDevice.is_main.is_(True)
+                ).limit(1)
+            )
+
+        dup_q = select(VehicleDevice.vehicle_id).where(VehicleDevice.device_no == dev_no)
+        if v is not None and v.id:
+            dup_q = dup_q.where(VehicleDevice.vehicle_id != v.id)
+        if await db.scalar(dup_q.limit(1)) is not None:
+            skip(f"设备号重复：{dev_no}")
+            continue
+
+        is_new = v is None
+        if is_new:
             v = Vehicle(plate_no=plate)
             db.add(v)
+        org_code = _norm(company.org_code) or f"{company.id:04d}"
+        v.plate_color = _norm(_vehicle_import_cell(row, i_plate_color)) or "黄牌"
+        v.vin = vin
+        v.engine_no = engine_no
+        v.product_model_code = product_model_code
+        v.frame_no = frame_no or None
+        v.fleet_id = fleet_id
+        v.company_id = company.id
+        v.company_org_code = org_code
+        v.service_start_date = _to_date(_vehicle_import_cell(row, i_start))
+        v.service_end_date = _to_date(_vehicle_import_cell(row, i_end))
+        v.install_date = _to_date(_vehicle_import_cell(row, i_install))
+        v.brand = _norm(_vehicle_import_cell(row, i_brand)) or None
+        v.model = _norm(_vehicle_import_cell(row, i_model)) or None
+        v.vehicle_category = _norm_vehicle_category(_vehicle_import_cell(row, i_category))
+        v.status = (_norm(_vehicle_import_cell(row, i_status)) or "正常").split(",")[0]
+        v.channel_count = _to_int(_vehicle_import_cell(row, i_channel), 0) or 0
+        await db.flush()
+
+        d = (
+            await db.execute(
+                select(VehicleDevice).where(VehicleDevice.vehicle_id == v.id, VehicleDevice.is_main.is_(True))
+            )
+        ).scalar_one_or_none()
+        if d is None:
+            d = VehicleDevice(vehicle_id=v.id, is_main=True, channel_no=1)
+            db.add(d)
+        d.device_no = dev_no
+        d.terminal_type = _norm(_vehicle_import_cell(row, i_dev_type)) or None
+        d.sim_no = _norm(_vehicle_import_cell(row, i_dev_sim)) or None
+        await _remove_reserve_for_device_no(db, dev_no)
+
+        seen_plates.add(plate)
+        seen_devices.add(dev_no)
+        sync_queue.append((int(v.id), _norm(old_dev) or None))
+        if is_new:
             imported += 1
         else:
             updated += 1
 
-        v.plate_color = _norm(row[i_plate_color] if len(row) > i_plate_color else "") or None
-        v.vin = _norm(row[i_vin] if len(row) > i_vin else "") or None
-        v.fleet_id = None
-        v.company_id = company.id
-        v.company_org_code = org_code
-        v.service_start_date = _to_date(row[i_start] if len(row) > i_start else None)
-        v.service_end_date = _to_date(row[i_end] if len(row) > i_end else None)
-        v.install_date = _to_date(row[i_install] if len(row) > i_install else None)
-        v.brand = _norm(row[i_brand] if len(row) > i_brand else "") or None
-        v.status = (_norm(row[i_status] if len(row) > i_status else "") or "正常").split(",")[0]
-        v.last_online_at = _to_datetime(row[i_last] if len(row) > i_last else None)
-        v.channel_count = _to_int(row[i_channel] if len(row) > i_channel else None, 0) or 0
-        await db.flush()
-
-        dev_no = _norm(row[i_dev_no] if len(row) > i_dev_no else "")
-        dev_type = _norm(row[i_dev_type] if len(row) > i_dev_type else "")
-        dev_sim = _norm(row[i_dev_sim] if len(row) > i_dev_sim else "")
-        if dev_no:
-            dup_q = select(VehicleDevice.vehicle_id).where(VehicleDevice.device_no == dev_no)
-            if v.id:
-                dup_q = dup_q.where(VehicleDevice.vehicle_id != v.id)
-            if await db.scalar(dup_q.limit(1)) is not None:
-                errors.append(f"第 {ridx} 行设备号重复：{dev_no}")
-                skipped_rows.append((ridx, f"设备号重复：{dev_no}"))
-                continue
-            d = (await db.execute(
-                select(VehicleDevice).where(VehicleDevice.vehicle_id == v.id, VehicleDevice.is_main.is_(True))
-            )).scalar_one_or_none()
-            if d is None:
-                d = VehicleDevice(vehicle_id=v.id, is_main=True, channel_no=1, device_no=dev_no)
-                db.add(d)
-            d.device_no = dev_no
-            d.terminal_type = dev_type or None
-            d.sim_no = dev_sim or None
-            await _remove_reserve_for_device_no(db, dev_no)
-
     wb.close()
+    await db.flush()
+    await db.commit()
+
+    jt808_ok = 0
+    jt808_fail = 0
+    jt808_skip = 0
+    for vid, old_dev in sync_queue:
+        try:
+            result = await jt808_vehicle.upsert_now(vid, old_dev)
+        except Exception:  # noqa: BLE001
+            jt808_fail += 1
+            continue
+        status = _jt808_sync_status(result)
+        if status == "success":
+            jt808_ok += 1
+        elif status == "failed":
+            jt808_fail += 1
+        else:
+            jt808_skip += 1
+
     annotated_file_base64: str | None = None
     annotated_file_name: str | None = None
     if skipped_rows:
@@ -740,6 +1004,9 @@ async def import_vehicle_from_carinfos(file: UploadFile = File(...), db: AsyncSe
         "updated": updated,
         "skipped": len(skipped_rows),
         "skipped_preview": errors[:20],
+        "jt808_sync_ok": jt808_ok,
+        "jt808_sync_fail": jt808_fail,
+        "jt808_sync_skip": jt808_skip,
         "annotated_file_name": annotated_file_name,
         "annotated_file_base64": annotated_file_base64,
     }
@@ -764,15 +1031,33 @@ async def vehicle_reserve_terminals(db: AsyncSession = Depends(get_db)):
     }
 
 
+def _parse_company_filter_ids(company_id: int | None, company_ids: str | None) -> list[int]:
+    """解析公司筛选：支持本地 org id 或 JT808 gid（与报表公司树一致）。"""
+    selected: list[int] = []
+    if company_ids:
+        for part in str(company_ids).split(","):
+            text = part.strip()
+            if not text:
+                continue
+            try:
+                selected.append(int(text))
+            except (TypeError, ValueError):
+                continue
+    elif company_id is not None:
+        selected.append(int(company_id))
+    return selected
+
+
 @router.get("/list")
 async def vehicle_list(
     plate_no: str | None = Query(None),
     status: str | None = Query(None),
     company_id: int | None = Query(None),
+    company_ids: str | None = Query(None),
     scope_org_tree: bool = Query(False),
     online_source: str = Query("db"),
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page_size: int = Query(20, ge=1, le=1000),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
@@ -791,9 +1076,18 @@ async def vehicle_list(
         q = q.where(Vehicle.plate_no.ilike(f"%{plate_no.strip()}%"))
     if status:
         q = q.where(Vehicle.status == status)
-    if company_id:
-        company_subtree = await collect_org_company_subtree_ids(db, int(company_id))
-        q = q.where(Vehicle.company_id.in_(company_subtree))
+    selected_raw = _parse_company_filter_ids(company_id, company_ids)
+    if selected_raw:
+        parent_map, _, gid_to_local, _ = await load_org_company_maps(db)
+        local_selected = resolve_selected_to_local_org_ids(
+            selected_raw,
+            gid_to_local=gid_to_local,
+            known_local_ids=set(parent_map.keys()),
+        )
+        if local_selected:
+            company_subtree = await expand_company_filter_ids(db, local_selected)
+            if company_subtree:
+                q = q.where(Vehicle.company_id.in_(company_subtree))
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
     q = q.offset((page - 1) * page_size).limit(page_size)
     rows = (await db.execute(q)).scalars().all()
@@ -849,6 +1143,7 @@ async def vehicle_list(
         display_company_name, display_fleet_name = _vehicle_list_company_fleet_names(
             r.company_id, r.fleet_id, company_map, parent_map, fleet_map
         )
+        level_names = _org_level_names(r.company_id, company_map, parent_map)
         bound_driver_name = (r.driver_name or "").strip() or (
             driver_map.get(int(r.driver_id)) if r.driver_id else None
         )
@@ -866,6 +1161,10 @@ async def vehicle_list(
                 "company_org_code": (r.company_org_code or company_org_map.get(r.company_id) or None),
                 "fleet_id": r.fleet_id,
                 "fleet_name": display_fleet_name,
+                "level_one_org": level_names[0],
+                "level_two_org": level_names[1],
+                "level_three_org": level_names[2],
+                "level_four_org": level_names[3],
                 "driver_id": r.driver_id,
                 "driver_name": bound_driver_name,
                 "install_date": str(r.install_date) if r.install_date else None,

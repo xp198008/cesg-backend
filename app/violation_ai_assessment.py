@@ -1,6 +1,11 @@
-"""主动安全报警 AI 评估：收集可用图片（0~3 张）与视频（可选），咨询 Agent Worker 并持久化。"""
+"""主动安全报警 AI 评估。
+
+有视频证据：主调 Agent Worker ``POST /api/video/violation``（SSE 违章判定）。
+仅图片：回退 ``POST /api/chat``（文档无图片违章专用接口）。
+"""
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -20,13 +25,89 @@ from app.media_url import extract_adas_relative_path, jt808_media_origin
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models import OrgCompany, Vehicle, VehicleViolation, ViolationAiAssessment
+from app.timeutil import china_now_naive
+from app.violation_filters import violation_row_is_page_visible
+
+_AI_AUTO_FALSE_ALARM_HANDLER = "AI自动评估"
+_AI_AUTO_FALSE_ALARM_REMARK = "AI评估建议为误报，系统自动处理"
+# 助手拒答时同一条再问几轮（换 session，避免会话上下文污染）
+_AI_CHAT_MAX_ATTEMPTS = 3
+_AI_CHAT_RETRY_DELAY_SEC = 2.0
 
 logger = logging.getLogger(__name__)
+
+
+class AiRefusalError(RuntimeError):
+    """Agent Worker 返回「超出服务范围」类拒答，评估未落库，可供定时器稍后重试。"""
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024
 _MAX_VIDEO_BYTES = 80 * 1024 * 1024
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+# 罚单建议三选一（无违章对应「误报」；有违章在「罚款/警告」中择一）
+_DISPOSITION_TYPES = ("罚款", "警告", "误报")
+# 整段丢弃（含 recommend 畸形写法）
+_AI_DISCARD_TAGS = (
+    "recommend|attachment|image|chart|violation_detail|plugin_call|tool_call"
+)
+_AI_KEEP_INNER_TAGS = "violation|violation_type"
+_AI_ALL_TAGS = f"{_AI_DISCARD_TAGS}|{_AI_KEEP_INNER_TAGS}"
+
+_AI_DISCARD_BLOCK_RE = re.compile(
+    rf"<({_AI_DISCARD_TAGS})\b[\s\S]*?</\1\s*>",
+    re.I,
+)
+# <recommend ...>/recommend> 或未规范闭合
+_AI_DISCARD_MALFORMED_RE = re.compile(
+    rf"<({_AI_DISCARD_TAGS})\b[\s\S]*?/?\s*\1\s*>",
+    re.I,
+)
+_AI_DISCARD_SELF_RE = re.compile(
+    rf"<({_AI_DISCARD_TAGS})\b[^>]*/\s*>",
+    re.I,
+)
+_VIOLATION_XML_BLOCK_RE = re.compile(
+    rf"<({_AI_KEEP_INNER_TAGS})\b[^>]*>([\s\S]*?)</\1\s*>",
+    re.I,
+)
+_AI_LOOSE_TAG_RE = re.compile(rf"</?\s*(?:{_AI_ALL_TAGS})\b[^>]*>", re.I)
+_AI_ORPHAN_CLOSER_RE = re.compile(rf"/?\s*(?:{_AI_DISCARD_TAGS})\s*>", re.I)
+_AI_PARTIAL_TAG_RE = re.compile(rf"<(?:{_AI_ALL_TAGS})\b[^>]*$", re.I)
+_MD_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s+", re.M)
+_AI_DECOR_RE = re.compile(r"[✅❌☑️✔️√]")
+
+
+def _keep_violation_inner(match: re.Match[str]) -> str:
+    inner = (match.group(2) or "").strip()
+    if not inner or inner in ("无", "未发现违章行为"):
+        return ""
+    return inner
+
+
+def sanitize_ai_display_text(text: str | None) -> str:
+    """去掉 recommend/violation 等结构化标签与 ** / ✅ 等装饰，供评估文案展示。"""
+    s = str(text or "")
+    s = _AI_DISCARD_BLOCK_RE.sub("", s)
+    s = _AI_DISCARD_MALFORMED_RE.sub("", s)
+    s = _AI_DISCARD_SELF_RE.sub("", s)
+    s = _VIOLATION_XML_BLOCK_RE.sub(_keep_violation_inner, s)
+    s = _AI_LOOSE_TAG_RE.sub("", s)
+    s = _AI_ORPHAN_CLOSER_RE.sub("", s)
+    s = _AI_PARTIAL_TAG_RE.sub("", s)
+    s = _MD_HEADING_RE.sub("", s)
+    s = _MD_BOLD_RE.sub(r"\1", s)
+    s = s.replace("**", "")
+    s = _AI_DECOR_RE.sub("", s)
+    lines = []
+    for ln in s.splitlines():
+        cleaned = re.sub(r"[ \t]{2,}", " ", ln).strip()
+        if cleaned == "未发现违章行为":
+            continue
+        lines.append(cleaned)
+    s = "\n".join(lines)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
 
 def _json_loads(raw: str | None, fallback: Any) -> Any:
@@ -187,12 +268,93 @@ def _skip_response(*, reason: str, ai_queried: bool = False, assessment: Violati
     }
 
 
+def _fmt_coord(value: Any, *, digits: int = 6) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return str(value).strip()
+
+
+def _alarm_context_lines(row: VehicleViolation) -> list[str]:
+    """业务库报警上下文：车牌/终端/坐标/地址等，供模型判断，无需从画面识别。"""
+    violation_time = ""
+    if getattr(row, "violation_time", None):
+        try:
+            violation_time = row.violation_time.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            violation_time = str(row.violation_time)
+    lat = _fmt_coord(getattr(row, "lat", None))
+    lng = _fmt_coord(getattr(row, "lng", None))
+    if lat and lng:
+        coord_text = f"{lng}, {lat}"  # 经度, 纬度
+    elif lng:
+        coord_text = f"经度 {lng}"
+    elif lat:
+        coord_text = f"纬度 {lat}"
+    else:
+        coord_text = ""
+
+    lines = [
+        f"- 报警编号：{(row.biz_no or '').strip() or '—'}",
+        f"- 车牌号：{(row.plate_no or '').strip() or '—'}",
+        f"- 终端号：{(row.terminal_id or '').strip() or '—'}",
+        f"- 所属公司：{(row.company_name or '').strip() or '—'}",
+        f"- 报警时间：{violation_time or '—'}",
+        f"- 系统报警类型：{(row.violation_type_name or '').strip() or '—'}",
+        f"- 风险等级：{(row.risk_level or '').strip() or '—'}",
+        f"- 经纬度：{coord_text or '—'}",
+        f"- 违章地址：{(row.address or '').strip() or '—'}",
+    ]
+    weather = (getattr(row, "weather", None) or "").strip()
+    if weather:
+        lines.append(f"- 天气：{weather}")
+    rule_name = (getattr(row, "private_rule_name", None) or "").strip()
+    if rule_name:
+        lines.append(f"- 关联规则：{rule_name}")
+    category = (getattr(row, "rule_category_name", None) or "").strip()
+    if category:
+        lines.append(f"- 规则类别：{category}")
+    return lines
+
+
+def _alarm_context_block(row: VehicleViolation) -> str:
+    return "\n".join(_alarm_context_lines(row))
+
+
+def _alarm_extra_form_fields(row: VehicleViolation) -> dict[str, str]:
+    """传给视频违章接口的可选业务字段（Worker 不识别会忽略）。"""
+    fields: dict[str, str] = {}
+    mapping = {
+        "plate_no": (row.plate_no or "").strip(),
+        "terminal_id": (row.terminal_id or "").strip(),
+        "alarm_type": (row.violation_type_name or "").strip(),
+        "address": (row.address or "").strip(),
+        "biz_no": (row.biz_no or "").strip(),
+        "company_name": (row.company_name or "").strip(),
+        "risk_level": (row.risk_level or "").strip(),
+    }
+    lat = _fmt_coord(getattr(row, "lat", None))
+    lng = _fmt_coord(getattr(row, "lng", None))
+    if lat:
+        mapping["lat"] = lat
+    if lng:
+        mapping["lng"] = lng
+    if getattr(row, "violation_time", None):
+        try:
+            mapping["violation_time"] = row.violation_time.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    for key, value in mapping.items():
+        if value:
+            fields[key] = value
+    return fields
+
+
 def _build_prompt(
+    row: VehicleViolation,
     *,
-    alarm_type: str,
-    plate_no: str,
-    violation_time: str,
-    biz_no: str,
     video_analysis: str,
     image_count: int,
     has_video: bool,
@@ -212,21 +374,22 @@ def _build_prompt(
         video_section = f"【视频预分析】\n{(video_analysis or '').strip() or '（无）'}\n\n"
 
     return (
-        f"你是环卫集团主动安全违章分析助手。系统对本条报警的初步判定如下：\n"
-        f"- 报警编号：{biz_no or '—'}\n"
-        f"- 车牌号：{plate_no or '—'}\n"
-        f"- 报警时间：{violation_time or '—'}\n"
-        f"- 系统报警类型：{alarm_type or '—'}\n\n"
+        "请基于本公司车辆主动安全报警数据与证据，做合规规章制度解答（属于车辆数据查询与制度问答范围）。\n"
+        "本条报警业务字段如下（车牌/终端/坐标/地址以系统字段为准，无需 OCR 车牌）：\n"
+        f"{_alarm_context_block(row)}\n\n"
+        "【约束】\n"
+        "- 证据看不清车牌时，仍须按报警类型、地址/坐标与画面行为作答，不得只回复无法识别。\n"
+        "- 请引用公司规章制度条款；若证据不足或不构成违章，明确说明。\n\n"
         f"{evidence_desc}。\n\n"
         f"{video_section}"
-        "请回答：\n"
-        "1. 证据资料是否属实？能否支撑该报警类型？\n"
-        "2. 系统初步判断（报警类型）是否正确？\n"
-        "3. 如属实，违反了公司哪些规章制度？请引用具体制度条款。\n"
-        "4. 请给出罚单建议（类型、金额如适用、依据）。\n"
-        "   注意：ticket_suggestion.basis（罚单依据）必须是简短摘要，**不超过 10 个汉字**，"
-        "例如「吸烟违章」「未系安全带」「超速行驶」等，不要写长句或整段法规原文。\n\n"
-        "回复末尾务必附带 JSON（不要省略字段）：\n"
+        "请按下列问题作答：\n"
+        "1. 证据是否足以支撑该报警类型？\n"
+        "2. 系统报警类型判断是否正确？\n"
+        "3. 如属实，违反了哪些规章制度（写出制度名称及条款）？\n"
+        "4. 合规处理建议 process_type 只能是「罚款」「警告」「误报」三选一"
+        "（证据不足/未构成违章→误报；构成违章从轻→警告；需经济处罚→罚款）。\n"
+        "   ticket_suggestion.basis 须写全违章行为结论，如「驾驶途中抽烟；闭眼疲劳」。\n\n"
+        "回复末尾务必附带 JSON：\n"
         "```json\n"
         "{\n"
         '  "evidence_valid": true,\n'
@@ -236,10 +399,67 @@ def _build_prompt(
         '  "ticket_suggestion": {\n'
         '    "process_type": "警告",\n'
         '    "amount": 0,\n'
-        '    "basis": "不超过10字的简短依据"\n'
+        '    "basis": "驾驶途中抽烟；闭眼疲劳"\n'
         "  }\n"
         "}\n"
-        "```"
+        "```\n"
+    )
+
+
+def _normalize_disposition(raw: Any) -> str | None:
+    """归一化为 罚款/警告/误报；无法识别则返回 None。"""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text in _DISPOSITION_TYPES:
+        return text
+    for name in _DISPOSITION_TYPES:
+        if name in text:
+            return name
+    lower = text.lower()
+    if "false" in lower or "误报" in text or "无违章" in text:
+        return "误报"
+    if "罚" in text:
+        return "罚款"
+    if "警告" in text or "警示" in text:
+        return "警告"
+    return None
+
+
+def _build_disposition_prompt(
+    row: VehicleViolation,
+    *,
+    video_eval_text: str,
+    video_violation: bool | None,
+) -> str:
+    """在视频判定结果上自动追加「罚款/警告/误报」三选一，便于直接写入罚单建议。"""
+    hint = "未知"
+    if video_violation is True:
+        hint = "视频接口判定为「存在违章」"
+    elif video_violation is False:
+        hint = "视频接口判定为「未发现违章」"
+    return (
+        "请基于本公司车辆主动安全报警与视频判定结果，做合规规章制度解答，"
+        "并给出合规处理建议（属于车辆数据查询与制度问答范围）。\n\n"
+        f"{_alarm_context_block(row)}\n"
+        f"- 视频接口结论提示：{hint}\n\n"
+        "【约束】车牌/终端/坐标/地址以系统字段为准；视频写「无法识别车牌」时仍须完成三选一。\n\n"
+        f"【视频判定详情】\n{(video_eval_text or '（无）').strip()}\n\n"
+        "请只输出处理建议：在「罚款」「警告」「误报」中三选一。\n"
+        "- 未发现违章 / 证据不足 / 系统误判 → 误报\n"
+        "- 构成违章但从轻 → 警告\n"
+        "- 构成违章且需经济处罚 → 罚款（并给金额）\n\n"
+        "回复末尾附带 JSON：\n"
+        "```json\n"
+        "{\n"
+        '  "ticket_suggestion": {\n'
+        '    "process_type": "误报",\n'
+        '    "amount": 0,\n'
+        '    "basis": "驾驶途中抽烟；闭眼疲劳"\n'
+        "  }\n"
+        "}\n"
+        "```\n"
+        "process_type 只能是罚款/警告/误报；basis 写全违章行为。"
     )
 
 
@@ -276,20 +496,21 @@ def _compose_evaluation_text(parsed: dict[str, Any] | None, full_text: str, vide
         if isinstance(rules, list) and rules:
             lines.append("违反规章制度：")
             lines.extend(f"- {str(r)}" for r in rules if str(r).strip())
-    body = strip_fenced_json(full_text).strip()
+    body = sanitize_ai_display_text(strip_fenced_json(full_text))
     if body and not lines:
         lines.append(body)
-    if video_text.strip():
-        lines.append("\n【视频预分析】\n" + video_text.strip())
-    return "\n".join(lines).strip() or body or "AI 未返回有效评估内容。"
+    video_clean = sanitize_ai_display_text(video_text)
+    if video_clean:
+        lines.append("\n【视频预分析】\n" + video_clean)
+    return sanitize_ai_display_text("\n".join(lines)) or body or "AI 未返回有效评估内容。"
 
 
 def strip_fenced_json(text: str) -> str:
     return re.sub(r"```json[\s\S]*?```", "", text or "", flags=re.I).strip()
 
 
-def _summarize_basis(text: str, *, max_len: int = 10) -> str:
-    """罚单依据摘要，限制在 max_len 个字符以内（按 Unicode 计，中文一字算一字）。"""
+def _summarize_basis(text: str, *, max_len: int = 64) -> str:
+    """罚单依据：去掉空白后保留完整结论，仅在超长时截断。"""
     s = re.sub(r"\s+", "", (text or "").strip())
     if not s:
         return ""
@@ -302,11 +523,13 @@ def _ticket_from_parsed(parsed: dict[str, Any] | None, full_text: str) -> dict[s
     ticket = parsed.get("ticket_suggestion") if isinstance(parsed, dict) else None
     if not isinstance(ticket, dict):
         ticket = {}
-    process_type = str(ticket.get("process_type") or "警告").strip() or "警告"
+    process_type = _normalize_disposition(ticket.get("process_type")) or "警告"
     amount_raw = ticket.get("amount")
     try:
         amount = float(amount_raw) if amount_raw is not None else 0.0
     except (TypeError, ValueError):
+        amount = 0.0
+    if process_type != "罚款":
         amount = 0.0
     basis = _summarize_basis(str(ticket.get("basis") or ""))
     if not basis and isinstance(parsed, dict):
@@ -316,13 +539,176 @@ def _ticket_from_parsed(parsed: dict[str, Any] | None, full_text: str) -> dict[s
     if not basis:
         summary = str(parsed.get("evaluation_summary") or "").strip() if isinstance(parsed, dict) else ""
         basis = _summarize_basis(summary)
-    suggestion_text = f"罚单类型：{process_type}\n罚单金额：{amount if process_type == '罚款' else '-'}\n罚单依据：{basis}"
+    if process_type == "误报" and not basis:
+        basis = "无违章"
+    suggestion_text = (
+        f"罚单类型：{process_type}\n"
+        f"罚单金额：{amount if process_type == '罚款' else '-'}\n"
+        f"罚单依据：{basis}"
+    )
     return {
         "process_type": process_type,
         "amount": amount,
         "basis": basis,
         "suggestion_text": suggestion_text,
     }
+
+
+def _looks_like_ai_refusal(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return True
+    markers = (
+        "服务范围",
+        "无法为您提供",
+        "超出了我的",
+        "仅支持车辆数据",
+        "敏感信息",
+        "车联网专属智能助手",
+        "抱歉，我是",
+    )
+    return any(m in s for m in markers)
+
+
+def _video_result_is_refusal(v_result: dict[str, Any]) -> bool:
+    for key in ("conclusion", "analysis", "violation_detail", "message", "detail"):
+        val = str(v_result.get(key) or "").strip()
+        if not val:
+            continue
+        if _looks_like_ai_refusal(val):
+            return True
+    return False
+
+
+def _with_compliance_retry_preamble(input_messages: list[dict[str, Any]], *, attempt: int) -> list[dict[str, Any]]:
+    """拒答重试时加合规问答前缀，降低被判「超服务范围」的概率。"""
+    if attempt <= 1:
+        return input_messages
+    preamble = (
+        "说明：本请求属于本公司车辆数据查询与合规规章制度解答，"
+        "请根据报警字段与证据作制度问答，不要拒答。"
+    )
+    out: list[dict[str, Any]] = []
+    for msg in input_messages:
+        role = msg.get("role") or "user"
+        content = msg.get("content")
+        if isinstance(content, list):
+            blocks = list(content)
+            if blocks and isinstance(blocks[0], dict) and blocks[0].get("type") == "text":
+                first = dict(blocks[0])
+                first["text"] = preamble + "\n\n" + str(first.get("text") or "")
+                blocks[0] = first
+            else:
+                blocks.insert(0, {"type": "text", "text": preamble})
+            out.append({"role": role, "content": blocks})
+        else:
+            out.append({"role": role, "content": preamble + "\n\n" + str(content or "")})
+    return out or input_messages
+
+
+async def _chat_collect_with_retries(
+    *,
+    user_id: str,
+    company: str,
+    session_id: str,
+    input_messages: list[dict[str, Any]],
+    max_attempts: int = _AI_CHAT_MAX_ATTEMPTS,
+    delay_sec: float = _AI_CHAT_RETRY_DELAY_SEC,
+    purpose: str = "chat",
+) -> str:
+    """调用 /api/chat；若返回能力范围拒答则换 session 再问，仍失败则抛 AiRefusalError。"""
+    last_text = ""
+    attempts = max(1, int(max_attempts))
+    for attempt in range(1, attempts + 1):
+        sid = session_id if attempt == 1 else f"{session_id}_r{attempt}"
+        msgs = _with_compliance_retry_preamble(input_messages, attempt=attempt)
+        try:
+            full_text = await agent_worker_client.chat_collect_text(
+                user_id=user_id,
+                company=company,
+                session_id=sid,
+                input_messages=msgs,
+            )
+        except AgentWorkerError as exc:
+            last_text = str(exc)
+            logger.warning("%s 第 %s/%s 次调用失败: %s", purpose, attempt, attempts, exc)
+            if attempt >= attempts:
+                raise
+            await asyncio.sleep(delay_sec)
+            continue
+        if not _looks_like_ai_refusal(full_text):
+            if attempt > 1:
+                logger.info("%s 第 %s 次重试成功 session=%s", purpose, attempt, sid)
+            return full_text
+        last_text = full_text
+        logger.warning(
+            "%s 被助手拒答（%s/%s）session=%s preview=%s",
+            purpose,
+            attempt,
+            attempts,
+            sid,
+            (full_text or "")[:80],
+        )
+        if attempt < attempts:
+            await asyncio.sleep(delay_sec)
+    raise AiRefusalError(last_text or f"{purpose} 多次拒答")
+
+
+async def _classify_disposition_via_chat(
+    *,
+    user_id: str,
+    company: str,
+    session_id: str,
+    row: VehicleViolation,
+    video_eval_text: str,
+    video_violation: bool | None,
+) -> dict[str, Any] | None:
+    """在视频判定后追加「罚款/警告/误报」三选一问答，直接得到可展示的建议。"""
+    # 视频已明确无违章时不再多问一轮，直接误报
+    if video_violation is False:
+        return {
+            "process_type": "误报",
+            "amount": 0.0,
+            "basis": "无违章",
+            "suggestion_text": "罚单类型：误报\n罚单金额：-\n罚单依据：无违章",
+        }
+    prompt = _build_disposition_prompt(
+        row,
+        video_eval_text=video_eval_text,
+        video_violation=video_violation,
+    )
+    try:
+        full_text = await _chat_collect_with_retries(
+            user_id=user_id,
+            company=company,
+            session_id=f"{session_id}_disposition",
+            input_messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+            purpose="处罚建议三选一",
+        )
+    except (AgentWorkerError, AiRefusalError) as exc:
+        logger.warning("处罚建议三选一最终失败，改用视频结论兜底: %s", exc)
+        return None
+    parsed = _extract_json_block(full_text)
+    if parsed is None:
+        guessed = _normalize_disposition(full_text)
+        if not guessed:
+            return None
+        basis = "无违章" if guessed == "误报" else ""
+        return {
+            "process_type": guessed,
+            "amount": 0.0,
+            "basis": basis,
+            "suggestion_text": f"罚单类型：{guessed}\n罚单金额：-\n罚单依据：{basis}",
+        }
+    ticket = _ticket_from_parsed(parsed, full_text)
+    return ticket
+
+
+def _apply_ticket_info(existing: ViolationAiAssessment, ticket_info: dict[str, Any]) -> None:
+    existing.ticket_process_type = ticket_info.get("process_type") or existing.ticket_process_type
+    existing.ticket_amount = ticket_info.get("amount") if ticket_info.get("process_type") == "罚款" else 0.0
+    existing.ticket_basis = ticket_info.get("basis") or existing.ticket_basis
+    existing.ticket_suggestion_text = ticket_info.get("suggestion_text") or existing.ticket_suggestion_text
 
 
 async def _resolve_company_for_violation(db: AsyncSession, row: VehicleViolation) -> str:
@@ -370,40 +756,289 @@ async def _download_image_blocks(image_urls: list[str]) -> list[dict[str, Any]]:
     return blocks
 
 
-async def _video_preanalysis(
-    video_url: str,
+def _evaluation_from_video_result(v_result: dict[str, Any]) -> str:
+    """把 /api/video/violation 的 complete 结果拼成对话展示文案。"""
+    lines: list[str] = []
+    conclusion = sanitize_ai_display_text(v_result.get("conclusion"))
+    vtype = str(v_result.get("violation_type") or "").strip()
+    detail = sanitize_ai_display_text(v_result.get("violation_detail"))
+    analysis = sanitize_ai_display_text(v_result.get("analysis"))
+    is_v = v_result.get("violation")
+    if is_v is not None:
+        lines.append(f"是否违章：{'是' if bool(is_v) else '否'}")
+    if conclusion:
+        lines.append(conclusion)
+    if vtype and vtype != "无":
+        lines.append(f"违章类型：{vtype}")
+    if detail:
+        lines.append(detail)
+    if analysis and analysis not in (conclusion, detail):
+        # 原始 LLM 输出可能很长，仍保留供人工核对
+        lines.append(analysis)
+    return sanitize_ai_display_text("\n".join(lines)) or "视频违章判定未返回有效内容。"
+
+
+def _video_has_violation(v_result: dict[str, Any]) -> bool | None:
+    """从视频接口 complete 结果解析是否违章；无法判断时返回 None。"""
+    vtype = str(v_result.get("violation_type") or "").strip()
+    if vtype == "无":
+        vtype = ""
+    raw_v = v_result.get("violation")
+    if isinstance(raw_v, str):
+        low = raw_v.strip().lower()
+        if low in ("1", "true", "yes", "是"):
+            return True
+        if low in ("0", "false", "no", "否"):
+            return False
+        is_v = bool(raw_v.strip())
+    elif raw_v is None:
+        is_v = None
+    else:
+        is_v = bool(raw_v)
+    if is_v is True:
+        return True
+    if is_v is False:
+        return False
+    if vtype:
+        return True
+    if vtype == "" and "violation_type" in v_result:
+        return False
+    return None
+
+
+def _basis_from_video_result(v_result: dict[str, Any]) -> str:
+    """从视频判定结果提取简短罚单依据（优先违章类型，其次结论正文）。"""
+    vtype = str(v_result.get("violation_type") or "").strip()
+    if vtype == "无":
+        vtype = ""
+    if vtype:
+        return _summarize_basis(vtype)
+    conclusion = sanitize_ai_display_text(v_result.get("conclusion")) or ""
+    conclusion = re.sub(r"^是否违章[：:].*$", "", conclusion, flags=re.M).strip()
+    conclusion = re.sub(r"^存在违章行为\s*", "", conclusion).strip()
+    conclusion = re.sub(r"^未发现违章行为\s*", "", conclusion).strip()
+    return _summarize_basis(conclusion)
+
+
+def _ticket_suggestion_text(process_type: str, amount: float, basis: str) -> str:
+    return (
+        f"罚单类型：{process_type}\n"
+        f"罚单金额：{amount if process_type == '罚款' else '-'}\n"
+        f"罚单依据：{basis or '暂无建议'}"
+    )
+
+
+def _ticket_from_video_result(v_result: dict[str, Any]) -> dict[str, Any]:
+    """视频违章接口结果 → 罚单建议兜底（三选一 chat 失败时使用）。
+
+    有违章：默认「警告」；无违章：默认「误报」。
+    """
+    is_v = _video_has_violation(v_result)
+    if is_v is True:
+        process_type = "警告"
+        basis = _basis_from_video_result(v_result)
+    else:
+        process_type = "误报"
+        basis = _summarize_basis("无违章")
+    return {
+        "process_type": process_type,
+        "amount": 0.0,
+        "basis": basis,
+        "suggestion_text": _ticket_suggestion_text(process_type, 0.0, basis),
+    }
+
+
+async def _resolve_ticket_after_video(
     *,
     user_id: str,
     company: str,
-    violation_id: int,
-) -> tuple[str, bool]:
-    """返回 (视频预分析文本, 是否成功拿到视频)。"""
-    video_downloaded = False
-    try:
-        video_data, video_mime = await _download_media(video_url)
-        if len(video_data) > _MAX_VIDEO_BYTES:
-            raise ValueError("视频文件过大")
-        video_downloaded = True
-        ext = Path(_extract_url(video_url)).suffix.lower() or ".mp4"
-        v_result = await agent_worker_client.analyze_video_violation(
-            user_id=user_id,
-            company=company,
-            filename=f"evidence{ext}",
-            content=video_data,
-            content_type=video_mime,
-            session_id=f"violation_{violation_id}",
+    session_id: str,
+    row: VehicleViolation,
+    v_result: dict[str, Any],
+) -> dict[str, Any]:
+    """视频判定后自动追加罚款/警告/误报三选一，结果直接写入罚单建议。"""
+    eval_text = _evaluation_from_video_result(v_result)
+    fallback = _ticket_from_video_result(v_result)
+    ticket = await _classify_disposition_via_chat(
+        user_id=user_id,
+        company=company,
+        session_id=session_id,
+        row=row,
+        video_eval_text=eval_text,
+        video_violation=_video_has_violation(v_result),
+    )
+    if ticket is None:
+        return fallback
+    if not str(ticket.get("basis") or "").strip():
+        ticket["basis"] = fallback.get("basis") or ""
+        ticket["suggestion_text"] = _ticket_suggestion_text(
+            str(ticket.get("process_type") or "警告"),
+            float(ticket.get("amount") or 0),
+            str(ticket.get("basis") or ""),
         )
-        parts = [
-            f"结论：{v_result.get('conclusion')}" if v_result.get("conclusion") else "",
-            f"违章详情：{v_result.get('violation_detail')}" if v_result.get("violation_detail") else "",
-            f"分析：{v_result.get('analysis')}" if v_result.get("analysis") else "",
-        ]
-        return "\n".join(p for p in parts if p).strip(), True
-    except Exception as exc:
-        logger.warning("视频 AI 分析失败: %s", exc)
-        if video_downloaded:
-            return f"视频分析未完成：{exc}", True
-        return "", False
+    return ticket
+
+
+def _maybe_auto_false_alarm(row: VehicleViolation, process_type: str | None) -> bool:
+    """AI 建议为误报且记录仍为待处理时，自动落库为误报。"""
+    if (process_type or "").strip() != "误报":
+        return False
+    if (row.status or "").strip() != "待处理":
+        return False
+    row.status = "误报"
+    row.pre_audit_kind = "false_alarm"
+    row.handler_name = _AI_AUTO_FALSE_ALARM_HANDLER
+    row.handler_remark = _AI_AUTO_FALSE_ALARM_REMARK
+    row.handled_at = china_now_naive()
+    logger.info(
+        "AI评估建议误报，自动落库 status=误报 violation_id=%s plate=%s",
+        getattr(row, "id", None),
+        (row.plate_no or "").strip(),
+    )
+    return True
+
+
+async def backfill_ai_suggested_false_alarms(db: AsyncSession) -> int:
+    """将「AI 已建议误报但仍为待处理」的历史记录一次性落库为误报。"""
+    rows = (
+        await db.execute(
+            select(VehicleViolation, ViolationAiAssessment)
+            .join(ViolationAiAssessment, ViolationAiAssessment.violation_id == VehicleViolation.id)
+            .where(
+                VehicleViolation.status == "待处理",
+                ViolationAiAssessment.ticket_process_type == "误报",
+            )
+        )
+    ).all()
+    n = 0
+    for row, assessment in rows:
+        if _maybe_auto_false_alarm(row, assessment.ticket_process_type):
+            n += 1
+    if n:
+        await db.flush()
+        logger.info("回填 AI 建议误报 → 状态误报：%s 条", n)
+    return n
+
+
+def _assessment_looks_like_refusal(assessment: ViolationAiAssessment) -> bool:
+    """历史落库内容是否为助手拒答话术（应清掉重评）。"""
+    chunks = (
+        assessment.evaluation_text,
+        assessment.raw_response_text,
+        assessment.video_analysis_text,
+        assessment.ticket_suggestion_text,
+        assessment.ticket_basis,
+    )
+    for chunk in chunks:
+        text = (chunk or "").strip()
+        if not text:
+            continue
+        if _looks_like_ai_refusal(text):
+            return True
+    return False
+
+
+async def backfill_reset_refused_assessments(db: AsyncSession) -> int:
+    """清除「待处理 + 评估内容为拒答」的历史，重置为未评估，供定时器重新调度。"""
+    rows = (
+        await db.execute(
+            select(VehicleViolation, ViolationAiAssessment)
+            .join(ViolationAiAssessment, ViolationAiAssessment.violation_id == VehicleViolation.id)
+            .where(VehicleViolation.status == "待处理")
+        )
+    ).all()
+    n = 0
+    for row, assessment in rows:
+        if not _assessment_looks_like_refusal(assessment):
+            continue
+        await db.delete(assessment)
+        row.ai_queried = False
+        n += 1
+        logger.info(
+            "回捞拒答评估：清除后重评 violation_id=%s biz_no=%s plate=%s",
+            row.id,
+            (row.biz_no or "").strip(),
+            (row.plate_no or "").strip(),
+        )
+    if n:
+        await db.flush()
+        logger.info("回捞拒答评估：已重置 %s 条待处理记录，等待定时评估", n)
+    return n
+
+
+def _persist_assessment_fields(
+    existing: ViolationAiAssessment,
+    row: VehicleViolation,
+    *,
+    session_id: str,
+    evaluation_text: str,
+    ticket_info: dict[str, Any],
+    video_analysis_text: str,
+    raw_response_text: str,
+    company: str,
+    image_count: int,
+    has_video: bool,
+    evidence_valid: bool | None,
+    system_ok: bool | None,
+    violated_rules: list[Any],
+) -> bool:
+    existing.session_id = session_id
+    existing.evaluation_text = evaluation_text
+    existing.ticket_process_type = ticket_info["process_type"]
+    existing.ticket_amount = ticket_info["amount"]
+    existing.ticket_basis = ticket_info["basis"]
+    existing.ticket_suggestion_text = ticket_info["suggestion_text"]
+    existing.evidence_valid = evidence_valid
+    existing.system_judgment_correct = system_ok
+    existing.violated_rules_json = json.dumps(violated_rules, ensure_ascii=False)
+    existing.video_analysis_text = video_analysis_text
+    existing.raw_response_text = raw_response_text
+    existing.company_name = company
+    existing.alarm_type_name = row.violation_type_name or ""
+    existing.image_count = image_count
+    existing.has_video = has_video
+    row.ai_queried = True
+    return _maybe_auto_false_alarm(row, ticket_info.get("process_type"))
+
+
+async def _save_assessment_from_video(
+    db: AsyncSession,
+    row: VehicleViolation,
+    existing: ViolationAiAssessment | None,
+    *,
+    session_id: str,
+    v_result: dict[str, Any],
+    company: str,
+    image_count: int = 0,
+    ticket_info: dict[str, Any] | None = None,
+) -> tuple[ViolationAiAssessment, bool]:
+    if existing is None:
+        existing = ViolationAiAssessment(violation_id=row.id)
+        db.add(existing)
+    evaluation_text = _evaluation_from_video_result(v_result)
+    if ticket_info is None:
+        ticket_info = _ticket_from_video_result(v_result)
+    is_v = _video_has_violation(v_result)
+    vtype = str(v_result.get("violation_type") or "").strip()
+    rules: list[Any] = [vtype] if is_v is True and vtype and vtype != "无" else []
+    auto_false = _persist_assessment_fields(
+        existing,
+        row,
+        session_id=session_id,
+        evaluation_text=evaluation_text,
+        ticket_info=ticket_info,
+        video_analysis_text=evaluation_text,
+        raw_response_text=json.dumps(v_result, ensure_ascii=False)[:8000],
+        company=company,
+        image_count=image_count,
+        has_video=True,
+        evidence_valid=True,
+        system_ok=is_v if is_v is not None else None,
+        violated_rules=rules,
+    )
+    await db.flush()
+    await db.refresh(existing)
+    return existing, auto_false
 
 
 async def _save_assessment(
@@ -417,7 +1052,8 @@ async def _save_assessment(
     company: str,
     image_count: int,
     has_video: bool,
-) -> ViolationAiAssessment:
+) -> tuple[ViolationAiAssessment, bool]:
+    """chat 回退路径落库（仅无视频、仅图片时使用）。"""
     parsed = _extract_json_block(full_text)
     ticket_info = _ticket_from_parsed(parsed, full_text)
     evaluation_text = _compose_evaluation_text(parsed, full_text, video_analysis_text)
@@ -432,40 +1068,255 @@ async def _save_assessment(
         existing = ViolationAiAssessment(violation_id=row.id)
         db.add(existing)
 
-    existing.session_id = session_id
-    existing.evaluation_text = evaluation_text
-    existing.ticket_process_type = ticket_info["process_type"]
-    existing.ticket_amount = ticket_info["amount"]
-    existing.ticket_basis = ticket_info["basis"]
-    existing.ticket_suggestion_text = ticket_info["suggestion_text"]
-    existing.evidence_valid = evidence_valid if isinstance(evidence_valid, bool) else None
-    existing.system_judgment_correct = system_ok if isinstance(system_ok, bool) else None
-    existing.violated_rules_json = json.dumps(violated_rules, ensure_ascii=False)
-    existing.video_analysis_text = video_analysis_text
-    existing.raw_response_text = full_text
-    existing.company_name = company
-    existing.alarm_type_name = row.violation_type_name or ""
-    existing.image_count = image_count
-    existing.has_video = has_video
-
-    row.ai_queried = True
+    auto_false = _persist_assessment_fields(
+        existing,
+        row,
+        session_id=session_id,
+        evaluation_text=evaluation_text,
+        ticket_info=ticket_info,
+        video_analysis_text=video_analysis_text,
+        raw_response_text=full_text,
+        company=company,
+        image_count=image_count,
+        has_video=has_video,
+        evidence_valid=evidence_valid if isinstance(evidence_valid, bool) else None,
+        system_ok=system_ok if isinstance(system_ok, bool) else None,
+        violated_rules=violated_rules,
+    )
     await db.flush()
     await db.refresh(existing)
-    return existing
+    return existing, auto_false
 
 
 async def get_violation_ai_assessment(db: AsyncSession, violation_id: int) -> dict[str, Any]:
     row = await db.scalar(select(VehicleViolation).where(VehicleViolation.id == violation_id).limit(1))
-    if row is None:
+    if row is None or not violation_row_is_page_visible(row):
         raise HTTPException(status_code=404, detail="记录不存在")
     assessment = await db.scalar(
         select(ViolationAiAssessment).where(ViolationAiAssessment.violation_id == violation_id).limit(1)
     )
+    auto_false = False
+    if assessment is not None:
+        auto_false = _maybe_auto_false_alarm(row, assessment.ticket_process_type)
+        if auto_false:
+            await db.flush()
+            await db.refresh(row)
     return {
         "ok": True,
         "ai_queried": bool(getattr(row, "ai_queried", False)),
+        "auto_false_alarm": auto_false,
+        "status": (row.status or "").strip(),
         "assessment": _assessment_out(assessment),
     }
+
+
+async def _download_video_bytes(video_url: str) -> tuple[bytes, str, str]:
+    """下载视频，返回 (bytes, mime, filename_ext)。"""
+    video_data, video_mime = await _download_media(video_url)
+    if len(video_data) > _MAX_VIDEO_BYTES:
+        raise ValueError("视频文件过大")
+    ext = Path(_extract_url(video_url)).suffix.lower() or ".mp4"
+    return video_data, video_mime, ext
+
+
+def _alarm_type_display(row: VehicleViolation) -> str:
+    from app.jt808_alarm_sync import _strip_alarm_level_suffix
+
+    raw = (row.violation_type_name or "").strip()
+    return _strip_alarm_level_suffix(raw) or raw or "主动安全报警"
+
+
+def _build_text_rules_prompt(row: VehicleViolation) -> str:
+    """纯文本规章制度问答（不带抓拍图，避免被判敏感信息拒答）。"""
+    alarm = _alarm_type_display(row)
+    return (
+        "请做合规规章制度解答（车辆主动安全报警业务，属于车辆数据查询与制度问答范围）。\n"
+        f"{_alarm_context_block(row)}\n\n"
+        f"请查询本公司规章制度中与「{alarm}」相关的条款，并回答：\n"
+        "1. 该报警一般如何认定？\n"
+        "2. 制度上的处理原则是什么？\n"
+        "3. 综合本条业务字段，给出 process_type：只能是「罚款」「警告」「误报」三选一"
+        "（证据不足或无法确认事实→警告并注明需人工复核；明显误报→误报；需经济处罚→罚款）。\n"
+        "   basis 写清依据摘要。\n\n"
+        "回复末尾附带 JSON：\n"
+        "```json\n"
+        "{\n"
+        '  "evidence_valid": null,\n'
+        '  "system_judgment_correct": null,\n'
+        '  "evaluation_summary": "制度问答结论",\n'
+        '  "violated_rules": ["制度名称及条款"],\n'
+        '  "ticket_suggestion": {\n'
+        '    "process_type": "警告",\n'
+        '    "amount": 0,\n'
+        f'    "basis": "{alarm}"\n'
+        "  }\n"
+        "}\n"
+        "```\n"
+    )
+
+
+async def _run_text_rules_fallback_assessment(
+    db: AsyncSession,
+    row: VehicleViolation,
+    existing: ViolationAiAssessment | None,
+    *,
+    user_id: str,
+    company: str,
+    image_count: int = 0,
+) -> tuple[ViolationAiAssessment, bool]:
+    """图片被拒答后的兜底：不传图，只做规章制度文本问答并落库。"""
+    session_id = f"violation_assess_{row.id}_rules"
+    prompt = _build_text_rules_prompt(row)
+    full_text = await _chat_collect_with_retries(
+        user_id=user_id,
+        company=company,
+        session_id=session_id,
+        input_messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+        purpose="制度文本问答",
+        max_attempts=2,
+    )
+    note = (
+        "【说明】抓拍图片分析被助手拒答（可能含敏感画面），"
+        "已改为不传图的合规规章制度问答，请结合证据人工复核。\n\n"
+    )
+    return await _save_assessment(
+        db,
+        row,
+        existing,
+        session_id=session_id,
+        full_text=note + (full_text or ""),
+        video_analysis_text="",
+        company=company,
+        image_count=image_count,
+        has_video=False,
+    )
+
+
+async def _run_local_refusal_fallback_assessment(
+    db: AsyncSession,
+    row: VehicleViolation,
+    existing: ViolationAiAssessment | None,
+    *,
+    company: str,
+    image_count: int = 0,
+    reason: str = "",
+) -> tuple[ViolationAiAssessment, bool]:
+    """Worker 多次拒答时的兜底：落「误报」，并完整保留助手返回原文。"""
+    alarm = _alarm_type_display(row)
+    session_id = f"violation_assess_{row.id}_local"
+    refuse_text = (reason or "").strip() or "（助手未返回正文）"
+    basis = "助手拒答"
+    ticket_info = {
+        "process_type": "误报",
+        "amount": 0.0,
+        "basis": basis,
+        "suggestion_text": _ticket_suggestion_text("误报", 0.0, basis),
+    }
+    evaluation = (
+        "【说明】车联网助手对本条多次返回服务范围拒答，系统按误报处理。\n"
+        f"- 报警类型：{alarm}\n"
+        f"- 车牌：{(row.plate_no or '').strip() or '—'}\n"
+        f"- 处理：误报\n\n"
+        "【AI 返回原文】\n"
+        f"{refuse_text}\n"
+    )
+
+    if existing is None:
+        existing = ViolationAiAssessment(violation_id=row.id)
+        db.add(existing)
+    auto_false = _persist_assessment_fields(
+        existing,
+        row,
+        session_id=session_id,
+        evaluation_text=evaluation,
+        ticket_info=ticket_info,
+        video_analysis_text="",
+        raw_response_text=refuse_text[:8000],
+        company=company,
+        image_count=image_count,
+        has_video=False,
+        evidence_valid=False,
+        system_ok=False,
+        violated_rules=[],
+    )
+    await db.flush()
+    await db.refresh(existing)
+    logger.warning(
+        "AI多次拒答，已落库误报并保留原文 violation_id=%s plate=%s auto_false=%s",
+        row.id,
+        (row.plate_no or "").strip(),
+        auto_false,
+    )
+    return existing, auto_false
+
+
+async def _run_chat_fallback_assessment(
+    db: AsyncSession,
+    row: VehicleViolation,
+    existing: ViolationAiAssessment | None,
+    *,
+    user_id: str,
+    company: str,
+    image_blocks: list[dict[str, Any]],
+) -> tuple[ViolationAiAssessment, bool]:
+    """无视频仅有图片时回退 /api/chat。
+
+    1) 带图评估 → 2) 拒答则无图制度问答 → 3) 仍拒答则本地落库（警告），保证调度不卡死。
+    """
+    session_id = f"violation_assess_{row.id}"
+    prompt = _build_prompt(
+        row,
+        video_analysis="",
+        image_count=len(image_blocks),
+        has_video=False,
+    )
+    content_blocks: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    content_blocks.extend(image_blocks)
+    last_refuse = ""
+    try:
+        full_text = await _chat_collect_with_retries(
+            user_id=user_id,
+            company=company,
+            session_id=session_id,
+            input_messages=[{"role": "user", "content": content_blocks}],
+            purpose="图片评估",
+            max_attempts=2,
+        )
+        return await _save_assessment(
+            db,
+            row,
+            existing,
+            session_id=session_id,
+            full_text=full_text,
+            video_analysis_text="",
+            company=company,
+            image_count=len(image_blocks),
+            has_video=False,
+        )
+    except AiRefusalError as exc:
+        last_refuse = str(exc)
+        logger.warning("图片评估拒答，改走无图制度问答 violation_id=%s", row.id)
+
+    try:
+        return await _run_text_rules_fallback_assessment(
+            db,
+            row,
+            existing,
+            user_id=user_id,
+            company=company,
+            image_count=len(image_blocks),
+        )
+    except AiRefusalError as exc:
+        last_refuse = str(exc) or last_refuse
+        logger.warning("制度问答仍拒答，改本地落库 violation_id=%s", row.id)
+        return await _run_local_refusal_fallback_assessment(
+            db,
+            row,
+            existing,
+            company=company,
+            image_count=len(image_blocks),
+            reason=last_refuse,
+        )
 
 
 async def run_violation_ai_assessment(
@@ -475,81 +1326,112 @@ async def run_violation_ai_assessment(
     user_id: str,
     force: bool = False,
 ) -> dict[str, Any]:
+    """主动安全 AI 评估：有视频主调 Worker /api/video/violation；仅图片时回退 chat。"""
     if not agent_worker_client.configured():
         raise HTTPException(status_code=503, detail="Agent Worker 未配置")
 
     row = await db.scalar(select(VehicleViolation).where(VehicleViolation.id == violation_id).limit(1))
-    if row is None:
+    if row is None or not violation_row_is_page_visible(row):
         raise HTTPException(status_code=404, detail="记录不存在")
 
     existing = await db.scalar(
         select(ViolationAiAssessment).where(ViolationAiAssessment.violation_id == violation_id).limit(1)
     )
     if bool(getattr(row, "ai_queried", False)) and existing and not force:
+        auto_false = _maybe_auto_false_alarm(row, existing.ticket_process_type)
+        if auto_false:
+            await db.flush()
+            await db.refresh(row)
         return {
             "ok": True,
             "cached": True,
             "ai_queried": True,
+            "auto_false_alarm": auto_false,
+            "status": (row.status or "").strip(),
             "assessment": _assessment_out(existing),
         }
 
     company = await _resolve_company_for_violation(db, row)
-
     image_urls, video_url = _gather_media_refs(row)
     if not image_urls and not video_url:
         return _skip_response(reason="暂无图片或视频证据，已跳过 AI 分析")
 
-    image_blocks = await _download_image_blocks(image_urls)
+    session_id = f"violation_assess_{violation_id}"
 
-    video_analysis_text = ""
-    has_video = False
+    # 主路径：视频违章判定接口
     if video_url:
-        video_analysis_text, has_video = await _video_preanalysis(
-            video_url, user_id=user_id, company=company, violation_id=violation_id
-        )
+        try:
+            video_data, video_mime, ext = await _download_video_bytes(video_url)
+            v_result = await agent_worker_client.analyze_video_violation(
+                user_id=user_id,
+                company=company,
+                filename=f"evidence{ext}",
+                content=video_data,
+                content_type=video_mime,
+                session_id=session_id,
+                extra_fields=_alarm_extra_form_fields(row),
+            )
+            if _video_result_is_refusal(v_result):
+                raise AiRefusalError("视频违章判定返回拒答文案")
+            ticket_info = await _resolve_ticket_after_video(
+                user_id=user_id,
+                company=company,
+                session_id=session_id,
+                row=row,
+                v_result=v_result,
+            )
+            existing, auto_false = await _save_assessment_from_video(
+                db,
+                row,
+                existing,
+                session_id=session_id,
+                v_result=v_result,
+                company=company,
+                image_count=len(image_urls),
+                ticket_info=ticket_info,
+            )
+            return {
+                "ok": True,
+                "cached": False,
+                "ai_queried": True,
+                "source": "video_violation",
+                "auto_false_alarm": auto_false,
+                "status": (row.status or "").strip(),
+                "assessment": _assessment_out(existing),
+            }
+        except AiRefusalError as exc:
+            # 视频拒答不落库，有图则继续回退；无图则向上抛给调度器稍后重试
+            logger.warning("视频违章判定拒答，尝试图片 chat 回退: %s", exc)
+            if not image_urls:
+                raise
+        except Exception as exc:
+            logger.warning("视频违章判定失败，尝试图片 chat 回退: %s", exc)
 
-    if not image_blocks and not has_video:
+    image_blocks = await _download_image_blocks(image_urls)
+    if not image_blocks:
         return _skip_response(reason="证据下载失败或全部为空，已跳过 AI 分析")
 
-    session_id = f"violation_assess_{violation_id}"
-    prompt = _build_prompt(
-        alarm_type=row.violation_type_name or "",
-        plate_no=row.plate_no or "",
-        violation_time=row.violation_time.strftime("%Y-%m-%d %H:%M:%S") if row.violation_time else "",
-        biz_no=row.biz_no or "",
-        video_analysis=video_analysis_text,
-        image_count=len(image_blocks),
-        has_video=has_video,
-    )
-    content_blocks: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    content_blocks.extend(image_blocks)
-
     try:
-        full_text = await agent_worker_client.chat_collect_text(
+        existing, auto_false = await _run_chat_fallback_assessment(
+            db,
+            row,
+            existing,
             user_id=user_id,
             company=company,
-            session_id=session_id,
-            input_messages=[{"role": "user", "content": content_blocks}],
+            image_blocks=image_blocks,
         )
+    except AiRefusalError:
+        raise
     except AgentWorkerError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    existing = await _save_assessment(
-        db,
-        row,
-        existing,
-        session_id=session_id,
-        full_text=full_text,
-        video_analysis_text=video_analysis_text,
-        company=company,
-        image_count=len(image_blocks),
-        has_video=has_video,
-    )
 
     return {
         "ok": True,
         "cached": False,
         "ai_queried": True,
+        "source": "chat_fallback",
+        "auto_false_alarm": auto_false,
+        "status": (row.status or "").strip(),
         "assessment": _assessment_out(existing),
     }
 
@@ -564,9 +1446,10 @@ async def stream_violation_ai_assessment(
     user_id: str,
     force: bool = False,
 ) -> AsyncIterator[bytes]:
-    """SSE 流式版 AI 评估：边生成边推送文本增量，完成后落库并推送最终结果。
+    """SSE 流式 AI 评估。
 
-    自管数据库会话（StreamingResponse 场景下不依赖 get_db）。
+    有视频：主调 Worker ``POST /api/video/violation``（SSE），不再用 chat 做违章判定。
+    仅图片：回退 ``/api/chat``（文档无图片违章接口）。
     """
     if not agent_worker_client.configured():
         yield _sse({"object": "error", "message": "Agent Worker 未配置（AGENT_WORKER_BASE_URL）"})
@@ -577,7 +1460,7 @@ async def stream_violation_ai_assessment(
             row = await db.scalar(
                 select(VehicleViolation).where(VehicleViolation.id == violation_id).limit(1)
             )
-            if row is None:
+            if row is None or not violation_row_is_page_visible(row):
                 yield _sse({"object": "error", "message": "记录不存在"})
                 return
 
@@ -587,11 +1470,17 @@ async def stream_violation_ai_assessment(
                 .limit(1)
             )
             if bool(getattr(row, "ai_queried", False)) and existing and not force:
+                auto_false = _maybe_auto_false_alarm(row, existing.ticket_process_type)
+                if auto_false:
+                    await db.commit()
+                    await db.refresh(row)
                 yield _sse(
                     {
                         "object": "assessment",
                         "cached": True,
                         "ai_queried": True,
+                        "auto_false_alarm": auto_false,
+                        "status": (row.status or "").strip(),
                         "assessment": _assessment_out(existing),
                     }
                 )
@@ -612,85 +1501,215 @@ async def stream_violation_ai_assessment(
                 yield _sse({"object": "skip", "reason": "暂无图片或视频证据，已跳过 AI 分析"})
                 return
 
-            yield _sse({"object": "status", "stage": "download", "message": "正在下载图片/视频证据…"})
-            image_blocks = await _download_image_blocks(image_urls)
+            session_id = f"violation_assess_{violation_id}"
 
-            video_analysis_text = ""
-            has_video = False
+            # ---------- 主路径：/api/video/violation ----------
             if video_url:
-                yield _sse({"object": "status", "stage": "video", "message": "正在进行视频违章预分析…"})
-                video_analysis_text, has_video = await _video_preanalysis(
-                    video_url, user_id=user_id, company=company, violation_id=violation_id
-                )
+                yield _sse({"object": "status", "stage": "download", "message": "正在下载视频证据…"})
+                try:
+                    video_data, video_mime, ext = await _download_video_bytes(video_url)
+                except Exception as exc:
+                    logger.warning("下载视频失败: %s", exc)
+                    video_data = b""
+                    video_mime = ""
+                    ext = ".mp4"
 
-            if not image_blocks and not has_video:
+                if video_data:
+                    yield _sse(
+                        {
+                            "object": "status",
+                            "stage": "video",
+                            "message": "正在调用视频违章判定接口…",
+                        }
+                    )
+                    text_parts: list[str] = []
+                    v_result: dict[str, Any] | None = None
+                    try:
+                        async for ev in agent_worker_client.analyze_video_violation_stream(
+                            user_id=user_id,
+                            company=company,
+                            filename=f"evidence{ext}",
+                            content=video_data,
+                            content_type=video_mime,
+                            session_id=session_id,
+                            extra_fields=_alarm_extra_form_fields(row),
+                        ):
+                            obj = str(ev.get("object") or "")
+                            if obj == "delta":
+                                # 进度/文本增量推给前端气泡
+                                if ev.get("type") == "text" and ev.get("text"):
+                                    text_parts.append(str(ev["text"]))
+                                    yield _sse(
+                                        {
+                                            "object": "content",
+                                            "type": "text",
+                                            "delta": True,
+                                            "text": ev["text"],
+                                        }
+                                    )
+                                elif ev.get("type") == "tool_call":
+                                    name = str(ev.get("name") or "tool")
+                                    status = str(ev.get("status") or "")
+                                    tip = f"[{name} {status}]".strip()
+                                    yield _sse(
+                                        {
+                                            "object": "status",
+                                            "stage": "video",
+                                            "message": tip,
+                                        }
+                                    )
+                            elif obj == "complete":
+                                v_result = dict(ev)
+                                v_result.pop("object", None)
+                            elif obj == "error":
+                                raise AgentWorkerError(
+                                    str(ev.get("detail") or ev.get("message") or "视频违章判定失败")
+                                )
+                    except AgentWorkerError as exc:
+                        logger.warning("视频违章判定 SSE 失败: %s", exc)
+                        v_result = None
+                        yield _sse(
+                            {
+                                "object": "status",
+                                "stage": "video",
+                                "message": f"视频判定失败，尝试图片分析…（{exc}）",
+                            }
+                        )
+
+                    if v_result is not None and _video_result_is_refusal(v_result):
+                        logger.warning("流式视频判定拒答，改走图片回退")
+                        v_result = None
+                        yield _sse(
+                            {
+                                "object": "status",
+                                "stage": "video",
+                                "message": "视频判定被拒答，正在重试图片分析…",
+                            }
+                        )
+
+                    if v_result is not None:
+                        # 若流里没有文本增量，把结论补推到气泡
+                        eval_text = _evaluation_from_video_result(v_result)
+                        if not text_parts and eval_text:
+                            yield _sse(
+                                {
+                                    "object": "content",
+                                    "type": "text",
+                                    "delta": True,
+                                    "text": eval_text,
+                                }
+                            )
+                        # 无违章直接误报；有违章再追问一轮「罚款/警告/误报」
+                        if _video_has_violation(v_result) is not False:
+                            yield _sse(
+                                {
+                                    "object": "status",
+                                    "stage": "disposition",
+                                    "message": "正在判定处罚建议（罚款 / 警告 / 误报）…",
+                                }
+                            )
+                        ticket_info = await _resolve_ticket_after_video(
+                            user_id=user_id,
+                            company=company,
+                            session_id=session_id,
+                            row=row,
+                            v_result=v_result,
+                        )
+                        existing, auto_false = await _save_assessment_from_video(
+                            db,
+                            row,
+                            existing,
+                            session_id=session_id,
+                            v_result=v_result,
+                            company=company,
+                            image_count=len(image_urls),
+                            ticket_info=ticket_info,
+                        )
+                        await db.commit()
+                        yield _sse(
+                            {
+                                "object": "assessment",
+                                "cached": False,
+                                "ai_queried": True,
+                                "source": "video_violation",
+                                "auto_false_alarm": auto_false,
+                                "status": (row.status or "").strip(),
+                                "assessment": _assessment_out(existing),
+                            }
+                        )
+                        return
+
+            # ---------- 回退：仅图片走 /api/chat ----------
+            yield _sse({"object": "status", "stage": "download", "message": "正在下载图片证据…"})
+            image_blocks = await _download_image_blocks(image_urls)
+            if not image_blocks:
                 yield _sse({"object": "skip", "reason": "证据下载失败或全部为空，已跳过 AI 分析"})
                 return
 
-            session_id = f"violation_assess_{violation_id}"
+            yield _sse(
+                {
+                    "object": "status",
+                    "stage": "chat",
+                    "message": "正在图片对话分析（若被拒答将自动多问几轮）…",
+                }
+            )
             prompt = _build_prompt(
-                alarm_type=row.violation_type_name or "",
-                plate_no=row.plate_no or "",
-                violation_time=row.violation_time.strftime("%Y-%m-%d %H:%M:%S") if row.violation_time else "",
-                biz_no=row.biz_no or "",
-                video_analysis=video_analysis_text,
+                row,
+                video_analysis="",
                 image_count=len(image_blocks),
-                has_video=has_video,
+                has_video=False,
             )
             content_blocks: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
             content_blocks.extend(image_blocks)
 
-            yield _sse({"object": "status", "stage": "chat", "message": "AI 正在评估证据并生成罚单建议…"})
+            source = "chat_fallback"
+            try:
+                existing, auto_false = await _run_chat_fallback_assessment(
+                    db,
+                    row,
+                    existing,
+                    user_id=user_id,
+                    company=company,
+                    image_blocks=image_blocks,
+                )
+                if (existing.session_id or "").endswith("_rules"):
+                    source = "text_rules_fallback"
+                elif (existing.session_id or "").endswith("_local"):
+                    source = "local_refusal_fallback"
+                eval_text = (existing.evaluation_text or "").strip()
+                if eval_text:
+                    yield _sse({"object": "content", "type": "text", "delta": True, "text": eval_text})
+            except AiRefusalError as exc:
+                # 理论上 chat 回退已含本地兜底；此处再兜一层
+                yield _sse(
+                    {
+                        "object": "status",
+                        "stage": "chat",
+                        "message": "助手拒答，已生成本地待复核建议…",
+                    }
+                )
+                source = "local_refusal_fallback"
+                existing, auto_false = await _run_local_refusal_fallback_assessment(
+                    db,
+                    row,
+                    existing,
+                    company=company,
+                    image_count=len(image_blocks),
+                    reason=str(exc),
+                )
+                eval_text = (existing.evaluation_text or "").strip()
+                if eval_text:
+                    yield _sse({"object": "content", "type": "text", "delta": True, "text": eval_text})
 
-            buffer = ""
-            parts: list[str] = []
-            async for chunk in agent_worker_client.chat_stream(
-                user_id=user_id,
-                company=company,
-                session_id=session_id,
-                input_messages=[{"role": "user", "content": content_blocks}],
-                stream=True,
-            ):
-                buffer += chunk.decode("utf-8", "replace")
-                while "\n\n" in buffer:
-                    block, buffer = buffer.split("\n\n", 1)
-                    line = next(
-                        (ln.strip() for ln in block.split("\n") if ln.strip().startswith("data:")),
-                        "",
-                    )
-                    if not line:
-                        continue
-                    try:
-                        evj = json.loads(line[5:].strip())
-                    except json.JSONDecodeError:
-                        continue
-                    if (
-                        evj.get("object") == "content"
-                        and evj.get("type") == "text"
-                        and evj.get("delta")
-                        and evj.get("text")
-                    ):
-                        parts.append(str(evj["text"]))
-                        yield _sse({"object": "content", "type": "text", "delta": True, "text": evj["text"]})
-
-            full_text = "".join(parts)
-            existing = await _save_assessment(
-                db,
-                row,
-                existing,
-                session_id=session_id,
-                full_text=full_text,
-                video_analysis_text=video_analysis_text,
-                company=company,
-                image_count=len(image_blocks),
-                has_video=has_video,
-            )
             await db.commit()
             yield _sse(
                 {
                     "object": "assessment",
                     "cached": False,
                     "ai_queried": True,
+                    "source": source,
+                    "auto_false_alarm": auto_false,
+                    "status": (row.status or "").strip(),
                     "assessment": _assessment_out(existing),
                 }
             )

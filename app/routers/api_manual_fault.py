@@ -1,16 +1,37 @@
-"""人工报障：录入与处理。"""
+"""人工报障：录入、审核与单据上传（待审核 → 审核通过 → 已完结 / 驳回）。"""
 from __future__ import annotations
 
 import secrets
 from datetime import datetime
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.device_fault_service import update_manual_fault_report_handle
+from app.device_fault_service import (
+    device_fault_receipt_safe_ext,
+    gen_receipt_stored_name,
+    get_manual_fault_by_id,
+    get_manual_fault_image_by_id,
+    get_manual_fault_receipt_by_id,
+    guess_image_media_type,
+    insert_manual_fault_image,
+    insert_manual_fault_receipt,
+    jt_device_fault_receipt_eligible,
+    list_manual_fault_images,
+    list_manual_fault_receipts,
+    manual_fault_image_safe_ext,
+    manual_fault_images_root,
+    manual_fault_receipts_root,
+    mark_fault_awaiting_final_review,
+    resolve_manual_fault_image_file_path,
+    resolve_manual_fault_receipt_file_path,
+    update_manual_fault_report_handle,
+)
 from app.models import (
     FaultTypeDict,
     JtDeviceFault,
@@ -28,6 +49,9 @@ from app.timeutil import china_now_naive
 router = APIRouter(prefix="/api/manual-fault", tags=["manual-fault"])
 
 _ALLOWED_LEVEL = frozenset({"高", "中", "低"})
+_MANUAL_FAULT_RECEIPT_MAX_BYTES = 10 * 1024 * 1024
+_MANUAL_FAULT_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+_MANUAL_FAULT_IMAGE_MAX_COUNT = 12
 
 
 def _gen_biz_no() -> str:
@@ -158,12 +182,9 @@ async def manual_fault_create(
     ft = await db.get(FaultTypeDict, int(body.fault_type_dict_id))
     if ft is None:
         raise HTTPException(status_code=400, detail="所选故障类型不存在，请刷新页面后重新选择")
-    level = (body.fault_level or "").strip()
-    if level not in _ALLOWED_LEVEL:
-        raise HTTPException(status_code=400, detail="故障级别须为高、中、低")
+    # 等级以故障类型字典为准，避免前端树选/映射偏差导致无法提交
     dict_level = (ft.fault_level or "").strip() or "中"
-    if dict_level != level:
-        raise HTTPException(status_code=400, detail="故障级别与所选故障类型不一致，请重新选择故障类型")
+    level = dict_level if dict_level in _ALLOWED_LEVEL else "中"
 
     plate = norm_plate(body.plate_no)
     if not plate:
@@ -172,12 +193,10 @@ async def manual_fault_create(
     if body.vehicle_id is not None:
         r_id = await db.execute(select(Vehicle).where(Vehicle.id == int(body.vehicle_id)))
         v_pick = r_id.scalar_one_or_none()
-        if v_pick is None:
-            raise HTTPException(status_code=400, detail="所选车辆不存在，请重新从列表选择")
-        if norm_plate(v_pick.plate_no) != plate:
-            raise HTTPException(status_code=400, detail="所选车辆与当前填写车牌不一致，请重新从列表选择")
-        v = v_pick
-    else:
+        # 前端车辆树常传 JT808 car_id，可能对不上本地 vehicle.id；仅在 id+车牌都匹配时采用
+        if v_pick is not None and norm_plate(v_pick.plate_no) == plate:
+            v = v_pick
+    if v is None:
         vr = await db.execute(select(Vehicle).where(Vehicle.plate_no == plate))
         v = vr.scalar_one_or_none()
         if v is None:
@@ -210,7 +229,7 @@ async def manual_fault_create(
         fault_phenomenon=(body.fault_phenomenon or "").strip() or None,
         fault_location=(body.fault_location or "").strip()[:256] or None,
         affect_service=int(body.affect_service),
-        handle_status="未处理",
+        handle_status="待审核",
     )
     db.add(row)
     await db.commit()
@@ -236,3 +255,158 @@ async def manual_fault_handle_put(
     if not ok:
         raise HTTPException(status_code=400, detail=err or "更新失败")
     return {"ok": True}
+
+
+@router.get("/receipts/list")
+async def api_list_manual_fault_receipts(
+    fault_id: int | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    rows, total = await list_manual_fault_receipts(db, fault_id=fault_id, page=page, page_size=page_size)
+    return {"ok": True, "items": rows, "total": total}
+
+
+@router.get("/receipts/{receipt_id}/download")
+async def download_manual_fault_receipt_file(receipt_id: int, db: AsyncSession = Depends(get_db)):
+    meta = await get_manual_fault_receipt_by_id(db, receipt_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="单据不存在")
+    p = resolve_manual_fault_receipt_file_path(int(meta["fault_id"]), str(meta["stored_name"]))
+    if p is None:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    name = str(meta.get("original_name") or Path(p).name)
+    media = guess_image_media_type(name, meta.get("mime_type") or "application/octet-stream")
+    return FileResponse(path=p, filename=name, media_type=media)
+
+
+@router.get("/{fault_id}/images")
+async def api_list_manual_fault_images(fault_id: int, db: AsyncSession = Depends(get_db)):
+    row = await get_manual_fault_by_id(db, fault_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="报障记录不存在")
+    items = await list_manual_fault_images(db, fault_id=fault_id)
+    return {"ok": True, "items": items, "total": len(items)}
+
+
+@router.get("/images/{image_id}/view")
+async def view_manual_fault_image(image_id: int, db: AsyncSession = Depends(get_db)):
+    meta = await get_manual_fault_image_by_id(db, image_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="图片不存在")
+    p = resolve_manual_fault_image_file_path(int(meta["fault_id"]), str(meta["stored_name"]))
+    if p is None:
+        raise HTTPException(status_code=404, detail="图片文件不存在")
+    name = str(meta.get("original_name") or Path(p).name)
+    media = guess_image_media_type(name, meta.get("mime_type"))
+    return FileResponse(path=p, filename=name, media_type=media)
+
+
+@router.post("/{fault_id}/images")
+async def upload_manual_fault_images(
+    fault_id: int,
+    files: list[UploadFile] = File(...),
+    uploader_name: str | None = Form(None),
+    db: AsyncSession = Depends(get_db),
+):
+    row = await get_manual_fault_by_id(db, fault_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="报障记录不存在")
+    if not files:
+        raise HTTPException(status_code=400, detail="请选择至少一张图片")
+    existing = await list_manual_fault_images(db, fault_id=fault_id)
+    if len(existing) + len(files) > _MANUAL_FAULT_IMAGE_MAX_COUNT:
+        raise HTTPException(status_code=400, detail=f"设备图片最多 {_MANUAL_FAULT_IMAGE_MAX_COUNT} 张")
+
+    root = manual_fault_images_root()
+    fault_dir = root / str(fault_id)
+    fault_dir.mkdir(parents=True, exist_ok=True)
+    biz = row.get("biz_no") or ""
+    uname = (uploader_name or "").strip()[:64] or None
+    saved: list[dict] = []
+
+    for uf in files:
+        ext = manual_fault_image_safe_ext(uf.filename)
+        if not ext:
+            raise HTTPException(status_code=400, detail=f"仅支持图片文件: {uf.filename}")
+        orig = (uf.filename or "image").replace("\\", "/").split("/")[-1][:255]
+        content = await uf.read()
+        if not content:
+            raise HTTPException(status_code=400, detail=f"文件为空: {orig}")
+        if len(content) > _MANUAL_FAULT_IMAGE_MAX_BYTES:
+            raise HTTPException(status_code=400, detail=f"图片 {orig} 超过 10MB")
+        stored = gen_receipt_stored_name(ext)
+        dest = fault_dir / stored
+        dest.write_bytes(content)
+        mime = guess_image_media_type(orig, uf.content_type)
+        iid = await insert_manual_fault_image(
+            db,
+            fault_id=fault_id,
+            biz_no=biz,
+            stored_name=stored,
+            original_name=orig,
+            file_size=len(content),
+            mime_type=mime,
+            uploader_name=uname,
+        )
+        one = await get_manual_fault_image_by_id(db, iid)
+        if one:
+            saved.append(one)
+
+    await db.commit()
+    return {"ok": True, "saved": saved, "items": saved}
+
+
+@router.post("/{fault_id}/receipts")
+async def upload_manual_fault_receipts(
+    fault_id: int,
+    files: list[UploadFile] = File(...),
+    uploader_name: str | None = Form(None),
+    db: AsyncSession = Depends(get_db),
+):
+    row = await get_manual_fault_by_id(db, fault_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="报障记录不存在")
+    if not jt_device_fault_receipt_eligible(row.get("handle_status")):
+        raise HTTPException(status_code=400, detail="仅审核通过后的报障可上传单据")
+    if not files:
+        raise HTTPException(status_code=400, detail="请选择至少一个文件")
+
+    root = manual_fault_receipts_root()
+    fault_dir = root / str(fault_id)
+    fault_dir.mkdir(parents=True, exist_ok=True)
+    biz = row.get("biz_no") or ""
+    uname = (uploader_name or "").strip()[:64] or None
+    saved: list[dict] = []
+
+    for uf in files:
+        ext = device_fault_receipt_safe_ext(uf.filename)
+        if not ext:
+            raise HTTPException(status_code=400, detail=f"不支持的文件类型: {uf.filename}")
+        orig = (uf.filename or "file").replace("\\", "/").split("/")[-1][:255]
+        content = await uf.read()
+        if len(content) > _MANUAL_FAULT_RECEIPT_MAX_BYTES:
+            raise HTTPException(status_code=400, detail=f"文件 {orig} 超过 10MB")
+        stored = gen_receipt_stored_name(ext)
+        dest = fault_dir / stored
+        dest.write_bytes(content)
+        rid = await insert_manual_fault_receipt(
+            db,
+            fault_id=fault_id,
+            biz_no=biz,
+            stored_name=stored,
+            original_name=orig,
+            file_size=len(content),
+            mime_type=uf.content_type,
+            uploader_name=uname,
+        )
+        one = await get_manual_fault_receipt_by_id(db, rid)
+        if one:
+            saved.append(one)
+
+    orm = await db.get(ManualFaultReport, int(fault_id))
+    if orm is not None:
+        await mark_fault_awaiting_final_review(orm)
+    await db.commit()
+    return {"ok": True, "saved": saved}

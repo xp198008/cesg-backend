@@ -134,7 +134,13 @@ async def resolve_allowed_vehicle_ids(
     db: AsyncSession,
     user_id: int | None,
 ) -> set[int] | None:
-    """返回 None 表示不做车辆 id 限制；返回 set 表示仅可见集合内车辆（可为空）。"""
+    """返回 None 表示不做车辆 id 限制；返回 set 表示仅可见集合内车辆（可为空）。
+
+    与 monitor-scope / 业务说明对齐：
+    - admin：None（不限制）
+    - 未绑定分配规则：所属组织树内车辆
+    - 已绑定规则：规则管控车辆并集
+    """
     if user_id is None:
         return None
 
@@ -145,28 +151,28 @@ async def resolve_allowed_vehicle_ids(
         .limit(1)
     )
     if user is None or not user.is_active:
-        return None
-    if _is_admin_user(user):
-        return None
+        return set()
 
-    rule_ids = list(
-        (
-            await db.execute(
-                select(VehicleAllocRuleUser.rule_id).where(VehicleAllocRuleUser.user_id == user.id)
-            )
-        ).scalars().all()
-    )
-    if not rule_ids:
+    vehicle_ids, unrestricted = await _resolve_scope_vehicle_ids(db, user)
+    if unrestricted:
         return None
+    return vehicle_ids
 
-    vehicle_ids = (
-        await db.execute(
-            select(VehicleAllocRuleVehicle.vehicle_id).where(
-                VehicleAllocRuleVehicle.rule_id.in_(rule_ids)
-            )
-        )
+
+async def resolve_allowed_plate_nos(
+    db: AsyncSession,
+    user_id: int | None,
+) -> set[str] | None:
+    """车牌可见范围；None=不限制，空 set=无可见车辆。"""
+    allowed_ids = await resolve_allowed_vehicle_ids(db, user_id)
+    if allowed_ids is None:
+        return None
+    if not allowed_ids:
+        return set()
+    rows = (
+        await db.execute(select(Vehicle.plate_no).where(Vehicle.id.in_(allowed_ids)))
     ).scalars().all()
-    return {int(vid) for vid in vehicle_ids}
+    return {(p or "").strip() for p in rows if (p or "").strip()}
 
 
 def apply_vehicle_id_scope(query, allowed_ids: set[int] | None):
@@ -191,10 +197,98 @@ def _normalize_device_no(raw: str | None) -> set[str]:
     return out
 
 
+def _lookup_jt808_plate_car_id_map(plates: list[str]) -> dict[str, int]:
+    """车牌 → 808 tgps_car.id（成对返回，避免与 car_ids 列表错位）。"""
+    cleaned = [str(p).strip() for p in plates if str(p).strip()]
+    if not cleaned:
+        return {}
+    try:
+        conn = pymysql.connect(
+            host=settings.jt808_mysql_host,
+            port=int(settings.jt808_mysql_port),
+            user=settings.jt808_mysql_user,
+            password=settings.jt808_mysql_password,
+            database=settings.jt808_mysql_database,
+            charset="utf8mb4",
+            connect_timeout=min(8.0, settings.jt808_sync_timeout),
+            read_timeout=10,
+            write_timeout=10,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("监控范围 808 车牌映射查询跳过: %s", e)
+        return {}
+    try:
+        result: dict[str, int] = {}
+        with conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(cleaned))
+            cur.execute(
+                f"select id, carno from tgps_car where carno in ({placeholders})",
+                cleaned,
+            )
+            for cid, carno in cur.fetchall():
+                plate = str(carno or "").strip()
+                if cid is None or not plate:
+                    continue
+                result[plate] = int(cid)
+        return result
+    except Exception as e:  # noqa: BLE001
+        logger.debug("监控范围 808 车牌映射查询失败: %s", e)
+        return {}
+    finally:
+        conn.close()
+
+
+def _lookup_jt808_car_id_plate_map(car_ids: list[int]) -> dict[int, str]:
+    """808 car_id → 车牌（仅作风险计数对齐键，不含公司/司机）。"""
+    ids = sorted({int(x) for x in car_ids if x})
+    if not ids:
+        return {}
+    try:
+        conn = pymysql.connect(
+            host=settings.jt808_mysql_host,
+            port=int(settings.jt808_mysql_port),
+            user=settings.jt808_mysql_user,
+            password=settings.jt808_mysql_password,
+            database=settings.jt808_mysql_database,
+            charset="utf8mb4",
+            connect_timeout=min(8.0, settings.jt808_sync_timeout),
+            read_timeout=10,
+            write_timeout=10,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("监控范围 808 car_id 反查跳过: %s", e)
+        return {}
+    try:
+        result: dict[int, str] = {}
+        with conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(ids))
+            cur.execute(
+                f"select id, carno from tgps_car where id in ({placeholders})",
+                ids,
+            )
+            for cid, carno in cur.fetchall():
+                plate = str(carno or "").strip()
+                if cid is None or not plate:
+                    continue
+                result[int(cid)] = plate
+        return result
+    except Exception as e:  # noqa: BLE001
+        logger.debug("监控范围 808 car_id 反查失败: %s", e)
+        return {}
+    finally:
+        conn.close()
+
+
 def _lookup_jt808_car_ids(plates: list[str], device_nos: list[str]) -> list[str]:
     """可选：从 808 MySQL 解析 tgps_car.id，供监控树按 value/deviceId 匹配。"""
     if not plates and not device_nos:
         return []
+    ids: set[str] = set()
+    plate_map = _lookup_jt808_plate_car_id_map(plates)
+    for cid in plate_map.values():
+        ids.add(str(int(cid)))
+    if not device_nos:
+        return sorted(ids)
     try:
         conn = pymysql.connect(
             host=settings.jt808_mysql_host,
@@ -209,32 +303,21 @@ def _lookup_jt808_car_ids(plates: list[str], device_nos: list[str]) -> list[str]
         )
     except Exception as e:  # noqa: BLE001
         logger.debug("监控范围 808 车辆 id 查询跳过: %s", e)
-        return []
+        return sorted(ids)
     try:
-        ids: set[str] = set()
         with conn.cursor() as cur:
-            if plates:
-                placeholders = ",".join(["%s"] * len(plates))
-                cur.execute(
-                    f"select id from tgps_car where carno in ({placeholders})",
-                    plates,
-                )
-                for (cid,) in cur.fetchall():
-                    if cid is not None:
-                        ids.add(str(int(cid)))
-            if device_nos:
-                placeholders = ",".join(["%s"] * len(device_nos))
-                cur.execute(
-                    f"select id from tgps_car where tid in ({placeholders})",
-                    device_nos,
-                )
-                for (cid,) in cur.fetchall():
-                    if cid is not None:
-                        ids.add(str(int(cid)))
+            placeholders = ",".join(["%s"] * len(device_nos))
+            cur.execute(
+                f"select id from tgps_car where tid in ({placeholders})",
+                device_nos,
+            )
+            for (cid,) in cur.fetchall():
+                if cid is not None:
+                    ids.add(str(int(cid)))
         return sorted(ids)
     except Exception as e:  # noqa: BLE001
         logger.debug("监控范围 808 车辆 id 查询失败: %s", e)
-        return []
+        return sorted(ids)
     finally:
         conn.close()
 

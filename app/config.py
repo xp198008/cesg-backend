@@ -29,7 +29,8 @@ class Settings(BaseSettings):
     # 公司分组同步走 HTTP 8002 API（admin 登录）
     jt808_api_base: str = "http://113.207.68.96:8800/api"
     jt808_admin_account: str = "admin"
-    jt808_admin_password: str = "123456"
+    # 已废弃：808 HTTP 登录密码改从 sys_user.password_plain 读取，勿再依赖本项。
+    jt808_admin_password: str = ""
     jt808_sync_timeout: float = 8.0
     # 用户同步走 SSH 隧道直连 MySQL jt808 库（127.0.0.1:3306）
     jt808_mysql_host: str = "127.0.0.1"
@@ -45,7 +46,8 @@ class Settings(BaseSettings):
     # 8003=自建 8800；1200=gb35658。留空则按 base_url / 是否配置 apitoken 自动判断。
     jt808_openapi_auth_mode: str = "8003"
     jt808_openapi_account: str = "admin"
-    jt808_openapi_password: str = "123456"
+    # 已废弃：OpenAPI 登录密码改从 sys_user.password_plain 读取，勿再依赖本项。
+    jt808_openapi_password: str = ""
     jt808_openapi_password_hashed: bool = False
     jt808_openapi_apitoken: str = ""
     jt808_openapi_timeout: float = 15.0
@@ -72,6 +74,16 @@ class Settings(BaseSettings):
     obd_stale_seconds: int = 300
     # 限速折线的命中缓冲带（米）：车距折线多远内算"在该路段上"
     obd_polyline_buffer_m: float = 30.0
+    # OBD 地图超速：是否调用 808 apicode 1303 写入 tgps_car_alarm（会话结束时）
+    obd_speed_push_1303_enabled: bool = True
+    # 单次持续超速会话最长秒数；超时强制落库 1303 并开新会话（默认 15 分钟）
+    obd_speed_session_max_seconds: int = 900
+
+    # ---- 停车超限报警：增量扫 1240 停车段，写 808 cesg_park_alarm ----
+    park_alarm_enabled: bool = True
+    park_alarm_interval_seconds: int = 120
+    # 无游标时回看小时数
+    park_alarm_lookback_hours: int = 48
 
     # ---- 智慧看板 Redis 队列消费（LPOP）----
     # 复用 obd_redis_* 连接参数，不重复配置 host/port/password/db
@@ -92,7 +104,6 @@ class Settings(BaseSettings):
     agent_worker_default_company: str = "三峰城服"
     agent_worker_timeout: float = 60.0
     agent_worker_video_timeout: float = 300.0
-
 
     # ---- 车辆风险画像（docs/2.pdf，周报；月报官方不可用时由周报拼接）----
     risk_api_base_url: str = "http://113.207.68.94:8000"

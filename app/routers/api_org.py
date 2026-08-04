@@ -19,11 +19,10 @@ from app import jt808_group
 from app.database import get_db
 from app.models import Driver, Fleet, OrgCompany, Vehicle
 from app.org_scope import (
-    collect_org_company_subtree_ids,
     require_user_company_subtree_ids,
-    require_x_org_id_header,
     wants_org_tree_scope,
 )
+from app.risk_profile_service import load_org_company_maps, resolve_selected_to_local_org_ids
 
 router = APIRouter(prefix="/api/org", tags=["org"])
 logger = logging.getLogger(__name__)
@@ -258,6 +257,16 @@ async def _descendant_ids(db: AsyncSession, root_id: int) -> set[int]:
     return out
 
 
+def _org_tree_icon_for_name(name: str) -> str:
+    """与前端 monitorTreeIcons / 实时监控树一致：项目部、车队、公司。"""
+    text = (name or "").strip()
+    if "项目部" in text:
+        return "project-dept"
+    if "车队" in text or "车组" in text:
+        return "fleet"
+    return "building"
+
+
 def _tree_nodes_for_ui(
     rows: list[OrgCompany],
     by_parent: dict[int | None, list[OrgCompany]],
@@ -273,8 +282,11 @@ def _tree_nodes_for_ui(
             label = f"{node.name}（{code}）" if code else (node.name or "")
         return {
             "id": str(node.id),
+            "org_id": int(node.id),
+            "name": (node.name or "").strip(),
+            "jt808_group_id": int(node.jt808_group_id) if node.jt808_group_id is not None else None,
             "label": label,
-            "icon": "building",
+            "icon": _org_tree_icon_for_name(node.name or ""),
             "children": [build(c) for c in kids],
         }
 
@@ -429,6 +441,7 @@ async def org_tree(
     label_plain: bool = Query(False),
     scope_org_tree: bool = Query(False),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
     r = await db.execute(select(OrgCompany).order_by(OrgCompany.id))
@@ -436,8 +449,10 @@ async def org_tree(
 
     do_scope = wants_org_tree_scope(scope_org_tree, x_org_id)
     if do_scope:
-        root = require_x_org_id_header(x_org_id)
-        subtree = await collect_org_company_subtree_ids(db, root)
+        # 必须落在登录用户所属公司子树内，禁止伪造 X-Org-Id 越权
+        _, subtree = await require_user_company_subtree_ids(
+            db, x_org_id=x_org_id, x_user_id=x_user_id
+        )
         rows = [x for x in rows if x.id in subtree]
 
     if exclude_id is not None:
@@ -495,6 +510,72 @@ async def parent_options(exclude_id: int | None = Query(None), db: AsyncSession 
     return {"options": options}
 
 
+def _parse_company_filter_ids(company_id: int | None, company_ids: str | None) -> list[int]:
+    """解析公司筛选：支持本地 org id 或 JT808 gid（与车辆信息公司树一致）。"""
+    selected: list[int] = []
+    if company_ids:
+        for part in str(company_ids).split(","):
+            text = part.strip()
+            if not text:
+                continue
+            try:
+                selected.append(int(text))
+            except (TypeError, ValueError):
+                continue
+    elif company_id is not None:
+        selected.append(int(company_id))
+    return selected
+
+
+@router.get("/resolve-jt808-groups")
+async def resolve_jt808_groups(
+    gids: str = Query(..., description="逗号分隔的 JT808 group id 或本地 org_id"),
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """将前端公司树勾选的 JT808 gid / 本地 org_id 映射为本地 org_company.id。
+
+    仅返回当前登录用户可见公司子树内的结果，防止越权解析。
+    """
+    raw: list[int] = []
+    for part in str(gids).split(","):
+        text = part.strip()
+        if not text:
+            continue
+        try:
+            raw.append(int(text))
+        except (TypeError, ValueError):
+            continue
+    if not raw:
+        return {"items": []}
+    _, allowed_ids = await require_user_company_subtree_ids(
+        db, x_org_id=x_org_id, x_user_id=x_user_id
+    )
+    _, name_map, gid_to_local, _ = await load_org_company_maps(db)
+    items: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for gid in raw:
+        if gid in seen:
+            continue
+        seen.add(gid)
+        local_id = gid_to_local.get(gid)
+        if local_id is None and gid in allowed_ids:
+            # 选择器可能直接传本地 org_id（公司未同步 jt808_group_id 时）
+            local_id = gid
+        if local_id is None or local_id not in allowed_ids:
+            continue
+        items.append(
+            {
+                "gid": gid,
+                "id": local_id,
+                "name": name_map.get(local_id, ""),
+                "jt808_group_id": gid if gid in gid_to_local else None,
+            }
+        )
+    return {"items": items}
+
+
 @router.get("/companies", response_model=dict)
 async def company_list(
     page: int = Query(1, ge=1),
@@ -502,6 +583,8 @@ async def company_list(
     org_code: str | None = None,
     name: str | None = None,
     parent_id: int | None = Query(None),
+    company_id: int | None = Query(None, description="上级筛选：本地 id 或 JT808 gid"),
+    company_ids: str | None = Query(None, description="上级筛选：逗号分隔，本地 id 或 JT808 gid"),
     db: AsyncSession = Depends(get_db),
 ):
     conds = []
@@ -509,8 +592,24 @@ async def company_list(
         conds.append(OrgCompany.org_code.ilike(f"%{org_code.strip()}%"))
     if name and name.strip():
         conds.append(OrgCompany.name.ilike(f"%{name.strip()}%"))
+    parent_ids: list[int] = []
     if parent_id is not None:
-        conds.append(OrgCompany.parent_id == parent_id)
+        parent_ids.append(int(parent_id))
+    selected_raw = _parse_company_filter_ids(company_id, company_ids)
+    if selected_raw:
+        parent_map, _, gid_to_local, _ = await load_org_company_maps(db)
+        local_selected = resolve_selected_to_local_org_ids(
+            selected_raw,
+            gid_to_local=gid_to_local,
+            known_local_ids=set(parent_map.keys()),
+        )
+        parent_ids.extend(int(x) for x in local_selected)
+    if parent_ids:
+        uniq_parent_ids = list(dict.fromkeys(parent_ids))
+        if len(uniq_parent_ids) == 1:
+            conds.append(OrgCompany.parent_id == uniq_parent_ids[0])
+        else:
+            conds.append(OrgCompany.parent_id.in_(uniq_parent_ids))
     count_stmt = select(func.count()).select_from(OrgCompany)
     if conds:
         count_stmt = count_stmt.where(*conds)
@@ -561,6 +660,7 @@ async def company_detail(company_id: int, db: AsyncSession = Depends(get_db)):
         "parent_name": pn,
         "contact_phone": x.contact_phone,
         "address": x.address,
+        "jt808_group_id": int(x.jt808_group_id) if x.jt808_group_id is not None else None,
         "created_at": x.created_at.isoformat() if x.created_at else None,
     }
 

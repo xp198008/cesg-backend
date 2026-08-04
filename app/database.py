@@ -76,6 +76,10 @@ async def init_models() -> None:
                     await conn.exec_driver_sql("ALTER TABLE sys_user ADD COLUMN identity VARCHAR(64)")
                 if "phone" not in names:
                     await conn.exec_driver_sql("ALTER TABLE sys_user ADD COLUMN phone VARCHAR(32)")
+                if "jt808_lingxtoken" not in names:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE sys_user ADD COLUMN jt808_lingxtoken VARCHAR(512)"
+                    )
             cols = await conn.exec_driver_sql("PRAGMA table_info(map_api_config)")
             names = {row[1] for row in cols.fetchall()}
             if names and "web_service_key" not in names:
@@ -88,10 +92,54 @@ async def init_models() -> None:
                 await conn.exec_driver_sql("ALTER TABLE map_rule_category ADD COLUMN weather_types JSON")
             if "weather_speed_limits" not in names:
                 await conn.exec_driver_sql("ALTER TABLE map_rule_category ADD COLUMN weather_speed_limits JSON")
+            if "instant_notify_enabled" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE map_rule_category ADD COLUMN instant_notify_enabled BOOLEAN DEFAULT 0"
+                )
+            if "broadcast_content" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE map_rule_category ADD COLUMN broadcast_content VARCHAR(200)"
+                )
+            if "min_speed_limit_kmh" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE map_rule_category ADD COLUMN min_speed_limit_kmh INTEGER DEFAULT 0"
+                )
+            if "warn_enabled" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE map_rule_category ADD COLUMN warn_enabled BOOLEAN DEFAULT 0"
+                )
+            if "warn_percent" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE map_rule_category ADD COLUMN warn_percent INTEGER"
+                )
+            if "warn_content" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE map_rule_category ADD COLUMN warn_content VARCHAR(200)"
+                )
+            if "park_stop_limit_minutes" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE map_rule_category ADD COLUMN park_stop_limit_minutes INTEGER DEFAULT 0"
+                )
             cols = await conn.exec_driver_sql("PRAGMA table_info(private_map_rule)")
             names = {row[1] for row in cols.fetchall()}
             if "category_ids" not in names:
                 await conn.exec_driver_sql("ALTER TABLE private_map_rule ADD COLUMN category_ids JSON")
+            if "created_by" not in names:
+                await conn.exec_driver_sql("ALTER TABLE private_map_rule ADD COLUMN created_by INTEGER")
+            if "created_by_name" not in names:
+                await conn.exec_driver_sql("ALTER TABLE private_map_rule ADD COLUMN created_by_name VARCHAR(64)")
+            if "company_name" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE private_map_rule ADD COLUMN company_name VARCHAR(128)"
+                )
+            if "fleet_name" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE private_map_rule ADD COLUMN fleet_name VARCHAR(128)"
+                )
+            if "park_stop_limit_minutes" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE private_map_rule ADD COLUMN park_stop_limit_minutes INTEGER DEFAULT 0"
+                )
             cols = await conn.exec_driver_sql("PRAGMA table_info(vehicle_violation)")
             names = {row[1] for row in cols.fetchall()}
             if names:
@@ -115,6 +163,20 @@ async def init_models() -> None:
                     await conn.exec_driver_sql(
                         "ALTER TABLE vehicle_violation ADD COLUMN risk_level VARCHAR(8) DEFAULT 'low'"
                     )
+                if "weather" not in names:
+                    await conn.exec_driver_sql("ALTER TABLE vehicle_violation ADD COLUMN weather VARCHAR(32)")
+                if "private_rule_name" not in names:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE vehicle_violation ADD COLUMN private_rule_name VARCHAR(200)"
+                    )
+                if "rule_category_name" not in names:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE vehicle_violation ADD COLUMN rule_category_name VARCHAR(128)"
+                    )
+                if "company_name" not in names:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE vehicle_violation ADD COLUMN company_name VARCHAR(128)"
+                    )
             cols = await conn.exec_driver_sql("PRAGMA table_info(vehicle_location)")
             names = {row[1] for row in cols.fetchall()}
             if names and "source" not in names:
@@ -131,6 +193,9 @@ async def init_models() -> None:
                     ("driver_name", "VARCHAR(64)"),
                     ("engine_displacement", "VARCHAR(32)"),
                     ("fuel_tank_capacity", "VARCHAR(32)"),
+                    ("fuel_tank", "VARCHAR(32)"),
+                    ("rapid_acceleration", "VARCHAR(64)"),
+                    ("rapid_deceleration", "VARCHAR(64)"),
                     ("battery_capacity", "VARCHAR(32)"),
                     ("range_mileage", "VARCHAR(32)"),
                     ("battery_no", "VARCHAR(64)"),
@@ -146,6 +211,12 @@ async def init_models() -> None:
                     ("vehicle_payload", "NUMERIC(12, 2)"),
                     ("curb_weight", "NUMERIC(12, 2)"),
                     ("urea_info", "VARCHAR(256)"),
+                    ("coolant_temp_high_threshold", "NUMERIC(10, 2)"),
+                    ("fuel_level_low_threshold", "NUMERIC(10, 2)"),
+                    ("reagent_level_low_threshold", "NUMERIC(10, 2)"),
+                    ("dpf_pressure_high_threshold", "NUMERIC(10, 2)"),
+                    ("scr_downstream_abnormal_threshold", "NUMERIC(10, 2)"),
+                    ("nox_abnormal_threshold", "NUMERIC(10, 2)"),
                 ):
                     if col_name not in names:
                         await conn.exec_driver_sql(f"ALTER TABLE vehicle ADD COLUMN {col_name} {col_type}")
@@ -207,6 +278,99 @@ async def init_models() -> None:
                 ):
                     if col_name not in names:
                         await conn.exec_driver_sql(f"ALTER TABLE user_operation_log ADD COLUMN {col_name} {col_type}")
+            cols = await conn.exec_driver_sql("PRAGMA table_info(alarm_type_dict)")
+            names = {row[1] for row in cols.fetchall()}
+            if names:
+                if "safety_level" not in names:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE alarm_type_dict ADD COLUMN safety_level VARCHAR(8) DEFAULT '中'"
+                    )
+                if "min_interval_minutes" not in names:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE alarm_type_dict ADD COLUMN min_interval_minutes INTEGER DEFAULT 15"
+                    )
+                if "status" not in names:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE alarm_type_dict ADD COLUMN status VARCHAR(8) DEFAULT '启用'"
+                    )
+                await conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ix_alarm_type_dict_type_name "
+                    "ON alarm_type_dict(type_name)"
+                )
+            cols = await conn.exec_driver_sql("PRAGMA table_info(route_plan_preset)")
+            names = {row[1] for row in cols.fetchall()}
+            if names and "created_by_name" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE route_plan_preset ADD COLUMN created_by_name VARCHAR(64)"
+                )
+        else:
+            # MySQL 等：已有库 create_all 不会加列，best-effort 补齐
+            try:
+                exists = await conn.exec_driver_sql(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sys_user' "
+                    "AND COLUMN_NAME = 'jt808_lingxtoken'"
+                )
+                row = exists.fetchone()
+                if row is not None and int(row[0] or 0) == 0:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE sys_user ADD COLUMN jt808_lingxtoken VARCHAR(512) NULL"
+                    )
+            except Exception:
+                pass
+            try:
+                exists = await conn.exec_driver_sql(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'route_plan_preset' "
+                    "AND COLUMN_NAME = 'created_by_name'"
+                )
+                row = exists.fetchone()
+                if row is not None and int(row[0] or 0) == 0:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE route_plan_preset ADD COLUMN created_by_name VARCHAR(64) NULL"
+                    )
+            except Exception:
+                pass
+            for col_name, col_sql in (
+                ("instant_notify_enabled", "TINYINT(1) NOT NULL DEFAULT 0"),
+                ("broadcast_content", "VARCHAR(200) NULL"),
+                ("min_speed_limit_kmh", "INTEGER NOT NULL DEFAULT 0"),
+                ("warn_enabled", "TINYINT(1) NOT NULL DEFAULT 0"),
+                ("warn_percent", "INTEGER NULL"),
+                ("warn_content", "VARCHAR(200) NULL"),
+                ("park_stop_limit_minutes", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                try:
+                    exists = await conn.exec_driver_sql(
+                        "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'map_rule_category' "
+                        f"AND COLUMN_NAME = '{col_name}'"
+                    )
+                    row = exists.fetchone()
+                    if row is not None and int(row[0] or 0) == 0:
+                        await conn.exec_driver_sql(
+                            f"ALTER TABLE map_rule_category ADD COLUMN {col_name} {col_sql}"
+                        )
+                except Exception:
+                    pass
+            for col_name, col_sql in (
+                ("company_name", "VARCHAR(128) NULL"),
+                ("fleet_name", "VARCHAR(128) NULL"),
+                ("park_stop_limit_minutes", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                try:
+                    exists = await conn.exec_driver_sql(
+                        "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'private_map_rule' "
+                        f"AND COLUMN_NAME = '{col_name}'"
+                    )
+                    row = exists.fetchone()
+                    if row is not None and int(row[0] or 0) == 0:
+                        await conn.exec_driver_sql(
+                            f"ALTER TABLE private_map_rule ADD COLUMN {col_name} {col_sql}"
+                        )
+                except Exception:
+                    pass
 
 
 async def get_db():

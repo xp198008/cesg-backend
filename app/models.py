@@ -53,6 +53,8 @@ class SysUser(Base):
     role_id = Column(Integer, ForeignKey("sys_role.id"))
     org_id = Column(Integer, ForeignKey("org_company.id"))
     jt808_user_id = Column(String(36), nullable=True, index=True)
+    # 系统内共用的 808 lingxtoken：登录时先 8005 探测，失效再 8003
+    jt808_lingxtoken = Column(String(512), nullable=True)
     allow_pwd_edit = Column(Boolean, default=True, nullable=False)
     is_active = Column(Boolean, default=True)
     valid_until = Column(Date, nullable=True)
@@ -174,6 +176,12 @@ class Vehicle(Base):
     vehicle_payload = Column(Numeric(12, 2), nullable=True)
     curb_weight = Column(Numeric(12, 2), nullable=True)
     urea_info = Column(String(256), nullable=True)
+    coolant_temp_high_threshold = Column(Numeric(10, 2), nullable=True)
+    fuel_level_low_threshold = Column(Numeric(10, 2), nullable=True)
+    reagent_level_low_threshold = Column(Numeric(10, 2), nullable=True)
+    dpf_pressure_high_threshold = Column(Numeric(10, 2), nullable=True)
+    scr_downstream_abnormal_threshold = Column(Numeric(10, 2), nullable=True)
+    nox_abnormal_threshold = Column(Numeric(10, 2), nullable=True)
     short_name = Column(String(64))
     company_id = Column(Integer, ForeignKey("org_company.id"))
     company_org_code = Column(String(48), index=True, nullable=True)
@@ -197,6 +205,9 @@ class Vehicle(Base):
     channel_count = Column(Integer, default=0)
     engine_displacement = Column(String(32), nullable=True)
     fuel_tank_capacity = Column(String(32), nullable=True)
+    fuel_tank = Column(String(32), nullable=True)
+    rapid_acceleration = Column(String(64), nullable=True)
+    rapid_deceleration = Column(String(64), nullable=True)
     battery_capacity = Column(String(32), nullable=True)
     range_mileage = Column(String(32), nullable=True)
     battery_no = Column(String(64), nullable=True)
@@ -319,9 +330,12 @@ class AlarmTypeDict(Base):
     __tablename__ = "alarm_type_dict"
     id = Column(Integer, primary_key=True, autoincrement=True)
     type_code = Column(String(32), nullable=False, unique=True, index=True)
-    type_name = Column(String(64), nullable=False, index=True)
+    type_name = Column(String(64), nullable=False, unique=True, index=True)
     description = Column(Text, nullable=True)
     alarm_level = Column(String(16), nullable=False, server_default="中级")
+    safety_level = Column(String(8), nullable=False, server_default="中", default="中")
+    min_interval_minutes = Column(Integer, nullable=False, server_default="15", default=15)
+    status = Column(String(8), nullable=False, server_default="启用", default="启用")
     data_source = Column(String(32), nullable=False, server_default="manual")
     ttx_atp_code = Column(Integer, nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
@@ -437,7 +451,14 @@ class PrivateMapRule(Base):
     speed_limit_kmh = Column(Integer, nullable=False, default=0, server_default="0")
     ref_public_rule_id = Column(Integer, nullable=True, index=True)
     category_ids = Column(JSON, nullable=False, default=list)
+    # 停止限时（分钟）：规则分配配置；0=关闭；围栏内停车超此时长写 808 cesg_park_alarm
+    park_stop_limit_minutes = Column(Integer, nullable=False, default=0, server_default="0")
+    # 所属公司/车队名称快照（与车辆列表同一套组织树解析；无值时列表显示 -）
+    company_name = Column(String(128), nullable=True)
+    fleet_name = Column(String(128), nullable=True)
     remark = Column(String(255))
+    created_by = Column(Integer, nullable=True, index=True)
+    created_by_name = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
@@ -470,16 +491,35 @@ class MapRuleCategory(Base):
     type_name = Column(String(128), nullable=False)
     company_id = Column(Integer, ForeignKey("org_company.id"), nullable=False, index=True)
     speed_limit_kmh = Column(Integer, nullable=False, default=0, server_default="0")
+    min_speed_limit_kmh = Column(Integer, nullable=False, default=0, server_default="0")
     weather_rule_id = Column(Integer, ForeignKey("private_map_rule_weather.id", ondelete="SET NULL"), nullable=True, index=True)
     weather_types = Column(JSON, nullable=False, default=list)
     weather_speed_limits = Column(JSON, nullable=False, default=dict)
     assigned_vehicle_ids = Column(JSON, nullable=False, default=list)
+    # 规则触发时是否调用 808 文字下发（默认语音播报）
+    instant_notify_enabled = Column(Boolean, nullable=False, default=False, server_default="0")
+    broadcast_content = Column(String(200), nullable=True)
+    # 接近限速预警：达到限速百分比时提前下发（未超速）
+    warn_enabled = Column(Boolean, nullable=False, default=False, server_default="0")
+    warn_percent = Column(Integer, nullable=True)
+    warn_content = Column(String(200), nullable=True)
+    # 停止限时（分钟）：0=关闭；围栏内停车超此时长则写 808 cesg_park_alarm
+    park_stop_limit_minutes = Column(Integer, nullable=False, default=0, server_default="0")
     remark = Column(String(255))
     created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
     company = relationship("OrgCompany", backref="map_rule_categories")
     weather_rule = relationship("PrivateMapRuleWeather")
+
+
+class ParkAlarmScanCursor(Base):
+    """停车超限报警扫描游标：按设备记录已处理到的 1240 停车结束时间。"""
+
+    __tablename__ = "park_alarm_scan_cursor"
+    device_no = Column(String(64), primary_key=True)
+    last_etime = Column(String(32), nullable=False, default="", server_default="")
+    updated_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now())
 
 
 class VehicleViolation(Base):
@@ -493,6 +533,8 @@ class VehicleViolation(Base):
     vehicle_id = Column(Integer, index=True, nullable=True)
     plate_no = Column(String(16), default="", index=True)
     company_id = Column(Integer, nullable=True, index=True)
+    # 所属公司名称快照（同步 808 镜像表用，避免对端再 JOIN）
+    company_name = Column(String(128), nullable=True)
     violation_type_code = Column(Integer, nullable=True)
     violation_type_name = Column(String(64), nullable=True)
     risk_level = Column(String(8), nullable=False, default="low", server_default="low")
@@ -502,6 +544,10 @@ class VehicleViolation(Base):
     address = Column(String(512), nullable=True)
     source = Column(String(32), nullable=False)
     transparent_type = Column(Integer, nullable=True)
+    # OBD 超速专属扩展（其它来源可空）
+    weather = Column(String(32), nullable=True)
+    private_rule_name = Column(String(200), nullable=True)
+    rule_category_name = Column(String(128), nullable=True)
     raw_preview = Column(Text, nullable=True)
     stream_snapshot_refs = Column(Text, nullable=True)
     ttx_evidence_refs = Column(Text, nullable=True)
@@ -614,6 +660,29 @@ class UserOnlineDaily(Base):
     updated_at = Column(DateTime, default=china_now_naive, server_default=func.now(), onupdate=china_now_naive)
 
 
+class VideoPreviewSession(Base):
+    """实时监控视频预览按车会话（报表 data-video-log 明细数据源）。"""
+
+    __tablename__ = "video_preview_session"
+    __table_args__ = (UniqueConstraint("session_key", name="uq_video_preview_session_key"),)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_key = Column(String(128), nullable=False, index=True)
+    user_id = Column(Integer, nullable=True, index=True)
+    username = Column(String(64), nullable=False, index=True)
+    real_name = Column(String(64), nullable=True)
+    org_id = Column(Integer, nullable=True, index=True)
+    org_name = Column(String(128), nullable=True)
+    car_id = Column(String(64), nullable=False, index=True)
+    plate_no = Column(String(32), nullable=True, index=True)
+    plate_color = Column(String(16), nullable=True)
+    started_at = Column(DateTime, nullable=False, index=True)
+    ended_at = Column(DateTime, nullable=False, index=True)
+    duration_seconds = Column(Integer, nullable=False, default=0, server_default="0")
+    source = Column(String(32), nullable=False, default="realtime", server_default="realtime")
+    created_at = Column(DateTime, default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime, default=china_now_naive, server_default=func.now(), onupdate=china_now_naive)
+
+
 class ManualFaultReport(Base):
     """人工报障录入（与 jt_device_fault 分流）。"""
 
@@ -633,7 +702,7 @@ class ManualFaultReport(Base):
     fault_phenomenon = Column(Text, nullable=True)
     fault_location = Column(String(256), nullable=True)
     affect_service = Column(Integer, nullable=False, server_default="1")
-    handle_status = Column(String(32), nullable=False, server_default="未处理")
+    handle_status = Column(String(32), nullable=False, server_default="待审核")
     handled_at = Column(DateTime, nullable=True)
     handler_name = Column(String(64), nullable=True)
     handler_remark = Column(String(255), nullable=True)
@@ -663,7 +732,7 @@ class JtDeviceFault(Base):
     direction = Column(Integer, nullable=True)
     raw_preview = Column(Text, nullable=True)
     source = Column(String(32), nullable=False, default="jt808_0200_alarm")
-    handle_status = Column(String(32), default="未处理")
+    handle_status = Column(String(32), default="待审核")
     handled_at = Column(DateTime, nullable=True)
     handler_name = Column(String(64), nullable=True)
     handler_remark = Column(String(255), nullable=True)
@@ -677,6 +746,36 @@ class JtDeviceFaultReceipt(Base):
     """设备报障结案后的上传单据索引。"""
 
     __tablename__ = "jt_device_fault_receipt"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fault_id = Column(Integer, nullable=False, index=True)
+    biz_no = Column(String(32), nullable=False, index=True)
+    stored_name = Column(String(255), nullable=False)
+    original_name = Column(String(255), nullable=False)
+    file_size = Column(Integer, nullable=False)
+    mime_type = Column(String(128), nullable=True)
+    uploader_name = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=china_now_naive, server_default=func.now())
+
+
+class ManualFaultReceipt(Base):
+    """人工报障维保单据索引。"""
+
+    __tablename__ = "manual_fault_receipt"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fault_id = Column(Integer, nullable=False, index=True)
+    biz_no = Column(String(32), nullable=False, index=True)
+    stored_name = Column(String(255), nullable=False)
+    original_name = Column(String(255), nullable=False)
+    file_size = Column(Integer, nullable=False)
+    mime_type = Column(String(128), nullable=True)
+    uploader_name = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=china_now_naive, server_default=func.now())
+
+
+class ManualFaultImage(Base):
+    """人工报障录入时上传的设备图片。"""
+
+    __tablename__ = "manual_fault_image"
     id = Column(Integer, primary_key=True, autoincrement=True)
     fault_id = Column(Integer, nullable=False, index=True)
     biz_no = Column(String(32), nullable=False, index=True)
@@ -731,6 +830,21 @@ class VehicleRepairReceipt(Base):
     mime_type = Column(String(128), nullable=True)
     uploader_name = Column(String(64), nullable=True)
     remark = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=china_now_naive, server_default=func.now())
+
+
+class VehicleRepairImage(Base):
+    """设备报修录入时上传的现场/设备图片。"""
+
+    __tablename__ = "vehicle_repair_image"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    repair_id = Column(Integer, nullable=False, index=True)
+    biz_no = Column(String(32), nullable=False, index=True)
+    stored_name = Column(String(255), nullable=False)
+    original_name = Column(String(255), nullable=False)
+    file_size = Column(Integer, nullable=False)
+    mime_type = Column(String(128), nullable=True)
+    uploader_name = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=china_now_naive, server_default=func.now())
 
 
@@ -797,3 +911,69 @@ class ObdEnergySnapshot(Base):
     day = Column(String(8), nullable=True, index=True)  # yyyyMMdd
     raw = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
+
+
+class ObdFuelDaily(Base):
+    """车辆日油耗事实表（OBD fdjrlll 积分估算，供燃油消耗报表读取）。
+
+    一车一日一行；行驶里程/百公里油耗可由报表侧叠 808 日里程后回写或实时计算。
+    """
+
+    __tablename__ = "obd_fuel_daily"
+    __table_args__ = (
+        UniqueConstraint("device_no", "day", name="uq_obd_fuel_daily_dev_day"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    device_no = Column(String(64), nullable=True, index=True)
+    plate_no = Column(String(32), nullable=True, index=True)
+    vehicle_id = Column(Integer, nullable=True, index=True)
+    company_id = Column(Integer, nullable=True, index=True)
+    day = Column(String(8), nullable=False, index=True)  # yyyyMMdd
+    fuel_l = Column(Float, nullable=True)  # 估算耗油量（L）
+    drive_km = Column(Float, nullable=True)  # 行驶里程（km），可后填
+    start_mileage = Column(Float, nullable=True)
+    end_mileage = Column(Float, nullable=True)
+    fuel_per_100km = Column(Float, nullable=True)
+    source = Column(String(32), nullable=False, default="obd_fdjrlll", server_default="obd_fdjrlll")
+    report_time = Column(DateTime, nullable=True, index=True)
+    updated_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
+    created_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
+
+
+class RoutePlanHistory(Base):
+    """路径规划下发历史：用户向设备发送语音/文字规划结果时落库。"""
+
+    __tablename__ = "route_plan_history"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    path_code = Column(String(32), nullable=False, unique=True, index=True)
+    plate_no = Column(String(32), nullable=True, index=True)
+    terminal_id = Column(String(64), nullable=True, index=True)
+    vehicle_id = Column(Integer, nullable=True, index=True)
+    company_id = Column(Integer, nullable=True, index=True)
+    current_address = Column(String(512), nullable=True)
+    start_address = Column(String(512), nullable=True)
+    dest_address = Column(String(512), nullable=True)
+    route_summary = Column(Text, nullable=True)
+    send_type = Column(String(16), nullable=False, server_default="text")  # voice / text / both
+    send_status = Column(String(16), nullable=False, server_default="success", index=True)  # success / fail
+    error_message = Column(String(512), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
+
+
+class RoutePlanPreset(Base):
+    """路径规划预设记录：按登录用户所属公司（含子树）隔离。"""
+
+    __tablename__ = "route_plan_preset"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    path_code = Column(String(32), nullable=False, unique=True, index=True)
+    company_id = Column(Integer, nullable=False, index=True)
+    created_by = Column(Integer, nullable=True, index=True)
+    created_by_name = Column(String(64), nullable=True)
+    plan_name = Column(String(64), nullable=False)
+    start_address = Column(String(512), nullable=True)
+    dest_address = Column(String(512), nullable=True)
+    route_text = Column(Text, nullable=True)
+    plan_snapshot = Column(JSON, nullable=False)
+    send_count = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
+    updated_at = Column(DateTime, nullable=True)

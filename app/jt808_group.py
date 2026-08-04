@@ -54,11 +54,20 @@ async def _post(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _login() -> str:
-    enc = _encode_password(settings.jt808_admin_password, settings.jt808_admin_account)
-    r = await _post({"apicode": 8003, "account": settings.jt808_admin_account, "password": enc})
+    from app.jt808_openapi_credentials import load_service_password_plain, service_openapi_username
+
+    account = service_openapi_username()
+    password = await load_service_password_plain()
+    enc = _encode_password(password, account)
+    r = await _post({"apicode": 8003, "account": account, "password": enc})
     if r.get("code") != 1 or not r.get("token"):
         raise RuntimeError(f"JT808 登录失败: {r.get('message') or r}")
     return r["token"]
+
+
+def invalidate_token() -> None:
+    global _token
+    _token = None
 
 
 async def _ensure_token(force: bool = False) -> str:
@@ -84,6 +93,42 @@ async def _tree(fid: int) -> list[dict[str, Any]]:
     r = await _call({"apicode": 8002, "e": "tgps_group", "m": "tree", "fid": int(fid),
                      "orderField": "orderindex", "orderType": "asc"})
     return r.get("data") or []
+
+
+async def fetch_group_children(fid: int) -> list[dict[str, Any]]:
+    """查询 JT808 分组直接下级（与前端组织树同源）。"""
+    try:
+        return await _tree(int(fid))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("JT808 查询分组下级失败 fid=%s: %s", fid, e)
+        return []
+
+
+async def collect_group_subtree_gids(root_gid: int, *, max_nodes: int = 5000) -> set[int]:
+    """BFS 收集 JT808 分组自身及全部下级 group_id。"""
+    rid = int(root_gid)
+    out: set[int] = {rid}
+    frontier = [rid]
+    while frontier:
+        next_frontier: list[int] = []
+        for fid in frontier:
+            for node in await fetch_group_children(fid):
+                raw = node.get("id")
+                if raw is None:
+                    continue
+                try:
+                    gid = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if gid in out:
+                    continue
+                out.add(gid)
+                next_frontier.append(gid)
+                if len(out) >= max_nodes:
+                    logger.warning("JT808 分组子树过大，已截断 root=%s size=%s", rid, len(out))
+                    return out
+        frontier = next_frontier
+    return out
 
 
 async def add_group(name: str, fid: int) -> int | None:

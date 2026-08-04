@@ -17,7 +17,8 @@ from app.models import SysRole, SysUser, SysUserShortcut
 
 router = APIRouter(prefix="/api/shortcut", tags=["shortcut"])
 
-_DEPRECATED_PERMISSION_IDS = frozenset({"7", "71", "72", "73"})
+# 7x：旧报表；51/107：地图接口管理、报警类型已迁至后台 /obd-status；414：违章申诉页已下线
+_DEPRECATED_PERMISSION_IDS = frozenset({"7", "71", "72", "73", "51", "107", "414"})
 
 _DATA_FILE = Path(__file__).resolve().parent.parent / "data" / "permission_menu.json"
 
@@ -38,19 +39,20 @@ _SHORTCUT_META: dict[str, dict[str, str]] = {
     "411": {"url": "/main/vehicle/violation/manual", "icon": "./images/svg/icon-carmanage.svg"},
     "412": {"url": "/main/vehicle/violation/instruction", "icon": "./images/svg/icon-carmanage.svg"},
     "413": {"url": "/main/vehicle/violation/review", "icon": "./images/svg/icon-carmanage.svg"},
-    "414": {"url": "/main/vehicle/violation/appeal", "icon": "./images/svg/icon-carmanage.svg"},
+    "415": {"url": "/main/vehicle/violation/query", "icon": "./images/svg/icon-carmanage.svg"},
     "421": {"url": "/main/vehicle/repair/list", "icon": "./images/svg/icon-carmanage.svg"},
     "422": {"url": "/main/vehicle/repair/entry", "icon": "./images/svg/icon-carmanage.svg"},
     "423": {"url": "/main/vehicle/repair/review", "icon": "./images/svg/icon-carmanage.svg"},
     "424": {"url": "/main/vehicle/repair/uploaded", "icon": "./images/svg/icon-carmanage.svg"},
     "431": {"url": "/main/vehicle/fault/manual", "icon": "./images/svg/icon-carmanage.svg"},
     "432": {"url": "/main/vehicle/fault/handle", "icon": "./images/svg/icon-carmanage.svg"},
-    "433": {"url": "/main/vehicle/fault/review", "icon": "./images/svg/icon-carmanage.svg"},
+    "433": {"url": "/main/vehicle/fault/handle", "icon": "./images/svg/icon-carmanage.svg"},
     "434": {"url": "/main/vehicle/fault/upload", "icon": "./images/svg/icon-carmanage.svg"},
+    "435": {"url": "/main/vehicle/fault/query", "icon": "./images/svg/icon-carmanage.svg"},
     "5": {"url": "/main/map/geofence", "icon": "./images/svg/icon-ditu.svg"},
-    "51": {"url": "/main/map/config", "icon": "./images/svg/icon-ditu.svg"},
     "52": {"url": "/main/map/geofence", "icon": "./images/svg/icon-ditu.svg"},
     "53": {"url": "/main/map/geofence", "icon": "./images/svg/icon-ditu.svg"},
+    "17": {"url": "/main/route-plan", "icon": "./images/svg/icon-ditu.svg"},
     "6": {"url": "/main/report/mileage-summary", "icon": "./images/svg/icon-tongji.svg"},
     "611": {"url": "/main/report/mileage-summary", "icon": "./images/svg/icon-tongji.svg"},
     "612": {"url": "/main/report/mileage-daily", "icon": "./images/svg/icon-tongji.svg"},
@@ -92,11 +94,10 @@ _SHORTCUT_META: dict[str, dict[str, str]] = {
     "103": {"url": "/main/base/drivers", "icon": "./images/svg/icon-jichushuju.svg"},
     "105": {"url": "/main/base/org", "icon": "./images/svg/icon-jichushuju.svg"},
     "106": {"url": "/main/base/vehicle-assignment", "icon": "./images/svg/icon-jichushuju.svg"},
-    "107": {"url": "/main/base/alarms", "icon": "./images/svg/icon-jichushuju.svg"},
-    "111": {"url": "/main/base/alarm-filter-rules", "icon": "./images/svg/icon-jichushuju.svg"},
     "108": {"url": "/main/base/roles", "icon": "./images/svg/icon-jichushuju.svg"},
     "109": {"url": "/main/base/faults", "icon": "./images/svg/icon-jichushuju.svg"},
     "110": {"url": "/main/base/speed-rules", "icon": "./images/svg/icon-jichushuju.svg"},
+    "112": {"url": "/main/base/violation-types", "icon": "./images/svg/icon-jichushuju.svg"},
     "16": {"url": "/main/knowledge", "icon": "./images/svg/icon-zhihuikanban.svg"},
 }
 
@@ -138,7 +139,9 @@ def _role_permission_ids(role: SysRole | None, username: str) -> set[str] | None
         arr = []
     if not isinstance(arr, list):
         arr = []
-    return {str(x) for x in arr if x is not None and str(x).strip()}
+    result = {str(x) for x in arr if x is not None and str(x).strip()}
+    result.add("1")
+    return result
 
 
 async def _load_user(db: AsyncSession, user_id: int) -> SysUser:

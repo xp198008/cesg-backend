@@ -92,14 +92,37 @@ def _resolve_session_end(
     next_login_at: datetime | None,
     now: datetime,
 ) -> datetime:
+    """解析会话结束时间。
+
+    优先采信前端心跳累计的 online_seconds：历史上存在 pagehide/visibility
+    误 finalize，把 logout_at 写成登录后约 1 秒，但 online_seconds 仍在增长。
+    日汇总若只看 logout_at 会把整天在线压成几秒。
+    """
+    login_at = _naive_dt(login_row.login_at) or now
+    candidates: list[datetime] = []
+
+    if login_row.online_seconds is not None and int(login_row.online_seconds) >= 0:
+        candidates.append(login_at + timedelta(seconds=int(login_row.online_seconds)))
+
     if login_row.logout_at is not None:
-        return _naive_dt(login_row.logout_at) or now
+        candidates.append(_naive_dt(login_row.logout_at) or login_at)
+    elif next_login_at is None:
+        last_active = _naive_dt(login_row.last_heartbeat_at) or login_at
+        if (now - last_active) <= SESSION_IDLE_TIMEOUT:
+            candidates.append(now)
+        else:
+            candidates.append(last_active)
+    else:
+        candidates.append(_naive_dt(next_login_at) or now)
+
+    end = max(candidates) if candidates else login_at
     if next_login_at is not None:
-        return _naive_dt(next_login_at) or now
-    last_active = _naive_dt(login_row.last_heartbeat_at) or _naive_dt(login_row.login_at) or now
-    if (now - last_active) <= SESSION_IDLE_TIMEOUT:
-        return now
-    return last_active
+        next_naive = _naive_dt(next_login_at) or end
+        if end > next_naive:
+            end = next_naive
+    if end < login_at:
+        end = login_at
+    return end
 
 
 def _normalize_stale_session_clock(login_row: UserLoginLog) -> None:
@@ -112,7 +135,8 @@ def _normalize_stale_session_clock(login_row: UserLoginLog) -> None:
     last_hb = _naive_dt(login_row.last_heartbeat_at)
     if login_at is None:
         return
-    if last_hb is None or last_hb > login_at:
+    # 无心跳，或心跳时间早于登录（脏数据）时，收束到登录时刻
+    if last_hb is None or last_hb < login_at:
         login_row.last_heartbeat_at = login_row.login_at
 
 
@@ -364,12 +388,13 @@ async def close_open_sessions_for_user(
     for row in open_rows:
         start = row.login_at or now
         start_naive = start.replace(tzinfo=None) if getattr(start, "tzinfo", None) else start
+        # 先落库退出时间，再重算日汇总，避免仍按「未退出」口径估算
+        row.logout_at = now
+        row.last_heartbeat_at = now
         if now > start_naive:
             await recompute_user_daily_for_date(db, row.username, start_naive.date())
             if now.date() != start_naive.date():
                 await recompute_user_daily_for_date(db, row.username, now.date())
-        row.logout_at = now
-        row.last_heartbeat_at = now
 
 
 async def record_login_daily(db: AsyncSession, login_row: UserLoginLog) -> None:

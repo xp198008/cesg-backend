@@ -18,10 +18,12 @@ from app.device_fault_service import (
     get_merged_device_manual_fault_list,
     insert_jt_device_fault_receipt,
     jt_device_fault_receipt_eligible,
-    list_jt_device_fault_receipts,
+    list_merged_fault_receipts,
+    mark_fault_awaiting_final_review,
     resolve_device_fault_receipt_file_path,
     update_jt_device_fault_handle,
 )
+from app.models import JtDeviceFault
 
 router = APIRouter(prefix="/api/device-fault", tags=["device-fault"])
 
@@ -70,11 +72,18 @@ async def list_device_faults(
 @router.get("/receipts/list")
 async def api_list_device_fault_receipts(
     fault_id: int | None = None,
+    report_source: str | None = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ):
-    rows, total = await list_jt_device_fault_receipts(db, fault_id=fault_id, page=page, page_size=page_size)
+    rows, total = await list_merged_fault_receipts(
+        db,
+        fault_id=fault_id,
+        report_source=report_source,
+        page=page,
+        page_size=page_size,
+    )
     return {"ok": True, "items": rows, "total": total}
 
 
@@ -132,7 +141,7 @@ async def upload_device_fault_receipts(
     if not row:
         raise HTTPException(status_code=404, detail="报障记录不存在")
     if not jt_device_fault_receipt_eligible(row.get("handle_status")):
-        raise HTTPException(status_code=400, detail="仅审核已通过的报障可上传单据")
+        raise HTTPException(status_code=400, detail="仅审核通过后的报障可上传单据")
     if not files:
         raise HTTPException(status_code=400, detail="请选择至少一个文件")
 
@@ -167,5 +176,9 @@ async def upload_device_fault_receipts(
         one = await get_jt_device_fault_receipt_by_id(db, rid)
         if one:
             saved.append(one)
+
+    orm = await db.get(JtDeviceFault, int(fault_id))
+    if orm is not None:
+        await mark_fault_awaiting_final_review(orm)
     await db.commit()
     return {"ok": True, "saved": saved}

@@ -5,7 +5,9 @@
 2. 定时器 LPOP 三个队列，每轮最多取 redis_queue_batch_size 条
 3. 故障码 → vehicle_fault_live（设备号 → 车辆匹配，复用 _terminal_variants）
 4. OBD 能耗 → obd_energy_snapshot（同设备同日 upsert，避免表膨胀）
-5. 智慧看板 board-stats 接口读取两张表汇总展示
+5. 油车日油耗 → obd_fuel_daily（一车一日，供燃油消耗报表）
+6. 日油耗 upsert 后 best-effort 同步 808 镜像表 cesg_obd_fuel_daily
+7. 智慧看板 board-stats 接口读取能耗快照汇总展示
 
 字段名未完全确定，解析层沿用 obd_speed_monitor 的多别名兼容模式（_pick），
 部署后可用 /api/dashboard/redis-peek 抓样例回填 _XXX_KEYS 别名表。
@@ -25,8 +27,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.jt808_alarm_sync import _vehicle_by_terminal
+from app.jt808_obd_fuel_sync import notify_obd_fuel_daily_by_keys
 from app.jt808_vehicle import _terminal_variants
-from app.models import ObdEnergySnapshot, VehicleFaultLive
+from app.models import ObdEnergySnapshot, ObdFuelDaily, VehicleFaultLive
 from app.timeutil import china_now_naive
 
 logger = logging.getLogger(__name__)
@@ -64,13 +67,8 @@ _POWER_KEYS = (
     "soc", "zdl",
 )
 _OBD_FLOW_KEYS = ("fdjrlll", "FDJRLLL")  # 发动机燃料流量 L/h，用于积分估算日油耗
-_MILEAGE_KEYS = (
-    # OBD 油车：bclc=本次里程(km)，用于看板「今日行驶」；zlc=总里程不可多车相加
-    "bclc",
-    "mileage", "lc", "LC", "licheng", "totalMileage", "total_mileage",
-    "odometer", "里程", "总里程",
-    "zlc",
-)
+# 仅取「本次里程」；禁止回落 zlc/总里程——多车求和会把表显里程加爆，且不能当今日行驶
+_MILEAGE_KEYS = ("bclc",)
 _TS_KEYS = (
     "ts", "timestamp", "time", "gpstime", "gpsTime", "report_time",
     "reportTime", "时间戳", "时间",
@@ -283,6 +281,48 @@ async def _handle_obd(db: AsyncSession, data: dict, raw_text: str, energy_type: 
     )
     await db.execute(stmt)
     await db.flush()
+
+    # 燃油报表事实表：仅油车且算出耗油量时写入（一车一日）
+    if energy_type == "oil" and device_no is not None and fuel is not None:
+        vehicle_id, plate_from_vehicle, company_id = await _resolve_vehicle(db, str(device_no))
+        plate_raw = _pick(data, _PLATE_KEYS)
+        plate_no = str(plate_raw or plate_from_vehicle or "").strip() or None
+        now = china_now_naive()
+        fuel_values = {
+            "device_no": str(device_no),
+            "plate_no": plate_no,
+            "vehicle_id": vehicle_id,
+            "company_id": company_id,
+            "day": day,
+            "fuel_l": float(fuel),
+            "drive_km": None,  # 行驶里程由报表叠 808 日里程，避免用 bclc 当分母
+            "start_mileage": None,
+            "end_mileage": None,
+            "fuel_per_100km": None,
+            "source": "obd_fdjrlll",
+            "report_time": report_time,
+            "updated_at": now,
+            "created_at": now,
+        }
+        fuel_stmt = sqlite_insert(ObdFuelDaily).values(**fuel_values)
+        fuel_stmt = fuel_stmt.on_conflict_do_update(
+            index_elements=["device_no", "day"],
+            set_={
+                "plate_no": fuel_stmt.excluded.plate_no,
+                "vehicle_id": fuel_stmt.excluded.vehicle_id,
+                "company_id": fuel_stmt.excluded.company_id,
+                "fuel_l": fuel_stmt.excluded.fuel_l,
+                "source": fuel_stmt.excluded.source,
+                "report_time": fuel_stmt.excluded.report_time,
+                "updated_at": fuel_stmt.excluded.updated_at,
+            },
+        )
+        await db.execute(fuel_stmt)
+        await db.flush()
+        try:
+            await notify_obd_fuel_daily_by_keys(db, device_no=str(device_no), day=day)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("日油耗同步 808 跳过: %s", exc)
 
 
 async def _purge_old_faults(db: AsyncSession) -> int:

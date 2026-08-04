@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -91,7 +91,7 @@ async def require_user_company_subtree_ids(
         if user_home_org is not None:
             allowed_home = await collect_org_company_subtree_ids(db, user_home_org)
             if requested_root not in allowed_home:
-                raise HTTPException(status_code=403, detail="无权查看该公司及下属司机数据")
+                raise HTTPException(status_code=403, detail="无权查看该公司数据")
         root = requested_root
     elif user_home_org is not None:
         root = user_home_org
@@ -105,3 +105,48 @@ async def require_user_company_subtree_ids(
     if exists is None:
         raise HTTPException(status_code=400, detail="所属公司不存在")
     return root, await collect_org_company_subtree_ids(db, root)
+
+
+async def list_scoped_usernames(
+    db: AsyncSession,
+    scoped_org_ids: set[int],
+) -> list[str]:
+    """可见公司范围内的用户名（去重保序）。"""
+    if not scoped_org_ids:
+        return []
+    rows = (
+        await db.execute(
+            select(SysUser.username).where(SysUser.org_id.in_(list(scoped_org_ids))).order_by(SysUser.id)
+        )
+    ).all()
+    seen: set[str] = set()
+    out: list[str] = []
+    for (name,) in rows:
+        text = (name or "").strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def org_scope_row_clause(
+    org_id_column,
+    username_column,
+    scoped_org_ids: set[int],
+    scoped_usernames: list[str],
+):
+    """日志/会话行是否落在可见组织：org_id 命中，或 org_id 为空但用户名在范围内。"""
+    if not scoped_org_ids:
+        return org_id_column.in_([])
+    parts = [org_id_column.in_(list(scoped_org_ids))]
+    if scoped_usernames:
+        lowered = [n.lower() for n in scoped_usernames]
+        parts.append(
+            and_(
+                org_id_column.is_(None),
+                func.lower(username_column).in_(lowered),
+            )
+        )
+    return or_(*parts)

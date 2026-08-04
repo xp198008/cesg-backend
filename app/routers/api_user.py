@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app import jt808_auth, jt808_user
+from app.jt808_openapi_credentials import invalidate_openapi_token_if_service_user
 from app.database import get_db
 from app.models import OrgCompany, SysRole, SysUser, UserLoginLog, UserOnlineDaily, UserOperationLog
 from app.permission_names import permission_ids_to_piped_titles
@@ -27,6 +28,11 @@ from app.user_online_daily import (
     record_login_daily,
     resolve_user_org_profile,
     sync_login_session_to_daily,
+)
+from app.org_scope import (
+    list_scoped_usernames,
+    org_scope_row_clause,
+    require_user_company_subtree_ids,
 )
 from app.vehicle_alloc_scope import parse_user_id_header, resolve_monitor_scope
 
@@ -70,6 +76,15 @@ class UserSessionCheckPayload(BaseModel):
 class RefreshJt808TokenPayload(BaseModel):
     user_id: int = Field(..., ge=1)
     session_token: str | None = Field(default=None, max_length=128)
+    # 非单点：用现有 token 调 8005 续期；单点在 8005 失败后可走 8003
+    lingxtoken: str | None = Field(default=None, max_length=512)
+
+
+class EnsureJt808TokenPayload(BaseModel):
+    user_id: int = Field(..., ge=1)
+    session_token: str | None = Field(default=None, max_length=128)
+    # 首次无 password_plain 时由登录页传入明文密码，仅用于代登 8003
+    password: str | None = Field(default=None, max_length=128)
 
 
 class UserOperationLogIn(BaseModel):
@@ -92,6 +107,9 @@ class UserLogoutPayload(BaseModel):
     username: str | None = Field(default=None, max_length=64)
     login_log_id: int | None = Field(default=None, ge=1)
     online_seconds: int | None = Field(default=None, ge=0)
+    user_id: int | None = Field(default=None, ge=1)
+    # 主动退出时用于注销 808（单点）；非单点不清理系统共用 token
+    lingxtoken: str | None = Field(default=None, max_length=512)
 
 
 class UserSessionHeartbeatPayload(BaseModel):
@@ -232,9 +250,16 @@ async def user_list(
     keyword: str | None = Query(default=None),
     role_id: int | None = Query(default=None, ge=1),
     user_status: int | None = Query(default=None),
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(SysUser).options(selectinload(SysUser.role), selectinload(SysUser.org))
+    _, scoped_ids = await require_user_company_subtree_ids(
+        db, x_org_id=x_org_id, x_user_id=x_user_id
+    )
+    stmt = select(SysUser).options(selectinload(SysUser.role), selectinload(SysUser.org)).where(
+        SysUser.org_id.in_(list(scoped_ids))
+    )
     kw = (keyword or "").strip()
     if kw:
         like_kw = f"%{kw}%"
@@ -468,6 +493,7 @@ async def user_set_password(
         raise HTTPException(status_code=500, detail=f"修改密码失败: {e}")
 
     await db.commit()
+    invalidate_openapi_token_if_service_user(user.username)
     sync_result = await jt808_user.sync_set_password(user.id, new_pwd)
     jt808_sync, jt808_sync_message = _jt808_sync_view(sync_result)
     return {
@@ -497,6 +523,7 @@ async def user_reset_password(
     await db.flush()
     await db.refresh(user)
     await db.commit()
+    invalidate_openapi_token_if_service_user(user.username)
     sync_result = await jt808_user.sync_set_password(user.id, new_pwd)
     jt808_sync, jt808_sync_message = _jt808_sync_view(sync_result)
     return {
@@ -544,7 +571,6 @@ async def user_operation_log_append(payload: UserOperationLogIn, request: Reques
 @router.post("/logout")
 async def user_logout(payload: UserLogoutPayload, request: Request, db: AsyncSession = Depends(get_db)):
     username = (payload.username or "").strip()[:64]
-    ip = _client_login_ip(request)
     logout_at = china_now_naive()
     login_row: UserLoginLog | None = None
     if payload.login_log_id is not None:
@@ -564,6 +590,25 @@ async def user_logout(payload: UserLogoutPayload, request: Request, db: AsyncSes
     elif login_row is not None:
         await sync_login_session_to_daily(db, login_row)
         _apply_online_seconds(login_row, payload.online_seconds)
+
+    # 单点：主动退出才注销 808；未退出则页内靠 8005 一直有效
+    user: SysUser | None = None
+    if payload.user_id is not None:
+        user = await db.scalar(select(SysUser).where(SysUser.id == payload.user_id).limit(1))
+    if user is None and username:
+        user = await db.scalar(select(SysUser).where(SysUser.username == username).limit(1))
+    if user is not None and getattr(user, "single_login", False):
+        token = (payload.lingxtoken or getattr(user, "jt808_lingxtoken", None) or "").strip()
+        if token:
+            try:
+                from app.jt808_vehicle import _post
+
+                await _post({"apicode": 8018, "lingxtoken": token})
+            except Exception:
+                pass
+        user.jt808_lingxtoken = None
+        user.login_session_token = None
+
     await db.flush()
     return {"ok": True, "message": "已退出登录"}
 
@@ -573,6 +618,9 @@ async def user_session_heartbeat(payload: UserSessionHeartbeatPayload, db: Async
     login_row = await db.scalar(select(UserLoginLog).where(UserLoginLog.id == payload.login_log_id).limit(1))
     if login_row is None:
         raise HTTPException(status_code=404, detail="登录会话不存在")
+    # 非 finalize 心跳：若此前被 pagehide/visibility 误关闭，重新打开会话
+    if login_row.logout_at is not None and not payload.finalize:
+        login_row.logout_at = None
     await sync_login_session_to_daily(db, login_row)
     _apply_online_seconds(login_row, payload.online_seconds)
     if payload.finalize and login_row.logout_at is None:
@@ -592,10 +640,19 @@ async def user_login_logs(
     end_at: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=500),
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(UserLoginLog)
-    count_stmt = select(func.count()).select_from(UserLoginLog)
+    _, scoped_ids = await require_user_company_subtree_ids(
+        db, x_org_id=x_org_id, x_user_id=x_user_id
+    )
+    scoped_names = await list_scoped_usernames(db, scoped_ids)
+    scope_clause = org_scope_row_clause(
+        UserLoginLog.org_id, UserLoginLog.username, scoped_ids, scoped_names
+    )
+    stmt = select(UserLoginLog).where(scope_clause)
+    count_stmt = select(func.count()).select_from(UserLoginLog).where(scope_clause)
     uname = (username or "").strip()
     if uname:
         stmt = stmt.where(UserLoginLog.username.like(f"%{uname}%"))
@@ -648,10 +705,19 @@ async def user_online_duration_stats(
     end_at: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=500),
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(UserOnlineDaily)
-    count_stmt = select(func.count()).select_from(UserOnlineDaily)
+    _, scoped_ids = await require_user_company_subtree_ids(
+        db, x_org_id=x_org_id, x_user_id=x_user_id
+    )
+    scoped_names = await list_scoped_usernames(db, scoped_ids)
+    scope_clause = org_scope_row_clause(
+        UserOnlineDaily.org_id, UserOnlineDaily.username, scoped_ids, scoped_names
+    )
+    stmt = select(UserOnlineDaily).where(scope_clause)
+    count_stmt = select(func.count()).select_from(UserOnlineDaily).where(scope_clause)
     uname = (username or "").strip()
     if uname:
         stmt = stmt.where(UserOnlineDaily.username.like(f"%{uname}%"))
@@ -708,10 +774,23 @@ async def user_operation_logs(
     end_at: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=500),
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(UserOperationLog).where(_manual_operation_log_clause())
-    count_stmt = select(func.count()).select_from(UserOperationLog).where(_manual_operation_log_clause())
+    _, scoped_ids = await require_user_company_subtree_ids(
+        db, x_org_id=x_org_id, x_user_id=x_user_id
+    )
+    scoped_names = await list_scoped_usernames(db, scoped_ids)
+    scope_clause = org_scope_row_clause(
+        UserOperationLog.org_id, UserOperationLog.username, scoped_ids, scoped_names
+    )
+    stmt = select(UserOperationLog).where(_manual_operation_log_clause(), scope_clause)
+    count_stmt = (
+        select(func.count())
+        .select_from(UserOperationLog)
+        .where(_manual_operation_log_clause(), scope_clause)
+    )
     uname = (username or "").strip()
     if uname:
         stmt = stmt.where(UserOperationLog.username.like(f"%{uname}%"))
@@ -798,6 +877,11 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
     if not ok:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
 
+    # 供后续 808 代登 / 续期使用（明文仅存服务端）
+    if password and (getattr(user, "password_plain", None) or "") != password:
+        user.password_plain = password
+        invalidate_openapi_token_if_service_user(user.username)
+
     session_token = ""
     if getattr(user, "single_login", False):
         # 开启“单点登录”时，每次成功登录刷新 token，旧浏览器持有的 token 随即失效。
@@ -815,6 +899,9 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
                 permission_ids = [str(x) for x in raw if x is not None]
         except (json.JSONDecodeError, TypeError):
             permission_ids = []
+    # 智慧看板(1)：全员强制拥有，角色授权不可去掉
+    if "1" not in permission_ids:
+        permission_ids.append("1")
 
     org_id = user.org_id
     org_name = (user.org.name if user.org else "") or ""
@@ -948,12 +1035,99 @@ async def user_session_check(payload: UserSessionCheckPayload, db: AsyncSession 
     return {"ok": True}
 
 
-@router.post("/refresh-jt808-token")
-async def user_refresh_jt808_token(payload: RefreshJt808TokenPayload, db: AsyncSession = Depends(get_db)):
-    """808 lingxtoken 过期时由后端代用户重登 8003 换新 token（静默续期）。
+async def _try_jt808_8005(lingxtoken: str) -> dict | None:
+    """用现有 token 调 8005；成功返回 {token, auth}，否则 None。"""
+    token = (lingxtoken or "").strip()
+    if not token:
+        return None
+    from app.jt808_vehicle import _post
 
-    单点登录用户先校验 CESG 会话：被新设备踢掉的旧会话不允许续期，
-    否则续期动作会在 808 单会话模式下反踢新设备，形成互抢循环。
+    try:
+        resp = await _post({"apicode": 8005, "lingxtoken": token})
+    except Exception:
+        return None
+    if resp.get("code") == 1 and resp.get("token"):
+        return {"token": str(resp["token"]), "auth": resp.get("auth")}
+    return None
+
+
+async def _login_jt808_8003(username: str, password_plain: str) -> dict:
+    """代登 8003，成功返回 {token, auth}。"""
+    from app.jt808_vehicle import _encode_password, _post
+
+    uname = (username or "").strip()
+    pwd = (password_plain or "").strip()
+    if not uname or not pwd:
+        raise HTTPException(status_code=400, detail="当前用户未存储登录凭据，无法登录 808，请重新登录")
+    try:
+        resp = await _post(
+            {
+                "apicode": 8003,
+                "account": uname,
+                "password": _encode_password(pwd, uname),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"808 平台连接失败：{exc}") from exc
+    if resp.get("code") != 1 or not resp.get("token"):
+        raise HTTPException(
+            status_code=400,
+            detail=str(resp.get("message") or "808 平台登录失败，请重新登录"),
+        )
+    return {"token": str(resp["token"]), "auth": resp.get("auth")}
+
+
+async def _acquire_jt808_session(
+    user: SysUser,
+    *,
+    client_lingxtoken: str | None = None,
+    password: str | None = None,
+    allow_8003: bool = True,
+    force_8003: bool = False,
+) -> dict:
+    """获取可用 808 会话。
+
+    - force_8003：单点登录「每次登录」直打 8003。
+    - 否则先 8005（客户端 / 系统缓存 token），必要时再 8003。
+    """
+    if not force_8003:
+        candidates: list[str] = []
+        for raw in (client_lingxtoken, getattr(user, "jt808_lingxtoken", None)):
+            t = (raw or "").strip()
+            if t and t not in candidates:
+                candidates.append(t)
+        for token in candidates:
+            kept = await _try_jt808_8005(token)
+            if kept:
+                user.jt808_lingxtoken = kept["token"]
+                return {**kept, "via": "8005"}
+
+    if not allow_8003:
+        raise HTTPException(status_code=400, detail="808 会话已失效，请重新登录")
+
+    pwd = (password or getattr(user, "password_plain", "") or "").strip()
+    got = await _login_jt808_8003(user.username or "", pwd)
+    user.jt808_lingxtoken = got["token"]
+    if password and (getattr(user, "password_plain", None) or "") != password:
+        user.password_plain = password
+    return {**got, "via": "8003"}
+
+
+def _assert_single_login_session(user: SysUser, session_token: str | None) -> None:
+    if not getattr(user, "single_login", False):
+        return
+    server_token = (getattr(user, "login_session_token", None) or "").strip()
+    client_token = (session_token or "").strip()
+    if not server_token or not client_token or server_token != client_token:
+        raise HTTPException(status_code=409, detail="该账号已在其它设备登录，请重新登录")
+
+
+@router.post("/ensure-jt808-token")
+async def user_ensure_jt808_token(payload: EnsureJt808TokenPayload, db: AsyncSession = Depends(get_db)):
+    """登录后桥接 808。
+
+    - 单点：每次登录直接 8003；未主动退出前页内用 8005 续期保持有效。
+    - 非单点：系统已有有效会话则 8005，否则 8003（多端共用 token）。
     """
     user = await db.scalar(select(SysUser).where(SysUser.id == payload.user_id).limit(1))
     if user is None:
@@ -962,32 +1136,53 @@ async def user_refresh_jt808_token(payload: RefreshJt808TokenPayload, db: AsyncS
         raise HTTPException(status_code=403, detail="当前用户已禁用，请重新登录")
     if user.valid_until is not None and user.valid_until < china_today():
         raise HTTPException(status_code=403, detail="当前用户已过有效期，请重新登录")
-    if getattr(user, "single_login", False):
-        server_token = (getattr(user, "login_session_token", None) or "").strip()
-        client_token = (payload.session_token or "").strip()
-        if not server_token or not client_token or server_token != client_token:
-            raise HTTPException(status_code=409, detail="该账号已在其它设备登录，请重新登录")
+    _assert_single_login_session(user, payload.session_token)
 
-    pwd_plain = (getattr(user, "password_plain", "") or "").strip()
-    username = (user.username or "").strip()
-    if not pwd_plain or not username:
-        raise HTTPException(status_code=400, detail="当前用户未存储登录凭据，无法自动续期，请重新登录")
+    single_login = bool(getattr(user, "single_login", False))
+    result = await _acquire_jt808_session(
+        user,
+        password=(payload.password or "").strip() or None,
+        allow_8003=True,
+        force_8003=single_login,
+    )
+    await db.commit()
+    return {
+        "ok": True,
+        "token": result["token"],
+        "auth": result.get("auth"),
+        "via": result.get("via"),
+    }
 
-    from app.jt808_vehicle import _encode_password, _post
 
-    try:
-        resp = await _post(
-            {
-                "apicode": 8003,
-                "account": username,
-                "password": _encode_password(pwd_plain, username),
-            }
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"808 平台连接失败：{exc}") from exc
-    if resp.get("code") != 1 or not resp.get("token"):
-        raise HTTPException(status_code=400, detail=str(resp.get("message") or "808 平台续期失败，请重新登录"))
-    return {"ok": True, "token": resp["token"], "auth": resp.get("auth")}
+@router.post("/refresh-jt808-token")
+async def user_refresh_jt808_token(payload: RefreshJt808TokenPayload, db: AsyncSession = Depends(get_db)):
+    """页内续期 808 lingxtoken：统一走 8005，保持「未主动退出则一直有效」。
+
+    单点须通过 CESG 会话校验；8005 失败不再静默 8003（需重新登录）。
+    """
+    user = await db.scalar(select(SysUser).where(SysUser.id == payload.user_id).limit(1))
+    if user is None:
+        raise HTTPException(status_code=401, detail="当前用户不存在，请重新登录")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="当前用户已禁用，请重新登录")
+    if user.valid_until is not None and user.valid_until < china_today():
+        raise HTTPException(status_code=403, detail="当前用户已过有效期，请重新登录")
+
+    _assert_single_login_session(user, payload.session_token)
+
+    result = await _acquire_jt808_session(
+        user,
+        client_lingxtoken=payload.lingxtoken,
+        allow_8003=False,
+        force_8003=False,
+    )
+    await db.commit()
+    return {
+        "ok": True,
+        "token": result["token"],
+        "auth": result.get("auth"),
+        "via": result.get("via"),
+    }
 
 
 @router.delete("/{user_id}")

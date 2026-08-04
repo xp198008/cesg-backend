@@ -187,6 +187,76 @@ class AgentWorkerClient:
             if resp.status_code >= 400:
                 raise AgentWorkerError(resp.text or f"HTTP {resp.status_code}")
 
+    async def analyze_video_violation_stream(
+        self,
+        *,
+        user_id: str,
+        company: str,
+        filename: str,
+        content: bytes,
+        content_type: str | None = None,
+        session_id: str | None = None,
+        extra_fields: dict[str, str] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """POST /api/video/violation，按文档消费 SSE，逐条 yield 解析后的事件。
+
+        直至 object=complete / object=error 结束；错误事件也会 yield 后返回。
+        extra_fields：可选业务上下文（车牌/终端/坐标/地址等），Worker 未识别字段会忽略。
+        """
+        import json
+
+        url = f"{_base_url()}/api/video/violation"
+        files = {"file": (filename, content, content_type or "video/mp4")}
+        data: dict[str, str] = {"company": company, "user_id": str(user_id)}
+        if session_id:
+            data["session_id"] = session_id
+        if extra_fields:
+            for key, value in extra_fields.items():
+                if key and value is not None and str(value).strip():
+                    data[str(key)] = str(value).strip()
+        headers = _auth_headers(user_id, company)
+
+        async with httpx.AsyncClient(timeout=self._video_timeout()) as client:
+            async with client.stream("POST", url, files=files, data=data, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    detail = body.decode("utf-8", "replace")
+                    try:
+                        j = json.loads(detail)
+                        if isinstance(j, dict) and j.get("detail") is not None:
+                            detail = str(j.get("detail"))
+                    except Exception:
+                        pass
+                    raise AgentWorkerError(detail or f"HTTP {resp.status_code}")
+
+                buffer = ""
+                async for chunk in resp.aiter_text():
+                    if not chunk:
+                        continue
+                    buffer += chunk
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line.startswith("data:"):
+                            payload = line[5:].strip()
+                        else:
+                            # 文档示例偶发无 data: 前缀，兼容裸 JSON 行
+                            payload = line
+                        if not payload or payload == "[DONE]":
+                            continue
+                        try:
+                            ev = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(ev, dict):
+                            continue
+                        yield ev
+                        obj = str(ev.get("object") or "")
+                        if obj in ("complete", "error"):
+                            return
+
     async def analyze_video_violation(
         self,
         *,
@@ -196,23 +266,28 @@ class AgentWorkerClient:
         content: bytes,
         content_type: str | None = None,
         session_id: str | None = None,
+        extra_fields: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        url = f"{_base_url()}/api/video/violation"
-        files = {"file": (filename, content, content_type or "video/mp4")}
-        data: dict[str, str] = {"company": company, "user_id": str(user_id)}
-        if session_id:
-            data["session_id"] = session_id
-        async with httpx.AsyncClient(timeout=self._video_timeout()) as client:
-            resp = await client.post(url, files=files, data=data)
-            if resp.status_code >= 400:
-                detail = resp.text
-                try:
-                    j = resp.json()
-                    detail = j.get("detail") if isinstance(j, dict) else detail
-                except Exception:
-                    pass
-                raise AgentWorkerError(str(detail) or f"HTTP {resp.status_code}")
-            return resp.json()
+        """调用 /api/video/violation，消费 SSE 后返回 complete 事件字段（不含 object）。"""
+        last_error = ""
+        async for ev in self.analyze_video_violation_stream(
+            user_id=user_id,
+            company=company,
+            filename=filename,
+            content=content,
+            content_type=content_type,
+            session_id=session_id,
+            extra_fields=extra_fields,
+        ):
+            obj = str(ev.get("object") or "")
+            if obj == "complete":
+                out = dict(ev)
+                out.pop("object", None)
+                return out
+            if obj == "error":
+                last_error = str(ev.get("detail") or ev.get("message") or "视频违章判定失败")
+                raise AgentWorkerError(last_error)
+        raise AgentWorkerError(last_error or "视频违章判定未返回 complete 事件")
 
 
 agent_worker_client = AgentWorkerClient()

@@ -16,8 +16,10 @@ from app.models import (
     PrivateMapRule,
     PrivateMapRuleWeather,
     PublicMapRule,
+    SysUser,
     Vehicle,
 )
+from app.vehicle_alloc_scope import parse_user_id_header
 
 router = APIRouter(prefix="/api", tags=["map-rules"])
 
@@ -48,6 +50,86 @@ async def _resolve_company_id(db: AsyncSession, x_org_id: str | None = None) -> 
     if not cid:
         raise HTTPException(status_code=400, detail="请先维护公司信息")
     return int(cid)
+
+
+async def _load_org_name_parent_maps(
+    db: AsyncSession,
+) -> tuple[dict[int, str | None], dict[int, int | None]]:
+    orgs = (await db.execute(select(OrgCompany.id, OrgCompany.name, OrgCompany.parent_id))).all()
+    name_map = {int(r.id): ((r.name or "").strip() or None) for r in orgs}
+    parent_map = {int(r.id): int(r.parent_id) if r.parent_id is not None else None for r in orgs}
+    return name_map, parent_map
+
+
+def _parent_org_name(
+    org_id: int | None,
+    name_map: dict[int, str | None],
+    parent_map: dict[int, int | None],
+) -> str | None:
+    parent_id = parent_map.get(org_id) if org_id else None
+    return name_map.get(parent_id) if parent_id else None
+
+
+def _find_ancestor_with_fleet_name(
+    org_id: int | None,
+    name_map: dict[int, str | None],
+    parent_map: dict[int, int | None],
+) -> int | None:
+    """从 org 的直接上级开始向上，返回第一个名称含「车队」的组织 id。"""
+    current_id = parent_map.get(org_id) if org_id else None
+    visited: set[int] = set()
+    while current_id and current_id not in visited:
+        visited.add(current_id)
+        name = name_map.get(current_id)
+        if name and "车队" in name:
+            return current_id
+        current_id = parent_map.get(current_id)
+    return None
+
+
+def _company_fleet_names_from_maps(
+    org_id: int | None,
+    name_map: dict[int, str | None],
+    parent_map: dict[int, int | None],
+) -> tuple[str | None, str | None]:
+    """与车辆列表一致：选中车队时公司取上级，车队取本级/含「车队」的祖先。"""
+    if not org_id:
+        return None, None
+    org_name = name_map.get(int(org_id))
+
+    # 1) 本级名称含「车队」：车队=本级，所属公司=上级
+    if org_name and "车队" in org_name:
+        return _parent_org_name(int(org_id), name_map, parent_map), org_name
+
+    # 2) 向上找含「车队」的上级：车队=该上级，所属公司=该上级的上级
+    fleet_org_id = _find_ancestor_with_fleet_name(int(org_id), name_map, parent_map)
+    if fleet_org_id is not None:
+        return _parent_org_name(fleet_org_id, name_map, parent_map), name_map.get(fleet_org_id)
+
+    # 3) 找不到「车队」，且本级名称含「项目/组」：所属公司=上级，车队为空
+    if org_name and ("项目" in org_name or "组" in org_name):
+        return _parent_org_name(int(org_id), name_map, parent_map), None
+
+    # 4) 其它：本级即公司，车队为空
+    return org_name, None
+
+
+async def _resolve_company_fleet_names(
+    db: AsyncSession,
+    org_id: int,
+    *,
+    explicit_fleet: str | None = None,
+) -> tuple[str | None, str | None]:
+    name_map, parent_map = await _load_org_name_parent_maps(db)
+    company_name, fleet_name = _company_fleet_names_from_maps(org_id, name_map, parent_map)
+    text = (explicit_fleet or "").strip()
+    if text:
+        fleet_name = text[:128]
+    if company_name:
+        company_name = company_name[:128]
+    if fleet_name:
+        fleet_name = fleet_name[:128]
+    return company_name or None, fleet_name or None
 
 
 class MapApiConfigBody(BaseModel):
@@ -96,7 +178,8 @@ async def map_api_config_put(body: MapApiConfigBody, db: AsyncSession = Depends(
         db.add(row)
     row.api_key = (body.api_key or "").strip() or None
     row.secret_key = (body.secret_key or "").strip() or None
-    # web_service_key 只读：仅允许启动/失败回退/sync 接口从 808 写入
+    # Web 服务 Key 可在地图接口管理页配置并落库
+    row.web_service_key = (body.web_service_key or "").strip() or None
     if body.default_zoom is not None:
         row.default_zoom = body.default_zoom
     if body.default_center_lng is not None:
@@ -240,6 +323,7 @@ class PrivateMapRuleCreateBody(BaseModel):
     geometry_json: dict[str, Any] | list[Any]
     speed_limit_kmh: int = Field(0, ge=0, le=500)
     ref_public_rule_id: int | None = None
+    fleet_name: str | None = Field(None, max_length=128)
     remark: str | None = Field(None, max_length=255)
 
 
@@ -249,11 +333,13 @@ class PrivateMapRuleUpdateBody(BaseModel):
     geometry_json: dict[str, Any] | list[Any] | None = None
     speed_limit_kmh: int | None = Field(None, ge=0, le=500)
     ref_public_rule_id: int | None = None
+    fleet_name: str | None = Field(None, max_length=128)
     remark: str | None = Field(None, max_length=255)
 
 
 class PrivateRuleCategoryAssignBody(BaseModel):
     category_ids: list[int] = Field(default_factory=list)
+    park_stop_limit_minutes: int = Field(0, ge=0, le=10000)
 
 
 def _private_rule_out(row: PrivateMapRule) -> dict:
@@ -268,10 +354,30 @@ def _private_rule_out(row: PrivateMapRule) -> dict:
         "speed_limit_kmh": row.speed_limit_kmh,
         "ref_public_rule_id": row.ref_public_rule_id,
         "category_ids": _normalize_vehicle_ids(row.category_ids if isinstance(row.category_ids, list) else []),
+        "park_stop_limit_minutes": max(
+            0, min(10000, int(getattr(row, "park_stop_limit_minutes", 0) or 0))
+        ),
+        "company_name": (getattr(row, "company_name", None) or "").strip() or None,
+        "fleet_name": (getattr(row, "fleet_name", None) or "").strip() or None,
         "remark": row.remark,
+        "created_by": row.created_by,
+        "created_by_name": row.created_by_name,
         "created_at": row.created_at.strftime("%Y-%m-%d %H:%M:%S") if row.created_at else None,
         "updated_at": row.updated_at.strftime("%Y-%m-%d %H:%M:%S") if row.updated_at else None,
     }
+
+
+async def _resolve_creator_name(db: AsyncSession, user_id: int | None) -> str | None:
+    if not user_id:
+        return None
+    row = await db.execute(
+        select(SysUser.real_name, SysUser.username).where(SysUser.id == user_id).limit(1)
+    )
+    pair = row.first()
+    if not pair:
+        return None
+    real_name, username = pair
+    return (real_name or "").strip() or (username or "").strip() or None
 
 
 @router.get("/private-map-rules")
@@ -287,7 +393,28 @@ async def private_map_rules_list(
     rows = (
         await db.execute(stmt.order_by(PrivateMapRule.id.desc()).offset(offset).limit(limit))
     ).scalars().all()
-    return {"ok": True, "items": [_private_rule_out(x) for x in rows], "total": total}
+    name_map, parent_map = await _load_org_name_parent_maps(db)
+    ctx_company, ctx_fleet = _company_fleet_names_from_maps(cid, name_map, parent_map)
+    items: list[dict] = []
+    for x in rows:
+        d = _private_rule_out(x)
+        # 历史数据缺快照时，按车辆列表同一逻辑从 company_id 回填展示
+        if not d.get("company_name") or not d.get("fleet_name"):
+            cn, fn = _company_fleet_names_from_maps(int(x.company_id), name_map, parent_map)
+            if not d.get("company_name"):
+                d["company_name"] = cn
+            if not d.get("fleet_name"):
+                d["fleet_name"] = fn
+        items.append(d)
+    return {
+        "ok": True,
+        "items": items,
+        "total": total,
+        "context": {
+            "company_name": ctx_company,
+            "fleet_name": ctx_fleet,
+        },
+    }
 
 
 @router.get("/private-map-rules/weather-type-options")
@@ -298,20 +425,34 @@ async def private_map_rule_weather_type_options():
 class MapRuleCategoryCreateBody(BaseModel):
     type_name: str = Field(..., min_length=1, max_length=128)
     speed_limit_kmh: int = Field(0, ge=0, le=500)
+    min_speed_limit_kmh: int = Field(0, ge=0, le=500)
     weather_rule_id: int | None = None
     weather_types: list[str] = Field(default_factory=lambda: ["sunny"])
     weather_speed_limits: dict[str, int] = Field(default_factory=dict)
     assigned_vehicle_ids: list[int] = Field(default_factory=list)
+    instant_notify_enabled: bool = False
+    broadcast_content: str | None = Field(None, max_length=200)
+    warn_enabled: bool = False
+    warn_percent: int | None = Field(None, ge=1, le=100)
+    warn_content: str | None = Field(None, max_length=200)
+    park_stop_limit_minutes: int = Field(0, ge=0, le=10000)
     remark: str | None = Field(None, max_length=255)
 
 
 class MapRuleCategoryUpdateBody(BaseModel):
     type_name: str | None = Field(None, min_length=1, max_length=128)
     speed_limit_kmh: int | None = Field(None, ge=0, le=500)
+    min_speed_limit_kmh: int | None = Field(None, ge=0, le=500)
     weather_rule_id: int | None = None
     weather_types: list[str] | None = None
     weather_speed_limits: dict[str, int] | None = None
     assigned_vehicle_ids: list[int] | None = None
+    instant_notify_enabled: bool | None = None
+    broadcast_content: str | None = Field(None, max_length=200)
+    warn_enabled: bool | None = None
+    warn_percent: int | None = Field(None, ge=1, le=100)
+    warn_content: str | None = Field(None, max_length=200)
+    park_stop_limit_minutes: int | None = Field(None, ge=0, le=10000)
     remark: str | None = Field(None, max_length=255)
 
 
@@ -336,6 +477,55 @@ def _normalize_vehicle_ids(values: list[int] | None) -> list[int]:
         seen.add(n)
         out.append(n)
     return out
+
+
+# 与前端 DEFAULT_BROADCAST_CONTENT 一致；未启用时也落库保留
+DEFAULT_MAP_RULE_BROADCAST = "您已违反集团限制XX公里最高车速，请注意文明行驶！"
+DEFAULT_MAP_RULE_WARN = "车路协同数字平台提醒您，您已达到限速值的百分之SS，请注意文明驾驶！"
+
+
+def _normalize_broadcast_content(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text:
+        return DEFAULT_MAP_RULE_BROADCAST
+    return text[:200]
+
+
+def _validate_instant_notify(enabled: bool, content: str | None) -> str:
+    """启用开关与播报内容均落库；未启用也保留文案（默认模板）。"""
+    text = _normalize_broadcast_content(content)
+    if enabled and not text:
+        raise HTTPException(status_code=400, detail="启用即时信息通知时请填写播报内容")
+    return text
+
+
+def _normalize_warn_content(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text:
+        return DEFAULT_MAP_RULE_WARN
+    return text[:200]
+
+
+def _validate_warn_config(
+    enabled: bool,
+    percent: int | None,
+    content: str | None,
+) -> tuple[bool, int | None, str]:
+    """预警开关、百分比与文案落库；启用时百分比必填 1-100。"""
+    text = _normalize_warn_content(content)
+    if not enabled:
+        pct = int(percent) if percent is not None else None
+        if pct is not None and (pct < 1 or pct > 100):
+            pct = None
+        return False, pct, text
+    if percent is None:
+        raise HTTPException(status_code=400, detail="启用预警时请填写百分比（1-100）")
+    pct = int(percent)
+    if pct < 1 or pct > 100:
+        raise HTTPException(status_code=400, detail="预警百分比须为 1-100")
+    if not text:
+        raise HTTPException(status_code=400, detail="启用预警时请填写预警文案")
+    return True, pct, text
 
 
 def _normalize_weather_types(values: list[str] | None) -> list[str]:
@@ -418,6 +608,7 @@ async def _category_out(db: AsyncSession, row: MapRuleCategory) -> dict:
         "type_name": row.type_name,
         "company_id": int(row.company_id),
         "speed_limit_kmh": int(row.speed_limit_kmh or 0),
+        "min_speed_limit_kmh": int(getattr(row, "min_speed_limit_kmh", 0) or 0),
         "weather_rule_id": int(row.weather_rule_id) if row.weather_rule_id is not None else None,
         "weather_types": weather_types,
         "weather_speed_limits": weather_speed_limits,
@@ -428,6 +619,17 @@ async def _category_out(db: AsyncSession, row: MapRuleCategory) -> dict:
         "weather_rule_label": weather_rule_label,
         "assigned_vehicle_ids": vehicle_ids,
         "assigned_vehicle_plates": vehicle_plates,
+        "instant_notify_enabled": bool(getattr(row, "instant_notify_enabled", False)),
+        "broadcast_content": (getattr(row, "broadcast_content", None) or "").strip()
+        or DEFAULT_MAP_RULE_BROADCAST,
+        "warn_enabled": bool(getattr(row, "warn_enabled", False)),
+        "warn_percent": int(row.warn_percent)
+        if getattr(row, "warn_percent", None) is not None
+        else None,
+        "warn_content": (getattr(row, "warn_content", None) or "").strip() or DEFAULT_MAP_RULE_WARN,
+        "park_stop_limit_minutes": max(
+            0, min(10000, int(getattr(row, "park_stop_limit_minutes", 0) or 0))
+        ),
         "remark": row.remark,
         "created_at": row.created_at.strftime("%Y-%m-%d %H:%M:%S") if row.created_at else None,
         "updated_at": row.updated_at.strftime("%Y-%m-%d %H:%M:%S") if row.updated_at else None,
@@ -542,14 +744,35 @@ async def map_rule_category_create(
     name = body.type_name.strip()
     if body.weather_rule_id is not None and not await _weather_rule_belongs_to_company(db, body.weather_rule_id, cid):
         raise HTTPException(status_code=400, detail="天气规则不存在或不属于本公司")
+    notify_on = bool(body.instant_notify_enabled)
+    broadcast = _validate_instant_notify(notify_on, body.broadcast_content)
+    warn_on, warn_pct, warn_text = _validate_warn_config(
+        bool(body.warn_enabled),
+        body.warn_percent,
+        body.warn_content,
+    )
+    min_speed = max(0, min(500, int(body.min_speed_limit_kmh or 0)))
+    weather_types = _normalize_weather_types(body.weather_types)
+    weather_speed_limits = _normalize_weather_speed_limits(body.weather_speed_limits, weather_types)
+    if min_speed > 0:
+        for code, spd in weather_speed_limits.items():
+            if int(spd or 0) > 0 and int(spd) < min_speed:
+                raise HTTPException(status_code=400, detail=f"天气限速不能低于最低速度 {min_speed} km/h")
     row = MapRuleCategory(
         type_name=name,
         company_id=cid,
         speed_limit_kmh=int(body.speed_limit_kmh or 0),
+        min_speed_limit_kmh=min_speed,
         weather_rule_id=body.weather_rule_id,
-        weather_types=_normalize_weather_types(body.weather_types),
-        weather_speed_limits=_normalize_weather_speed_limits(body.weather_speed_limits, _normalize_weather_types(body.weather_types)),
+        weather_types=weather_types,
+        weather_speed_limits=weather_speed_limits,
         assigned_vehicle_ids=_normalize_vehicle_ids(body.assigned_vehicle_ids),
+        instant_notify_enabled=notify_on,
+        broadcast_content=broadcast,
+        warn_enabled=warn_on,
+        warn_percent=warn_pct,
+        warn_content=warn_text,
+        park_stop_limit_minutes=max(0, min(10000, int(body.park_stop_limit_minutes or 0))),
         remark=(body.remark or "").strip() or None,
     )
     db.add(row)
@@ -576,6 +799,8 @@ async def map_rule_category_update(
         row.type_name = body.type_name.strip()
     if "speed_limit_kmh" in data:
         row.speed_limit_kmh = int(body.speed_limit_kmh or 0)
+    if "min_speed_limit_kmh" in data:
+        row.min_speed_limit_kmh = max(0, min(500, int(body.min_speed_limit_kmh or 0)))
     if "weather_rule_id" in data:
         if body.weather_rule_id is not None and not await _weather_rule_belongs_to_company(db, body.weather_rule_id, cid):
             raise HTTPException(status_code=400, detail="天气规则不存在或不属于本公司")
@@ -585,8 +810,37 @@ async def map_rule_category_update(
     if "weather_speed_limits" in data or "weather_types" in data:
         wtypes = _normalize_weather_types(body.weather_types) if body.weather_types is not None else _normalize_weather_types(row.weather_types if isinstance(row.weather_types, list) else [])
         row.weather_speed_limits = _normalize_weather_speed_limits(body.weather_speed_limits, wtypes)
+    min_speed = int(getattr(row, "min_speed_limit_kmh", 0) or 0)
+    if min_speed > 0:
+        wsl = row.weather_speed_limits if isinstance(row.weather_speed_limits, dict) else {}
+        for _code, spd in wsl.items():
+            if int(spd or 0) > 0 and int(spd) < min_speed:
+                raise HTTPException(status_code=400, detail=f"天气限速不能低于最低速度 {min_speed} km/h")
     if "assigned_vehicle_ids" in data:
         row.assigned_vehicle_ids = _normalize_vehicle_ids(body.assigned_vehicle_ids)
+    if "instant_notify_enabled" in data or "broadcast_content" in data:
+        notify_on = (
+            bool(body.instant_notify_enabled)
+            if "instant_notify_enabled" in data
+            else bool(getattr(row, "instant_notify_enabled", False))
+        )
+        content_src = body.broadcast_content if "broadcast_content" in data else getattr(row, "broadcast_content", None)
+        row.instant_notify_enabled = notify_on
+        row.broadcast_content = _validate_instant_notify(notify_on, content_src)
+    if "warn_enabled" in data or "warn_percent" in data or "warn_content" in data:
+        warn_on = (
+            bool(body.warn_enabled)
+            if "warn_enabled" in data
+            else bool(getattr(row, "warn_enabled", False))
+        )
+        pct_src = body.warn_percent if "warn_percent" in data else getattr(row, "warn_percent", None)
+        content_src = body.warn_content if "warn_content" in data else getattr(row, "warn_content", None)
+        warn_on, warn_pct, warn_text = _validate_warn_config(warn_on, pct_src, content_src)
+        row.warn_enabled = warn_on
+        row.warn_percent = warn_pct
+        row.warn_content = warn_text
+    if "park_stop_limit_minutes" in data and body.park_stop_limit_minutes is not None:
+        row.park_stop_limit_minutes = max(0, min(10000, int(body.park_stop_limit_minutes)))
     if "remark" in data:
         row.remark = (body.remark or "").strip() or None
     await db.flush()
@@ -645,6 +899,9 @@ async def private_map_rule_categories_get(
     return {
         "ok": True,
         "selected_category_ids": selected_ids,
+        "park_stop_limit_minutes": max(
+            0, min(10000, int(getattr(row, "park_stop_limit_minutes", 0) or 0))
+        ),
         "items": [await _category_out(db, x) for x in rows],
     }
 
@@ -696,21 +953,32 @@ async def private_map_rule_categories_put(
         if conflicts:
             raise HTTPException(status_code=400, detail=conflicts[0])
     row.category_ids = ids
+    row.park_stop_limit_minutes = max(0, min(10000, int(body.park_stop_limit_minutes or 0)))
     await db.flush()
     await db.refresh(row)
-    return {"ok": True, "selected_category_ids": ids, "data": _private_rule_out(row)}
+    return {
+        "ok": True,
+        "selected_category_ids": ids,
+        "park_stop_limit_minutes": int(row.park_stop_limit_minutes or 0),
+        "data": _private_rule_out(row),
+    }
 
 
 @router.post("/private-map-rules")
 async def private_map_rule_create(
     body: PrivateMapRuleCreateBody,
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
     cid = await _resolve_company_id(db, x_org_id)
     rule_code = body.rule_code.strip()
     if await db.scalar(select(PrivateMapRule.id).where(PrivateMapRule.rule_code == rule_code).limit(1)):
         raise HTTPException(status_code=400, detail="规则编号已存在")
+    creator_id = parse_user_id_header(x_user_id)
+    company_name, fleet_name = await _resolve_company_fleet_names(
+        db, cid, explicit_fleet=body.fleet_name
+    )
     row = PrivateMapRule(
         company_id=cid,
         rule_code=rule_code,
@@ -720,7 +988,11 @@ async def private_map_rule_create(
         geometry_json=body.geometry_json,
         speed_limit_kmh=body.speed_limit_kmh,
         ref_public_rule_id=body.ref_public_rule_id,
+        company_name=company_name,
+        fleet_name=fleet_name,
         remark=(body.remark or "").strip() or None,
+        created_by=creator_id,
+        created_by_name=await _resolve_creator_name(db, creator_id),
     )
     db.add(row)
     await db.flush()
@@ -752,6 +1024,11 @@ async def private_map_rule_update(
         row.speed_limit_kmh = body.speed_limit_kmh
     if "ref_public_rule_id" in data:
         row.ref_public_rule_id = body.ref_public_rule_id
+    if "fleet_name" in data:
+        row.fleet_name = (body.fleet_name or "").strip()[:128] or None
+        # 改车队时同步按当前组织重算所属公司（与车辆列表一致）
+        company_name, _ = await _resolve_company_fleet_names(db, cid)
+        row.company_name = company_name
     if "remark" in data:
         row.remark = (body.remark or "").strip() or None
     await db.flush()
@@ -785,10 +1062,14 @@ class BatchFromPublicBody(BaseModel):
 async def private_map_rules_batch_from_public(
     body: BatchFromPublicBody,
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
     """根据勾选的公用规则，为本公司批量生成/更新私有规则（对照复制）。"""
     cid = await _resolve_company_id(db, x_org_id)
+    creator_id = parse_user_id_header(x_user_id)
+    creator_name = await _resolve_creator_name(db, creator_id)
+    company_name, fleet_name = await _resolve_company_fleet_names(db, cid)
     created = updated = skipped = 0
     for public_id in list(dict.fromkeys(body.public_rule_ids)):
         pub = await db.scalar(select(PublicMapRule).where(PublicMapRule.id == public_id).limit(1))
@@ -814,7 +1095,11 @@ async def private_map_rules_batch_from_public(
                 speed_limit_kmh=0,
                 ref_public_rule_id=public_id,
                 category_ids=[],
+                company_name=company_name,
+                fleet_name=fleet_name,
                 remark=pub.remark,
+                created_by=creator_id,
+                created_by_name=creator_name,
             )
             db.add(row)
             created += 1
