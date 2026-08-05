@@ -1,0 +1,272 @@
+<sys>:0: SAWarning: relationship 'VehicleAllocRule.vehicles' will copy column vehicle_alloc_rule.id to column vehicle_alloc_rule_vehicle.rule_id, which conflicts with relationship(s): 'Vehicle.alloc_rules' (copies vehicle_alloc_rule.id to vehicle_alloc_rule_vehicle.rule_id). If this is not the intention, consider if these relationships should be linked with back_populates, or if viewonly=True should be applied to one or more if they are read-only. For the less common case that foreign key constraints are partially overlapping, the orm.foreign() annotation can be used to isolate the columns that should be written towards.   To silence this warning, add the parameter 'overlaps="alloc_rules"' to the 'VehicleAllocRule.vehicles' relationship. (Background on this warning at: https://sqlalche.me/e/20/qzyx) (This warning originated from the `configure_mappers()` process, which was invoked automatically in response to a user-initiated operation.)
+<sys>:0: SAWarning: relationship 'VehicleAllocRule.vehicles' will copy column vehicle.id to column vehicle_alloc_rule_vehicle.vehicle_id, which conflicts with relationship(s): 'Vehicle.alloc_rules' (copies vehicle.id to vehicle_alloc_rule_vehicle.vehicle_id). If this is not the intention, consider if these relationships should be linked with back_populates, or if viewonly=True should be applied to one or more if they are read-only. For the less common case that foreign key constraints are partially overlapping, the orm.foreign() annotation can be used to isolate the columns that should be written towards.   To silence this warning, add the parameter 'overlaps="alloc_rules"' to the 'VehicleAllocRule.vehicles' relationship. (Background on this warning at: https://sqlalche.me/e/20/qzyx) (This warning originated from the `configure_mappers()` process, which was invoked automatically in response to a user-initiated operation.)
+<sys>:0: SAWarning: relationship 'VehicleAllocRule.users' will copy column vehicle_alloc_rule.id to column vehicle_alloc_rule_user.rule_id, which conflicts with relationship(s): 'SysUser.vehicle_alloc_rules' (copies vehicle_alloc_rule.id to vehicle_alloc_rule_user.rule_id). If this is not the intention, consider if these relationships should be linked with back_populates, or if viewonly=True should be applied to one or more if they are read-only. For the less common case that foreign key constraints are partially overlapping, the orm.foreign() annotation can be used to isolate the columns that should be written towards.   To silence this warning, add the parameter 'overlaps="vehicle_alloc_rules"' to the 'VehicleAllocRule.users' relationship. (Background on this warning at: https://sqlalche.me/e/20/qzyx) (This warning originated from the `configure_mappers()` process, which was invoked automatically in response to a user-initiated operation.)
+<sys>:0: SAWarning: relationship 'VehicleAllocRule.users' will copy column sys_user.id to column vehicle_alloc_rule_user.user_id, which conflicts with relationship(s): 'SysUser.vehicle_alloc_rules' (copies sys_user.id to vehicle_alloc_rule_user.user_id). If this is not the intention, consider if these relationships should be linked with back_populates, or if viewonly=True should be applied to one or more if they are read-only. For the less common case that foreign key constraints are partially overlapping, the orm.foreign() annotation can be used to isolate the columns that should be written towards.   To silence this warning, add the parameter 'overlaps="vehicle_alloc_rules"' to the 'VehicleAllocRule.users' relationship. (Background on this warning at: https://sqlalche.me/e/20/qzyx) (This warning originated from the `configure_mappers()` process, which was invoked automatically in response to a user-initiated operation.)
+
+============================================================
+步骤1：从生产 CESG 获取车辆信息
+============================================================
+GET http://113.207.68.96:8100/api/vehicle/list?plate_no=7610
+
+============================================================
+步骤1 结果：CESG vehicle id=80
+============================================================
+{
+  "id": 80,
+  "plate_no": "渝DX7610",
+  "plate_color": "黄牌",
+  "vehicle_category": "fuel",
+  "vehicle_type": "隧道清洗车",
+  "vehicle_type_ii": null,
+  "color": null,
+  "vin": "123456",
+  "driving_license_no": null,
+  "engine_no": "12563",
+  "product_model_code": "259632",
+  "frame_no": null,
+  "vehicle_type_code": null,
+  "vehicle_length": null,
+  "vehicle_width": null,
+  "vehicle_height": null,
+  "loaded_weight": null,
+  "vehicle_payload": null,
+  "curb_weight": null,
+  "urea_info": null,
+  "short_name": null,
+  "company_id": 229,
+  "fleet_id": null,
+  "driver_id": null,
+  "driver_name": null,
+  "owner_name": null,
+  "contact_name": null,
+  "contact_phone": null,
+  "legal_contact_phone": null,
+  "legal_address": null,
+  "route": null,
+  "agent": null,
+  "install_date": null,
+  "service_start_date": null,
+  "service_end_date": null,
+  "status": "正常",
+  "last_online_at": null,
+  "channel_count": 0,
+  "engine_displacement": null,
+  "fuel_tank_capacity": null,
+  "battery_capacity": null,
+  "range_mileage": null,
+  "battery_no": null,
+  "motor_no": null,
+  "manufacturer": null,
+  "brand": null,
+  "model": null,
+  "vehicle_grade": null,
+  "vehicle_usage": null,
+  "speed_limit": 0.0,
+  "track_retain_days": 0,
+  "mileage_factor": null,
+  "mileage_offset": null,
+  "scrap_date": null,
+  "inspect_date": null,
+  "plate_login": false,
+  "is_connect": false,
+  "acc_on": true,
+  "night_speed_enabled": false,
+  "night_start_time": null,
+  "night_end_time": null,
+  "night_speed_percent": null,
+  "icon_id": 1,
+  "remark": null,
+  "device_no": "020251000334",
+  "device_sn": null,
+  "terminal_type": null,
+  "sim_no": "8986112522209036156",
+  "actual_sim": null,
+  "product_model": null,
+  "channels": [
+    "CH1",
+    "CH2",
+    "CH3",
+    "CH4",
+    "CH5",
+    "CH6",
+    "CH7"
+  ],
+  "device_channel_no": 7
+}
+
+============================================================
+步骤1b：解析 808 groupId
+============================================================
+{
+  "company_id": 229,
+  "jt808_group_id": 402,
+  "note": "来自本地 org_company.jt808_group_id（与生产库字段一致）"
+}
+
+============================================================
+步骤2：组装同步用车辆数据
+============================================================
+{
+  "id": 80,
+  "plate_no": "渝DX7610",
+  "plate_color": "黄牌",
+  "vin": "123456",
+  "engine_no": "12563",
+  "product_model_code": "259632",
+  "frame_no": null,
+  "vehicle_type_code": null,
+  "vehicle_length": null,
+  "vehicle_width": null,
+  "vehicle_height": null,
+  "loaded_weight": null,
+  "vehicle_payload": null,
+  "curb_weight": null,
+  "urea_info": null,
+  "channel_count": 7,
+  "channels": [
+    "CH1",
+    "CH2",
+    "CH3",
+    "CH4",
+    "CH5",
+    "CH6",
+    "CH7"
+  ],
+  "contact_name": null,
+  "contact_phone": null,
+  "owner_name": null,
+  "remark": null,
+  "device_no": "020251000334",
+  "sim_no": "8986112522209036156",
+  "terminal_type": null,
+  "group_id": 402,
+  "driver_name": null,
+  "vehicle_category": "fuel",
+  "vehicle_type": "隧道清洗车",
+  "vehicle_type_ii": null,
+  "vehicle_usage": null,
+  "status": "正常",
+  "brand": null,
+  "model": null,
+  "manufacturer": null,
+  "engine_displacement": null,
+  "fuel_tank_capacity": null,
+  "battery_capacity": null,
+  "range_mileage": null,
+  "battery_no": null,
+  "motor_no": null,
+  "vehicle_grade": null,
+  "route": null,
+  "agent": null,
+  "mileage_offset": null,
+  "mileage_factor": null,
+  "speed_limit": 0.0,
+  "track_retain_days": 0,
+  "icon_id": 1,
+  "night_speed_enabled": false,
+  "night_start_time": null,
+  "night_end_time": null,
+  "night_speed_percent": null,
+  "plate_login": false,
+  "is_connect": false,
+  "install_date": null,
+  "service_start_date": null,
+  "service_end_date": null,
+  "scrap_date": null,
+  "inspect_date": null
+}
+
+============================================================
+步骤3：808 登录 apicode=8003
+============================================================
+POST http://113.207.68.96:8800/api
+
+============================================================
+8003 请求体（密码已 MD5）
+============================================================
+{
+  "language": "zh-CN",
+  "apicode": 8003,
+  "account": "admin",
+  "password": "<md5>"
+}
+
+============================================================
+8003 响应
+============================================================
+{
+  "code": 1,
+  "isMainComment": true,
+  "auth": false,
+  "roleCode": [
+    "SUPER_ADMIN"
+  ],
+  "name": "admin",
+  "id": "43b2f84b-6e2d-4c4a-87d6-ab67e8c883ae",
+  "message": "操作成功",
+  "homePage": "/main/home",
+  "token": "EnuCRBFPtA1pPuc5wdX7iSSmNrlcIzoI457cab23e1a34087a6c628a83da43b55"
+}
+
+============================================================
+步骤4：808 车辆同步 apicode=1251 请求
+============================================================
+{
+  "url": "http://113.207.68.96:8800/api",
+  "method": "POST",
+  "body": {
+    "language": "zh-CN",
+    "apicode": 1251,
+    "deviceId": "20251000334",
+    "groupId": 402,
+    "carno": "渝DX7610",
+    "deviceType": "JT808-2013",
+    "oilBox": 0,
+    "ext_json": "{\"sim\": \"8986112522209036156\", \"czxm\": \"\", \"tel\": \"\", \"cjh\": \"123456\", \"version\": \"JT808-2013\", \"channel_num\": 7, \"remark\": \"CESG同步\", \"CH1\": 1, \"CH2\": 1, \"CH3\": 1, \"CH4\": 1, \"CH5\": 1, \"CH6\": 1, \"CH7\": 1, \"engine_no\": \"12563\", \"product_model_code\": \"259632\", \"plate_color\": \"黄牌\", \"vehicle_category\": \"fuel\", \"vehicle_type\": \"隧道清洗车\", \"status\": \"正常\", \"speed_limit\": 0.0, \"track_retain_days\": 0, \"icon_id\": 1, \"night_speed_enabled\": false, \"plate_login\": false, \"is_connect\": false}",
+    "id": 105,
+    "lingxtoken": "EnuCRBFPtA1pPuc5wdX7iSSmNrlcIzoI457cab23e1a34087a6c628a83da43b55"
+  }
+}
+
+============================================================
+ext_json 展开
+============================================================
+{
+  "sim": "8986112522209036156",
+  "czxm": "",
+  "tel": "",
+  "cjh": "123456",
+  "version": "JT808-2013",
+  "channel_num": 7,
+  "remark": "CESG同步",
+  "CH1": 1,
+  "CH2": 1,
+  "CH3": 1,
+  "CH4": 1,
+  "CH5": 1,
+  "CH6": 1,
+  "CH7": 1,
+  "engine_no": "12563",
+  "product_model_code": "259632",
+  "plate_color": "黄牌",
+  "vehicle_category": "fuel",
+  "vehicle_type": "隧道清洗车",
+  "status": "正常",
+  "speed_limit": 0.0,
+  "track_retain_days": 0,
+  "icon_id": 1,
+  "night_speed_enabled": false,
+  "plate_login": false,
+  "is_connect": false
+}
+
+============================================================
+步骤4：808 车辆同步 1251 响应
+============================================================
+{
+  "code": 1,
+  "data": {
+    "id": "105"
+  },
+  "message": "SUCCESS"
+}

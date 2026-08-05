@@ -1,0 +1,11 @@
+import sqlite3
+c = sqlite3.connect("data/cesg.db")
+cur = c.cursor()
+cur.execute("select count(*) from vehicle")
+print("count", cur.fetchone())
+cur.execute("select id, plate_no from vehicle order by id desc limit 15")
+print("recent", cur.fetchall())
+cur.execute("select id, plate_no from vehicle where id=7610")
+print("id7610", cur.fetchall())
+cur.execute("select id, plate_no from vehicle where plate_no like '%7610%'")
+print("plate7610", cur.fetchall())
