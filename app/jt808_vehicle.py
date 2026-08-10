@@ -467,7 +467,14 @@ async def _build_1251_request(data: dict, token: str) -> tuple[dict[str, Any] | 
     return body, None
 
 
-async def _sync_upsert(data: dict, trace: dict | None = None) -> bool:
+async def _sync_upsert(data: dict, trace: dict | None = None) -> bool | None:
+    """同步车辆到 808。
+
+    返回值：
+    - True：同步成功
+    - False：已尝试同步但失败（接口异常/业务失败）
+    - None：不具备同步条件，跳过（勿提示「808 失败」）
+    """
     dev = (data.get("device_no") or "").strip()
     if trace is not None:
         trace["fuel_tank_capacity_raw"] = data.get("fuel_tank_capacity")
@@ -479,23 +486,23 @@ async def _sync_upsert(data: dict, trace: dict | None = None) -> bool:
         logger.info("JT808 车辆同步跳过：无主设备号 vehicle_id=%s", data.get("id"))
         if trace is not None:
             trace["skip_reason"] = "无主设备号"
-        return False
+        return None
     gid = data.get("group_id")
     if not gid:
-        logger.warning("JT808 车辆同步跳过：公司无 jt808_group_id vehicle_id=%s", data.get("id"))
+        logger.info("JT808 车辆同步跳过：公司无 jt808_group_id vehicle_id=%s", data.get("id"))
         if trace is not None:
             trace["skip_reason"] = "所属公司未配置 jt808_group_id"
-        return False
+        return None
 
     tid = ""
     try:
         token = await _ensure_token()
         payload, err = await _build_1251_request(data, token)
         if payload is None:
-            logger.warning("JT808 1251 车辆同步跳过 vehicle_id=%s: %s", data.get("id"), err)
+            logger.info("JT808 1251 车辆同步跳过 vehicle_id=%s: %s", data.get("id"), err)
             if trace is not None:
                 trace["skip_reason"] = err
-            return False
+            return None
         tid = payload["deviceId"]
         plate = payload["carno"]
         car_id = payload.get("id")

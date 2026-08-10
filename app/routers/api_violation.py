@@ -27,9 +27,14 @@ from app.media_url import normalize_evidence_payload
 from app.models import Driver, Fleet, OrgCompany, SysUser, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTicket, ViolationTypeDict
 from app.org_scope import collect_org_company_subtree_ids, require_x_org_id_header
 from app.plate_util import norm_plate
-from app.vehicle_alloc_scope import parse_user_id_header, resolve_allowed_plate_nos
+from app.vehicle_alloc_scope import (
+    parse_user_id_header,
+    resolve_allowed_vehicle_ids,
+    user_has_vehicle_alloc_rules,
+)
 from app.routers.api_vehicle import _vehicle_list_company_fleet_names
 from app.timeutil import china_now_naive
+from app.ttl_cache import ttl_get_or_set_async
 from app.jt808_violation_sync import lookup_company_name, notify_violation_created
 from app.violation_alert_cache import get_alerts_after
 from app.alarm_type_gate import (
@@ -355,16 +360,24 @@ def _dt_text(v: datetime | None) -> str | None:
     return v.strftime("%Y-%m-%d %H:%M:%S") if v else None
 
 
+_ORG_MAPS_TTL = 60.0
+
+
 async def _load_org_company_maps(db: AsyncSession) -> tuple[dict[int, str | None], dict[int, int | None], dict[int, str | None]]:
-    company_map: dict[int, str | None] = {}
-    parent_map: dict[int, int | None] = {}
-    for cid, cname, pid in (await db.execute(select(OrgCompany.id, OrgCompany.name, OrgCompany.parent_id))).all():
-        company_map[cid] = cname
-        parent_map[cid] = pid
-    fleet_map: dict[int, str | None] = {}
-    for fid, fname in (await db.execute(select(Fleet.id, Fleet.name))).all():
-        fleet_map[fid] = fname
-    return company_map, parent_map, fleet_map
+    async def _load():
+        company_map: dict[int, str | None] = {}
+        parent_map: dict[int, int | None] = {}
+        for cid, cname, pid in (await db.execute(select(OrgCompany.id, OrgCompany.name, OrgCompany.parent_id))).all():
+            company_map[cid] = cname
+            parent_map[cid] = pid
+        fleet_map: dict[int, str | None] = {}
+        for fid, fname in (await db.execute(select(Fleet.id, Fleet.name))).all():
+            fleet_map[fid] = fname
+        return company_map, parent_map, fleet_map
+
+    cached = await ttl_get_or_set_async("violation:org_company_maps", _ORG_MAPS_TTL, _load)
+    company_map, parent_map, fleet_map = cached
+    return dict(company_map), dict(parent_map), dict(fleet_map)
 
 
 def _apply_vehicle_display_fields(
@@ -424,7 +437,7 @@ async def _rows_out(
     company_map, parent_map, fleet_map = await _load_org_company_maps(db)
     risk_map = await load_alarm_type_risk_map(db)
     items: list[dict[str, Any]] = []
-    fill_budget = 3
+    # 列表不做逆地理：地址补全只在详情/处理弹窗，避免列表被高德请求拖慢
     for row in rows:
         out = _row_out(row, ticket_by_biz, risk_map=risk_map)
         vehicle = vehicles.get(int(row.vehicle_id)) if row.vehicle_id else None
@@ -438,14 +451,10 @@ async def _rows_out(
             fleet_map=fleet_map,
             drivers=drivers,
         )
-        if fill_budget > 0 and not (out.get("address") or "").strip():
-            try:
-                addr = await ensure_violation_address(db, row)
-                if addr:
-                    out["address"] = addr
-                    fill_budget -= 1
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("列表补地址跳过 id=%s: %s", row.id, exc)
+        if not (out.get("company_name") or "").strip() or out.get("company_name") == "—":
+            snap = (getattr(row, "company_name", None) or "").strip()
+            if snap:
+                out["company_name"] = snap
         items.append(out)
     return items
 
@@ -551,19 +560,33 @@ async def _scoped_query(
     if disabled_alarm_type_names is None:
         disabled_alarm_type_names = await load_disabled_alarm_type_names(db)
     q = select(VehicleViolation).where(violation_list_visibility(disabled_alarm_type_names))
+    subtree: set[int] | None = None
     if x_org_id:
         root = require_x_org_id_header(x_org_id)
         exists = await db.scalar(select(OrgCompany.id).where(OrgCompany.id == root).limit(1))
         if exists:
             subtree = await collect_org_company_subtree_ids(db, root)
-            q = q.where(or_(VehicleViolation.company_id.in_(subtree), VehicleViolation.company_id.is_(None)))
-    # 车辆分配规则：有规则仅可见管控车辆；无规则则按组织树（与 vehicle_alloc_scope 一致）
-    allowed_plates = await resolve_allowed_plate_nos(db, parse_user_id_header(x_user_id))
-    if allowed_plates is not None:
-        if not allowed_plates:
-            q = q.where(VehicleViolation.id < 0)
-        else:
-            q = q.where(VehicleViolation.plate_no.in_(sorted(allowed_plates)))
+            # company_id 为空时，仅保留车辆挂在组织树内的记录，避免脏数据穿透
+            q = q.where(
+                or_(
+                    VehicleViolation.company_id.in_(subtree),
+                    and_(
+                        VehicleViolation.company_id.is_(None),
+                        VehicleViolation.vehicle_id.in_(
+                            select(Vehicle.id).where(Vehicle.company_id.in_(subtree))
+                        ),
+                    ),
+                )
+            )
+    # 仅「绑定了车辆分配规则」时按 vehicle_id 收紧；无规则依赖组织树，避免上千车牌 IN
+    uid = parse_user_id_header(x_user_id)
+    if uid is not None and await user_has_vehicle_alloc_rules(db, uid):
+        allowed_ids = await resolve_allowed_vehicle_ids(db, uid)
+        if allowed_ids is not None:
+            if not allowed_ids:
+                q = q.where(VehicleViolation.id < 0)
+            else:
+                q = q.where(VehicleViolation.vehicle_id.in_(list(allowed_ids)))
     return q
 
 
@@ -709,7 +732,16 @@ async def violation_list(
     if min_id is not None and min_id > 0:
         q = q.where(VehicleViolation.id > min_id)
 
-    total = await db.scalar(select(func.count()).select_from(q.subquery())) or 0
+    # count 只统计 id，避免对整行实体做 subquery
+    total = (
+        await db.scalar(
+            select(func.count()).select_from(
+                q.with_only_columns(VehicleViolation.id, maintain_column_froms=True)
+                .order_by(None)
+                .subquery()
+            )
+        )
+    ) or 0
     lim = limit or page_size
     off = offset if offset is not None else (page - 1) * page_size
     order = (

@@ -1089,6 +1089,8 @@ async def vehicle_list(
             if company_subtree:
                 q = q.where(Vehicle.company_id.in_(company_subtree))
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
+    # 最新创建的车辆优先，便于列表查看新数据
+    q = q.order_by(Vehicle.created_at.desc(), Vehicle.id.desc())
     q = q.offset((page - 1) * page_size).limit(page_size)
     rows = (await db.execute(q)).scalars().all()
 

@@ -9,9 +9,13 @@ from sqlalchemy import func, not_, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AlarmTypeDict, VehicleViolation
+from app.ttl_cache import ttl_get_or_set_async
 from app.violation_risk import risk_from_safety_level
 
 logger = logging.getLogger(__name__)
+
+_DISABLED_NAMES_TTL = 60.0
+_RISK_MAP_TTL = 60.0
 
 
 async def load_alarm_type_by_name(db: AsyncSession, type_name: str) -> AlarmTypeDict | None:
@@ -22,12 +26,15 @@ async def load_alarm_type_by_name(db: AsyncSession, type_name: str) -> AlarmType
 
 
 async def load_disabled_alarm_type_names(db: AsyncSession) -> list[str]:
-    rows = (
-        await db.execute(
-            select(AlarmTypeDict.type_name).where(AlarmTypeDict.status == "停用").order_by(AlarmTypeDict.id.asc())
-        )
-    ).scalars().all()
-    return [str(x).strip() for x in rows if str(x or "").strip()]
+    async def _load() -> list[str]:
+        rows = (
+            await db.execute(
+                select(AlarmTypeDict.type_name).where(AlarmTypeDict.status == "停用").order_by(AlarmTypeDict.id.asc())
+            )
+        ).scalars().all()
+        return [str(x).strip() for x in rows if str(x or "").strip()]
+
+    return list(await ttl_get_or_set_async("alarm:disabled_type_names", _DISABLED_NAMES_TTL, _load))
 
 
 def disabled_alarm_type_name_aliases(name: str) -> list[str]:
@@ -87,14 +94,19 @@ def risk_level_from_alarm_type(row: AlarmTypeDict | None, fallback_name: str | N
 
 async def load_alarm_type_risk_map(db: AsyncSession) -> dict[str, str]:
     """type_name → high/mid/low，供列表/补全按类型安全级别展示。"""
-    rows = (await db.execute(select(AlarmTypeDict.type_name, AlarmTypeDict.safety_level))).all()
-    out: dict[str, str] = {}
-    for type_name, safety_level in rows:
-        name = str(type_name or "").strip()
-        if not name:
-            continue
-        out[name] = risk_from_safety_level(safety_level)
-    return out
+
+    async def _load() -> dict[str, str]:
+        rows = (await db.execute(select(AlarmTypeDict.type_name, AlarmTypeDict.safety_level))).all()
+        out: dict[str, str] = {}
+        for type_name, safety_level in rows:
+            name = str(type_name or "").strip()
+            if not name:
+                continue
+            out[name] = risk_from_safety_level(safety_level)
+        return out
+
+    cached = await ttl_get_or_set_async("alarm:type_risk_map", _RISK_MAP_TTL, _load)
+    return dict(cached)
 
 
 async def _within_min_interval(

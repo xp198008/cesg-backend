@@ -38,7 +38,7 @@ def _fmt_dt(dt: datetime | None) -> str:
 
 
 class RoleCreatePayload(BaseModel):
-    name: str = Field(..., min_length=1, max_length=64)
+    name: str = Field(..., min_length=1, max_length=20)
     org_id: int | None = None
     is_global: bool = False
     permissions: str = Field(default="[]", max_length=65535)
@@ -47,7 +47,7 @@ class RoleCreatePayload(BaseModel):
 
 class RoleUpdatePayload(BaseModel):
     role_id: int = Field(..., ge=1)
-    name: str = Field(..., min_length=1, max_length=64)
+    name: str = Field(..., min_length=1, max_length=20)
     org_id: int | None = None
     is_global: bool = False
     permissions: str = Field(default="[]", max_length=65535)

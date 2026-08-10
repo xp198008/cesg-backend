@@ -8,24 +8,32 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models import OrgCompany, SysUser
+from app.ttl_cache import ttl_get_or_set_async
 from app.vehicle_alloc_scope import parse_user_id_header
+
+_ORG_SUBTREE_TTL = 60.0
 
 
 async def collect_org_company_subtree_ids(db: AsyncSession, root_id: int) -> set[int]:
     """返回 root_id 自身及其所有下级公司 id（按 parent_id BFS）。"""
     rid = int(root_id)
-    out: set[int] = {rid}
-    frontier = [rid]
-    while frontier:
-        r = await db.execute(select(OrgCompany.id).where(OrgCompany.parent_id.in_(frontier)))
-        nxt: list[int] = []
-        for row in r.all():
-            cid = int(row[0])
-            if cid not in out:
-                out.add(cid)
-                nxt.append(cid)
-        frontier = nxt
-    return out
+
+    async def _load() -> set[int]:
+        out: set[int] = {rid}
+        frontier = [rid]
+        while frontier:
+            r = await db.execute(select(OrgCompany.id).where(OrgCompany.parent_id.in_(frontier)))
+            nxt: list[int] = []
+            for row in r.all():
+                cid = int(row[0])
+                if cid not in out:
+                    out.add(cid)
+                    nxt.append(cid)
+            frontier = nxt
+        return out
+
+    cached = await ttl_get_or_set_async(f"org:subtree:{rid}", _ORG_SUBTREE_TTL, _load)
+    return set(cached)
 
 
 def wants_org_tree_scope(scope_org_tree: bool, x_org_id: str | None) -> bool:

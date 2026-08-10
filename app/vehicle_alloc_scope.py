@@ -153,10 +153,24 @@ async def resolve_allowed_vehicle_ids(
     if user is None or not user.is_active:
         return set()
 
+    # admin 不做车辆限制：避免先全表拉 Vehicle.id 再丢弃
+    if _is_admin_user(user):
+        return None
+
     vehicle_ids, unrestricted = await _resolve_scope_vehicle_ids(db, user)
     if unrestricted:
         return None
     return vehicle_ids
+
+
+async def user_has_vehicle_alloc_rules(db: AsyncSession, user_id: int | None) -> bool:
+    """用户是否绑定了车辆分配规则（有规则才需要额外按车过滤）。"""
+    if user_id is None:
+        return False
+    rid = await db.scalar(
+        select(VehicleAllocRuleUser.rule_id).where(VehicleAllocRuleUser.user_id == int(user_id)).limit(1)
+    )
+    return rid is not None
 
 
 async def resolve_allowed_plate_nos(

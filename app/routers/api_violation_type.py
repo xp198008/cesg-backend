@@ -1,6 +1,8 @@
 """违章类型字典：基础数据本地 CRUD（对齐 violation_type_maintenance.html）。"""
 from __future__ import annotations
 
+import secrets
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -8,10 +10,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import ViolationTypeDict
+from app.timeutil import china_now_naive
 
 router = APIRouter(prefix="/api/violation-type", tags=["violation-type"])
 
 _ALLOWED_SEVERITY = frozenset({"轻微", "一般", "严重"})
+
+
+def _gen_type_code() -> str:
+    return f"VT{china_now_naive().strftime('%Y%m%d%H%M%S')}{secrets.token_hex(2).upper()}"
+
+
+async def _allocate_unique_type_code(db: AsyncSession) -> str:
+    for _ in range(12):
+        code = _gen_type_code()
+        exists = await db.scalar(select(ViolationTypeDict.id).where(ViolationTypeDict.type_code == code).limit(1))
+        if exists is None:
+            return code
+    raise HTTPException(status_code=500, detail="生成类型编码失败，请重试")
 
 
 def _severity_or_400(raw: str | None) -> str:
@@ -22,7 +38,6 @@ def _severity_or_400(raw: str | None) -> str:
 
 
 class ViolationTypeCreateIn(BaseModel):
-    type_code: str = Field(..., min_length=1, max_length=32)
     type_name: str = Field(..., min_length=1, max_length=64)
     description: str | None = Field(None, max_length=2000)
     severity: str = Field("一般")
@@ -82,12 +97,8 @@ async def violation_type_get(tid: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("")
 async def violation_type_create(body: ViolationTypeCreateIn, db: AsyncSession = Depends(get_db)):
-    code = body.type_code.strip()
-    dup = await db.scalar(select(ViolationTypeDict.id).where(ViolationTypeDict.type_code == code).limit(1))
-    if dup is not None:
-        raise HTTPException(status_code=400, detail="违章类型编码已存在")
     row = ViolationTypeDict(
-        type_code=code,
+        type_code=await _allocate_unique_type_code(db),
         type_name=body.type_name.strip(),
         description=(body.description or "").strip() or None,
         severity=_severity_or_400(body.severity),

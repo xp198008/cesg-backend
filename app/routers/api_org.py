@@ -32,6 +32,14 @@ def _gen_org_code(org_id: int) -> str:
     return f"{org_id:04d}"
 
 
+def _fmt_dt(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 @router.get("/next-code")
 async def next_org_code(db: AsyncSession = Depends(get_db)):
     max_id = await db.scalar(select(func.max(OrgCompany.id)))
@@ -638,7 +646,7 @@ async def company_list(
                 "parent_name": pn,
                 "contact_phone": x.contact_phone,
                 "address": x.address,
-                "created_at": x.created_at.isoformat() if x.created_at else None,
+                "created_at": _fmt_dt(x.created_at),
             }
         )
     return {"total": total, "items": items, "page": page, "page_size": page_size}
@@ -661,7 +669,7 @@ async def company_detail(company_id: int, db: AsyncSession = Depends(get_db)):
         "contact_phone": x.contact_phone,
         "address": x.address,
         "jt808_group_id": int(x.jt808_group_id) if x.jt808_group_id is not None else None,
-        "created_at": x.created_at.isoformat() if x.created_at else None,
+        "created_at": _fmt_dt(x.created_at),
     }
 
 
