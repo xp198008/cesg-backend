@@ -61,6 +61,7 @@ from app.routers import (
     api_role,
     api_route_plan,
     api_shortcut,
+    api_sms,
     api_user,
     api_vehicle,
     api_vehicle_alloc,
@@ -131,6 +132,7 @@ app.include_router(api_fault_type.router)
 app.include_router(api_jt808_alarm_sync.router)
 app.include_router(api_map_rules.router)
 app.include_router(api_map_grasp.router)
+app.include_router(api_sms.router)
 app.include_router(api_obd_fuel.router)
 app.include_router(api_obd_speed.router)
 app.include_router(api_park_alarm_report.router)

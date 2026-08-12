@@ -421,6 +421,34 @@ class MapApiConfig(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
 
+class SmsPlatformConfig(Base):
+    """云 MAS 短信平台接口配置（后台运维页维护）。"""
+
+    __tablename__ = "sms_platform_config"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # 单行配置；provider 预留多通道，当前固定 mas
+    provider = Column(String(50), nullable=False, unique=True, default="mas")
+    enabled = Column(Boolean, nullable=False, default=False, server_default="0")
+    # 如 https://host:port 或 http://112.35.1.155:1992（不含路径）
+    base_url = Column(String(255))
+    # HTTPS 文档为 /sms/submit；HTTP 示例为 /sms/norsubmit
+    submit_path = Column(String(128), default="/sms/submit")
+    template_path = Column(String(128), default="/sms/tmpsubmit")
+    ec_name = Column(String(128))
+    ap_id = Column(String(128))
+    secret_key = Column(String(128))
+    sign = Column(String(128))
+    add_serial = Column(String(64), default="")
+    # normal=普通短信；template=模板短信
+    send_mode = Column(String(32), nullable=False, default="normal", server_default="normal")
+    template_id = Column(String(128))
+    # 普通短信正文模板，须含 {code}
+    content_template = Column(String(512), default="您的验证码为{code}，5分钟内有效。")
+    code_ttl_seconds = Column(Integer, nullable=False, default=300, server_default="300")
+    remark = Column(String(255))
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive, default=china_now_naive)
+
+
 class PublicMapRule(Base):
     """公用地图规则：公用限速管理页绘制和维护的围栏/折线规则。"""
 

@@ -204,7 +204,7 @@ _STATUS_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>后台运维 · OBD / AI评估 / 报警类型 / 地图接口</title>
+<title>后台运维 · OBD / AI评估 / 报警类型 / 地图接口 / 短信平台</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: "Microsoft YaHei", system-ui, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 24px; }
@@ -270,13 +270,14 @@ _STATUS_PAGE = """<!DOCTYPE html>
 <body>
 <div class="wrap">
   <h1>后台运维</h1>
-  <div class="sub">OBD 监测 · AI 自动评估 · 报警类型 · 地图接口</div>
+  <div class="sub">OBD 监测 · AI 自动评估 · 报警类型 · 地图接口 · 短信平台</div>
 
   <div class="tabs">
     <button type="button" class="active" data-tab="status">监测状态</button>
     <button type="button" data-tab="ai">AI 评估</button>
     <button type="button" data-tab="alarms">报警类型</button>
     <button type="button" data-tab="map">地图接口管理</button>
+    <button type="button" data-tab="sms">短信平台接口</button>
   </div>
 
   <div id="panel-status" class="panel active">
@@ -425,6 +426,45 @@ _STATUS_PAGE = """<!DOCTYPE html>
       </div>
     </div>
   </div>
+
+  <div id="panel-sms" class="panel">
+    <div class="card">
+      <h2><span class="dot" id="dotSms"></span>短信平台接口管理（云 MAS）</h2>
+      <p class="muted" style="margin-bottom:12px">
+        维护中国移动云 MAS 必需项。未启用、字段不全或平台鉴权失败时，登录页「获取验证码」仅提示无法获取短信，不影响其它功能。
+        HTTPS 路径一般为 <code>/sms/submit</code>；HTTP 联调示例可能为 <code>/sms/norsubmit</code>。
+      </p>
+      <div class="form-grid" id="smsForm">
+        <label>启用</label>
+        <select id="sEnabled"><option value="0">停用</option><option value="1">启用</option></select>
+        <label>接口根地址</label><input id="sBaseUrl" placeholder="https://主机:端口 或 http://112.35.1.155:1992">
+        <label>普通短信路径</label><input id="sSubmitPath" placeholder="/sms/submit">
+        <label>模板短信路径</label><input id="sTplPath" placeholder="/sms/tmpsubmit">
+        <label>企业名称 ecName</label><input id="sEcName" placeholder="云 MAS 企业名称">
+        <label>接口账号 apId</label><input id="sApId" placeholder="接口用户名">
+        <label>接口密码 secretKey</label><input id="sSecret" type="password" placeholder="接口密码">
+        <label>签名编码 sign</label><input id="sSign" placeholder="签名下载中的签名编码">
+        <label>扩展码 addSerial</label><input id="sAddSerial" placeholder="精确匹配填空；模糊匹配可填扩展码">
+        <label>发送模式</label>
+        <select id="sMode">
+          <option value="normal">普通短信</option>
+          <option value="template">模板短信</option>
+        </select>
+        <label>模板 ID</label><input id="sTplId" placeholder="模板模式必填">
+        <label>内容模板</label><textarea id="sContentTpl" placeholder="普通短信正文，须含 {code}"></textarea>
+        <label>验证码有效秒</label><input id="sTtl" type="number" min="60" max="3600" value="300">
+        <label>备注</label><textarea id="sRemark" placeholder="可选"></textarea>
+        <label>就绪状态</label><div id="sReadyText" class="muted">—</div>
+      </div>
+      <div class="btns" style="margin-top:14px;margin-bottom:0">
+        <button id="btnSmsSave">保存</button>
+        <button id="btnSmsReload" class="ghost">重新加载</button>
+        <input id="sTestPhone" placeholder="试发手机号" style="min-width:160px">
+        <button id="btnSmsTest" class="ghost">试发一条</button>
+        <span class="muted" id="smsMsg"></span>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div class="modal-mask" id="alModal">
@@ -465,6 +505,7 @@ document.querySelectorAll(".tabs button").forEach((btn) => {
     if (panel) panel.classList.add("active");
     if (btn.dataset.tab === "alarms") loadAlarms();
     if (btn.dataset.tab === "map") loadMapConfig();
+    if (btn.dataset.tab === "sms") loadSmsConfig();
     if (btn.dataset.tab === "status") loadStatus();
     if (btn.dataset.tab === "ai") loadAiStatus();
   };
@@ -912,6 +953,92 @@ $("btnMapSync").onclick = async () => {
   }
 };
 
+function fillSmsForm(d) {
+  d = d || {};
+  $("sEnabled").value = d.enabled ? "1" : "0";
+  $("sBaseUrl").value = d.base_url || "";
+  $("sSubmitPath").value = d.submit_path || "/sms/submit";
+  $("sTplPath").value = d.template_path || "/sms/tmpsubmit";
+  $("sEcName").value = d.ec_name || "";
+  $("sApId").value = d.ap_id || "";
+  $("sSecret").value = d.secret_key || "";
+  $("sSign").value = d.sign || "";
+  $("sAddSerial").value = d.add_serial || "";
+  $("sMode").value = d.send_mode === "template" ? "template" : "normal";
+  $("sTplId").value = d.template_id || "";
+  $("sContentTpl").value = d.content_template || "您的验证码为{code}，5分钟内有效。";
+  $("sTtl").value = d.code_ttl_seconds != null ? d.code_ttl_seconds : 300;
+  $("sRemark").value = d.remark || "";
+  const ready = !!d.ready;
+  $("dotSms").className = "dot " + (ready ? "ok" : "bad");
+  $("sReadyText").innerHTML = ready
+    ? '<span class="okc">就绪，可发送验证码</span>'
+    : ('<span class="err">未就绪：' + esc(d.ready_reason || "请完善并启用配置") + "</span>");
+}
+
+async function loadSmsConfig() {
+  $("smsMsg").textContent = "加载中…";
+  try {
+    const data = await apiJson("/api/sms-api-config?provider=mas");
+    fillSmsForm(data.data || {});
+    $("smsMsg").textContent = data.data
+      ? ("已加载" + (data.data.updated_at ? " · 更新于 " + String(data.data.updated_at).replace("T", " ").slice(0, 19) : ""))
+      : "尚无配置，填写后保存";
+  } catch (e) {
+    $("smsMsg").textContent = "加载失败：" + e.message;
+  }
+}
+
+$("btnSmsReload").onclick = () => loadSmsConfig();
+$("btnSmsSave").onclick = async () => {
+  const body = {
+    provider: "mas",
+    enabled: $("sEnabled").value === "1",
+    base_url: $("sBaseUrl").value.trim() || null,
+    submit_path: $("sSubmitPath").value.trim() || "/sms/submit",
+    template_path: $("sTplPath").value.trim() || "/sms/tmpsubmit",
+    ec_name: $("sEcName").value.trim() || null,
+    ap_id: $("sApId").value.trim() || null,
+    secret_key: $("sSecret").value.trim() || null,
+    sign: $("sSign").value.trim() || null,
+    add_serial: $("sAddSerial").value.trim(),
+    send_mode: $("sMode").value,
+    template_id: $("sTplId").value.trim() || null,
+    content_template: $("sContentTpl").value.trim() || null,
+    code_ttl_seconds: $("sTtl").value === "" ? 300 : Number($("sTtl").value),
+    remark: $("sRemark").value.trim() || null,
+  };
+  try {
+    const data = await apiJson("/api/sms-api-config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    fillSmsForm(data.data || {});
+    $("smsMsg").textContent = "保存成功 " + new Date().toLocaleString()
+      + (data.ready ? " · 已就绪" : (" · 未就绪：" + (data.ready_reason || "")));
+  } catch (e) {
+    $("smsMsg").textContent = "保存失败：" + e.message;
+    alert("保存失败：" + e.message);
+  }
+};
+$("btnSmsTest").onclick = async () => {
+  const phone = ($("sTestPhone").value || "").trim();
+  if (!/^1\\d{10}$/.test(phone)) {
+    alert("请输入正确的试发手机号");
+    return;
+  }
+  try {
+    const data = await apiJson("/api/sms-api-config/test-send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone }),
+    });
+    alert((data.ok ? "试发成功" : "无法获取短信") + (data.detail ? ("\\n" + data.detail) : ""));
+  } catch (e) {
+    alert("试发失败：" + e.message);
+  }
+};
 
 let aiSchedRunning = false;
 
@@ -1040,7 +1167,7 @@ statusTimer = setInterval(() => {
 }, 15000);
 
 const hash = (location.hash || "").replace("#", "");
-if (hash === "alarms" || hash === "map" || hash === "ai") {
+if (hash === "alarms" || hash === "map" || hash === "ai" || hash === "sms") {
   const btn = document.querySelector('.tabs button[data-tab="' + hash + '"]');
   if (btn) btn.click();
 }
@@ -1052,5 +1179,5 @@ if (hash === "alarms" || hash === "map" || hash === "ai") {
 
 @router.get("/obd-status", response_class=HTMLResponse, include_in_schema=False)
 async def obd_status_page():
-    """后台运维页：OBD 监测 + AI 自动评估 + 报警类型 + 地图接口。访问 /obd-status（#ai / #alarms / #map）。"""
+    """后台运维页：OBD / AI / 报警类型 / 地图 / 短信。访问 /obd-status（#ai / #alarms / #map / #sms）。"""
     return HTMLResponse(_STATUS_PAGE)

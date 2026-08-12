@@ -68,6 +68,11 @@ class UserLoginPayload(BaseModel):
     password: str = Field(..., min_length=1, max_length=128)
 
 
+class UserPhoneLoginPayload(BaseModel):
+    phone: str = Field(..., min_length=11, max_length=20)
+    code: str = Field(..., min_length=4, max_length=12)
+
+
 class UserSessionCheckPayload(BaseModel):
     user_id: int = Field(..., ge=1)
     session_token: str | None = Field(default=None, max_length=128)
@@ -846,40 +851,32 @@ async def user_operation_logs(
     return {"ok": True, "items": items, "total": total, "page": page, "page_size": page_size}
 
 
-@router.post("/login")
-async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSession = Depends(get_db)):
-    username = (payload.username or "").strip()
-    password = payload.password or ""
-    if not username or not password:
-        raise HTTPException(status_code=400, detail="用户名和密码不能为空")
+def _norm_login_phone(phone: str) -> str:
+    s = (phone or "").strip().replace(" ", "").replace("-", "")
+    if s.startswith("+86"):
+        s = s[3:]
+    elif s.startswith("86") and len(s) == 13 and s[2:].startswith("1"):
+        s = s[2:]
+    return s
 
-    result = await db.execute(
-        select(SysUser)
-        .options(selectinload(SysUser.role), selectinload(SysUser.org))
-        .where(SysUser.username == username)
-        .limit(1)
-    )
-    user = result.scalar_one_or_none()
-    if user is None:
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+async def _issue_login_response(
+    user: SysUser,
+    request: Request,
+    db: AsyncSession,
+    *,
+    login_method: str = "web",
+    password_plain: str | None = None,
+) -> dict:
+    """账号/手机号登录共用：会话、权限、登录日志。"""
     if not user.is_active:
         raise HTTPException(status_code=403, detail="当前用户已禁用，请联系管理员")
     if user.valid_until is not None and user.valid_until < china_today():
         raise HTTPException(status_code=403, detail="当前用户已过有效期，请联系管理员")
 
-    saved_hash = user.password_hash or ""
-    try:
-        ok = bcrypt.checkpw(password.encode("utf-8"), saved_hash.encode("utf-8"))
-    except Exception:
-        ok = False
-    if not ok and saved_hash and not saved_hash.startswith("$2"):
-        ok = password == saved_hash
-    if not ok:
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
-
-    # 供后续 808 代登 / 续期使用（明文仅存服务端）
-    if password and (getattr(user, "password_plain", None) or "") != password:
-        user.password_plain = password
+    pwd = (password_plain or "").strip()
+    if pwd and (getattr(user, "password_plain", None) or "") != pwd:
+        user.password_plain = pwd
         invalidate_openapi_token_if_service_user(user.username)
 
     session_token = ""
@@ -889,6 +886,7 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
         user.login_session_token = session_token
         await db.flush()
 
+    username = user.username or ""
     role = user.role
     role_code = _effective_role_code_for_session(role, username)
     permission_ids: list[str] = []
@@ -919,6 +917,7 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
         "id": user.id,
         "username": user.username,
         "real_name": user.real_name or user.username,
+        "phone": getattr(user, "phone", None) or "",
         "org_id": org_id,
         "org_name": org_name,
         "role_id": user.role_id,
@@ -930,6 +929,7 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
         "valid_until": _fmt_date(user.valid_until),
         "single_login": 1 if user.single_login else 0,
         "session_token": session_token,
+        "login_method": login_method,
     }
 
     login_log = UserLoginLog(
@@ -941,7 +941,7 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
         role_id=user.role_id,
         role_name=(user.role.name if user.role else "")[:64] or None,
         login_ip=_client_login_ip(request),
-        login_method="web",
+        login_method=(login_method or "web")[:32],
     )
 
     try:
@@ -964,6 +964,71 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
         await db.commit()
 
     return {"ok": True, "message": "登录成功", "data": data}
+
+
+@router.post("/login")
+async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSession = Depends(get_db)):
+    username = (payload.username or "").strip()
+    password = payload.password or ""
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="用户名和密码不能为空")
+
+    result = await db.execute(
+        select(SysUser)
+        .options(selectinload(SysUser.role), selectinload(SysUser.org))
+        .where(SysUser.username == username)
+        .limit(1)
+    )
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    saved_hash = user.password_hash or ""
+    try:
+        ok = bcrypt.checkpw(password.encode("utf-8"), saved_hash.encode("utf-8"))
+    except Exception:
+        ok = False
+    if not ok and saved_hash and not saved_hash.startswith("$2"):
+        ok = password == saved_hash
+    if not ok:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    return await _issue_login_response(
+        user, request, db, login_method="web", password_plain=password
+    )
+
+
+@router.post("/login-by-phone")
+async def user_login_by_phone(
+    payload: UserPhoneLoginPayload, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """短信验证码登录：校验验证码 → 按手机号取系统用户 → 与账号登录同一会话后续。"""
+    from app.sms_mas import verify_login_sms_code
+
+    phone = _norm_login_phone(payload.phone)
+    code = (payload.code or "").strip()
+    if not re.fullmatch(r"1\d{10}", phone):
+        raise HTTPException(status_code=400, detail="请输入正确的手机号")
+    if not code:
+        raise HTTPException(status_code=400, detail="请输入验证码")
+    if not verify_login_sms_code(phone, code):
+        raise HTTPException(status_code=401, detail="验证码错误或已过期")
+
+    rows = (
+        await db.execute(
+            select(SysUser)
+            .options(selectinload(SysUser.role), selectinload(SysUser.org))
+            .where(SysUser.phone == phone)
+            .order_by(SysUser.id.asc())
+        )
+    ).scalars().all()
+    if not rows:
+        raise HTTPException(status_code=401, detail="该手机号未绑定系统用户，请先使用账号登录或联系管理员绑定")
+    if len(rows) > 1:
+        raise HTTPException(status_code=400, detail="该手机号绑定了多个账号，请使用账号密码登录")
+
+    user = rows[0]
+    return await _issue_login_response(user, request, db, login_method="sms")
 
 
 @router.get("/monitor-scope")
