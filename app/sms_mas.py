@@ -117,6 +117,7 @@ async def send_mas_sms(
         payload = {
             "ecName": ec_name,
             "apId": ap_id,
+            "secretKey": secret_key,  # 官方样例 Base64 报文含此字段
             "templateId": template_id,
             "mobiles": mobiles,
             "params": params,
@@ -130,6 +131,7 @@ async def send_mas_sms(
         payload = {
             "ecName": ec_name,
             "apId": ap_id,
+            "secretKey": secret_key,  # 官方样例 Base64 报文含此字段
             "mobiles": mobiles,
             "content": content,
             "sign": sign,
@@ -146,8 +148,8 @@ async def send_mas_sms(
         async with httpx.AsyncClient(timeout=15.0, verify=False, trust_env=False) as client:
             resp = await client.post(
                 url,
-                content=body_b64,
-                headers={"Content-Type": "application/json; charset=UTF-8"},
+                content=body_b64.encode("ascii"),
+                headers={"Content-Type": "text/plain; charset=UTF-8"},
             )
         text = (resp.text or "").strip()
         data: dict[str, Any] = {}
