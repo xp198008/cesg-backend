@@ -1,4 +1,4 @@
-"""Agent Worker 知识库 dataset_id 对照（docs/AI.PDF 第四节）。"""
+"""Agent Worker 知识库 dataset_id 对照（docs/aiNew.pdf 第四节）。"""
 
 
 

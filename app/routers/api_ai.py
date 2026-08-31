@@ -165,6 +165,31 @@ async def ai_cancel(session_id: str):
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@router.get("/vehicle/summary")
+async def ai_vehicle_summary(
+    plate: str | None = Query(None),
+    car_id: int | None = Query(None, ge=1),
+    gps_hours: int = Query(3, ge=1, le=72),
+):
+    """代理 Agent Worker 车辆综合摘要（docs/aiNew.pdf 第五节）。"""
+    _ensure_configured()
+    if not (plate or "").strip() and car_id is None:
+        raise HTTPException(status_code=400, detail="plate 与 car_id 必须至少提供一个")
+    try:
+        data = await agent_worker_client.get_vehicle_summary(
+            plate=plate,
+            car_id=car_id,
+            gps_hours=gps_hours,
+        )
+        return {"ok": True, "data": data}
+    except AgentWorkerError as exc:
+        text = str(exc)
+        status = 404 if "未找到" in text else 502
+        raise HTTPException(status_code=status, detail=text) from exc
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text) from exc
+
+
 @router.get("/sessions/{session_id}")
 async def ai_session(session_id: str):
     _ensure_configured()

@@ -1,6 +1,6 @@
 """Agent Worker（AI 智能体）HTTP 客户端。
 
-接口文档：docs/AI.PDF
+接口文档：docs/aiNew.pdf（最新）/ docs/AI.PDF
 基础地址默认 http://113.207.68.94:5002
 """
 from __future__ import annotations
@@ -25,8 +25,11 @@ def _base_url() -> str:
 
 
 def _auth_headers(user_id: str, company: str) -> list[tuple[str, str | bytes]]:
+    # aiNew.pdf：x-user / x-company；同时带 x-user-id 兼容旧 Worker
+    uid = str(user_id)
     headers: list[tuple[str, str | bytes]] = [
-        ("x-user-id", str(user_id)),
+        ("x-user", uid),
+        ("x-user-id", uid),
         ("x-company", company.encode("utf-8")),
     ]
     api_key = (settings.agent_worker_api_key or "").strip()
@@ -127,6 +130,36 @@ class AgentWorkerClient:
             resp = await client.get(url)
             resp.raise_for_status()
             return resp.json()
+
+    async def get_vehicle_summary(
+        self,
+        *,
+        plate: str | None = None,
+        car_id: int | None = None,
+        gps_hours: int = 3,
+    ) -> dict[str, Any]:
+        """GET /api/vehicle/summary（aiNew.pdf 第五节）。"""
+        if not (plate or "").strip() and car_id is None:
+            raise AgentWorkerError("plate 与 car_id 必须至少提供一个")
+        url = f"{_base_url()}/api/vehicle/summary"
+        params: dict[str, Any] = {"gps_hours": max(1, min(72, int(gps_hours or 3)))}
+        if car_id is not None:
+            params["car_id"] = int(car_id)
+        if (plate or "").strip():
+            params["plate"] = plate.strip()
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
+            resp = await client.get(url, params=params)
+            if resp.status_code >= 400:
+                detail = resp.text
+                try:
+                    body = resp.json()
+                    if isinstance(body, dict) and body.get("detail") is not None:
+                        detail = str(body.get("detail"))
+                except Exception:
+                    pass
+                raise AgentWorkerError(detail or f"HTTP {resp.status_code}")
+            data = resp.json()
+            return data if isinstance(data, dict) else {"data": data}
 
     async def list_documents(
         self,

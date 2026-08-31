@@ -53,6 +53,7 @@ _SHORTCUT_META: dict[str, dict[str, str]] = {
     "52": {"url": "/main/map/geofence", "icon": "./images/svg/icon-ditu.svg"},
     "53": {"url": "/main/map/geofence", "icon": "./images/svg/icon-ditu.svg"},
     "17": {"url": "/main/route-plan", "icon": "./images/svg/icon-ditu.svg"},
+    "18": {"url": "/main/risk-control", "icon": "./images/svg/icon-anquan.svg"},
     "6": {"url": "/main/report/mileage-summary", "icon": "./images/svg/icon-tongji.svg"},
     "611": {"url": "/main/report/mileage-summary", "icon": "./images/svg/icon-tongji.svg"},
     "612": {"url": "/main/report/mileage-daily", "icon": "./images/svg/icon-tongji.svg"},
