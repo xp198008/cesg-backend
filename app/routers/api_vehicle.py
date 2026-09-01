@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import jt808_vehicle
 from app.database import get_db
+from app.jt808_openapi_client import jt808_openapi_client
 from app.models import (
     Driver,
     Fleet,
@@ -46,6 +47,80 @@ from app.vehicle_alloc_scope import (
 )
 
 router = APIRouter(prefix="/api/vehicle", tags=["vehicle"])
+
+
+def _online_time_candidates(*values: str | None) -> list[str]:
+    out: list[str] = []
+    for raw in values:
+        s = str(raw or "").strip()
+        if not s or s in out:
+            continue
+        out.append(s)
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if digits and digits != s and digits not in out:
+            out.append(digits)
+        if digits.isdigit() and 0 < len(digits) < 12:
+            padded = digits.zfill(12)
+            if padded not in out:
+                out.append(padded)
+    return out
+
+
+def _format_travel_stime(raw: str) -> str:
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if len(digits) >= 14:
+        return (
+            f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]} "
+            f"{digits[8:10]}:{digits[10:12]}:{digits[12:14]}"
+        )
+    return str(raw or "").strip()
+
+
+@router.get("/online-time")
+async def vehicle_online_time(
+    tid: str | None = Query(None),
+    deviceId: str | None = Query(None),
+    car_id: str | None = Query(None),
+):
+    """实时监控气泡：今日首次行车开始时间（808 无会话上线字段时的近似）。"""
+    candidates = _online_time_candidates(tid, deviceId, car_id)
+    if not candidates:
+        return {"ok": True, "data": {"online_time": None}}
+    now = china_now_naive()
+    day = now.strftime("%Y%m%d")
+    stime = f"{day}000000"
+    etime = f"{day}235959"
+    best = ""
+    used = ""
+    for device in candidates:
+        try:
+            result = await jt808_openapi_client.list_travel_records(
+                device_id=device,
+                stime=stime,
+                etime=etime,
+                type=1,
+                page=1,
+                rows=50,
+            )
+        except Exception:
+            continue
+        rows = result.get("data") if isinstance(result.get("data"), list) else []
+        for row in rows:
+            raw = str((row or {}).get("stime") or (row or {}).get("start_time") or "").strip()
+            if raw and (not best or raw < best):
+                best = raw
+                used = device
+        if best:
+            break
+    text = _format_travel_stime(best)
+    return {
+        "ok": True,
+        "data": {
+            "online_time": text or None,
+            "raw": best or None,
+            "deviceId": used or None,
+        },
+    }
 
 
 def _jt808_sync_status(result: bool | None) -> str:

@@ -1,7 +1,7 @@
 """主动安全报警 AI 评估。
 
-有视频证据：主调 Agent Worker ``POST /api/video/violation``（SSE 违章判定）。
-仅图片：回退 ``POST /api/chat``（文档无图片违章专用接口）。
+一律走 Agent Worker ``POST /api/video/violation``（SSE 违章判定）：
+有视频传视频，没有视频则把抓拍图作为 file 继续调同一接口。
 """
 from __future__ import annotations
 
@@ -856,7 +856,7 @@ async def _resolve_ticket_after_video(
     row: VehicleViolation,
     v_result: dict[str, Any],
 ) -> dict[str, Any]:
-    """视频判定后自动追加罚款/警告/误报三选一，结果直接写入罚单建议。"""
+    """视频判定成功后再用 /api/chat 问罚款/警告/误报；失败则用视频结论兜底。"""
     eval_text = _evaluation_from_video_result(v_result)
     fallback = _ticket_from_video_result(v_result)
     ticket = await _classify_disposition_via_chat(
@@ -1119,6 +1119,73 @@ async def _download_video_bytes(video_url: str) -> tuple[bytes, str, str]:
     return video_data, video_mime, ext
 
 
+def _image_ext_and_mime(url: str, mime: str) -> tuple[str, str]:
+    ext = Path((url or "").split("?", 1)[0]).suffix.lower()
+    if ext not in _IMAGE_EXTS:
+        ext = ".jpg"
+    mt = (mime or "").split(";")[0].strip().lower()
+    if not mt.startswith("image/"):
+        mt = {
+            ".png": "image/png",
+            ".webp": "image/webp",
+            ".bmp": "image/bmp",
+            ".gif": "image/gif",
+        }.get(ext, "image/jpeg")
+    return ext, mt
+
+
+async def _download_image_file(image_url: str) -> tuple[bytes, str, str]:
+    """下载抓拍图，返回 (bytes, mime, filename_ext)，供 /api/video/violation 的 file 字段。"""
+    data, mime = await _download_media(image_url)
+    if not data:
+        raise ValueError("图片内容为空")
+    if len(data) > _MAX_IMAGE_BYTES:
+        raise ValueError("图片文件过大")
+    ext, mime = _image_ext_and_mime(image_url, mime)
+    return data, mime, ext
+
+
+async def _collect_violation_files(
+    image_urls: list[str],
+    video_url: str | None,
+) -> list[dict[str, Any]]:
+    """优先视频，没有或失败再收集抓拍图，都作为 /api/video/violation 的 file。"""
+    files: list[dict[str, Any]] = []
+    if video_url:
+        try:
+            data, mime, ext = await _download_video_bytes(video_url)
+            if data:
+                files.append(
+                    {
+                        "kind": "video",
+                        "data": data,
+                        "mime": mime,
+                        "ext": ext,
+                        "filename": f"evidence{ext}",
+                    }
+                )
+        except Exception as exc:
+            logger.warning("下载视频失败，将改用抓拍图调用 video/violation: %s", exc)
+    if files:
+        return files
+    for url in image_urls:
+        try:
+            data, mime, ext = await _download_image_file(url)
+            files.append(
+                {
+                    "kind": "image",
+                    "data": data,
+                    "mime": mime,
+                    "ext": ext,
+                    "filename": f"evidence{ext}",
+                }
+            )
+            break
+        except Exception as exc:
+            logger.warning("下载图片失败 %s: %s", url, exc)
+    return files
+
+
 def _alarm_type_display(row: VehicleViolation) -> str:
     from app.jt808_alarm_sync import _strip_alarm_level_suffix
 
@@ -1326,7 +1393,7 @@ async def run_violation_ai_assessment(
     user_id: str,
     force: bool = False,
 ) -> dict[str, Any]:
-    """主动安全 AI 评估：有视频主调 Worker /api/video/violation；仅图片时回退 chat。"""
+    """主动安全 AI 评估：一律走 Worker /api/video/violation（无视频则传抓拍图）。"""
     if not agent_worker_client.configured():
         raise HTTPException(status_code=503, detail="Agent Worker 未配置")
 
@@ -1357,22 +1424,26 @@ async def run_violation_ai_assessment(
         return _skip_response(reason="暂无图片或视频证据，已跳过 AI 分析")
 
     session_id = f"violation_assess_{violation_id}"
+    evidence_files = await _collect_violation_files(image_urls, video_url)
+    if not evidence_files:
+        return _skip_response(reason="证据下载失败或全部为空，已跳过 AI 分析")
 
-    # 主路径：视频违章判定接口
-    if video_url:
+    last_error = ""
+    for item in evidence_files:
         try:
-            video_data, video_mime, ext = await _download_video_bytes(video_url)
             v_result = await agent_worker_client.analyze_video_violation(
                 user_id=user_id,
                 company=company,
-                filename=f"evidence{ext}",
-                content=video_data,
-                content_type=video_mime,
+                filename=item["filename"],
+                content=item["data"],
+                content_type=item["mime"],
                 session_id=session_id,
                 extra_fields=_alarm_extra_form_fields(row),
             )
             if _video_result_is_refusal(v_result):
-                raise AiRefusalError("视频违章判定返回拒答文案")
+                last_error = "违章判定返回拒答文案"
+                logger.warning("video/violation 拒答 kind=%s violation_id=%s", item["kind"], violation_id)
+                continue
             ticket_info = await _resolve_ticket_after_video(
                 user_id=user_id,
                 company=company,
@@ -1400,40 +1471,13 @@ async def run_violation_ai_assessment(
                 "assessment": _assessment_out(existing),
             }
         except AiRefusalError as exc:
-            # 视频拒答不落库，有图则继续回退；无图则向上抛给调度器稍后重试
-            logger.warning("视频违章判定拒答，尝试图片 chat 回退: %s", exc)
-            if not image_urls:
-                raise
+            last_error = str(exc)
+            logger.warning("video/violation 拒答 kind=%s: %s", item["kind"], exc)
         except Exception as exc:
-            logger.warning("视频违章判定失败，尝试图片 chat 回退: %s", exc)
+            last_error = str(exc)
+            logger.warning("video/violation 失败 kind=%s: %s", item["kind"], exc)
 
-    image_blocks = await _download_image_blocks(image_urls)
-    if not image_blocks:
-        return _skip_response(reason="证据下载失败或全部为空，已跳过 AI 分析")
-
-    try:
-        existing, auto_false = await _run_chat_fallback_assessment(
-            db,
-            row,
-            existing,
-            user_id=user_id,
-            company=company,
-            image_blocks=image_blocks,
-        )
-    except AiRefusalError:
-        raise
-    except AgentWorkerError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    return {
-        "ok": True,
-        "cached": False,
-        "ai_queried": True,
-        "source": "chat_fallback",
-        "auto_false_alarm": auto_false,
-        "status": (row.status or "").strip(),
-        "assessment": _assessment_out(existing),
-    }
+    raise HTTPException(status_code=502, detail=f"违章判定失败：{last_error or '未知错误'}")
 
 
 def _sse(payload: dict[str, Any]) -> bytes:
@@ -1448,8 +1492,7 @@ async def stream_violation_ai_assessment(
 ) -> AsyncIterator[bytes]:
     """SSE 流式 AI 评估。
 
-    有视频：主调 Worker ``POST /api/video/violation``（SSE），不再用 chat 做违章判定。
-    仅图片：回退 ``/api/chat``（文档无图片违章接口）。
+    一律走 Worker ``POST /api/video/violation``（SSE）：有视频传视频，无视频传抓拍图。
     """
     if not agent_worker_client.configured():
         yield _sse({"object": "error", "message": "Agent Worker 未配置（AGENT_WORKER_BASE_URL）"})
@@ -1502,217 +1545,147 @@ async def stream_violation_ai_assessment(
                 return
 
             session_id = f"violation_assess_{violation_id}"
+            yield _sse(
+                {
+                    "object": "status",
+                    "stage": "download",
+                    "message": "正在下载证据（视频优先，无视频则用抓拍图）…",
+                }
+            )
+            evidence_files = await _collect_violation_files(image_urls, video_url)
+            if not evidence_files:
+                yield _sse({"object": "skip", "reason": "证据下载失败或全部为空，已跳过 AI 分析"})
+                return
 
-            # ---------- 主路径：/api/video/violation ----------
-            if video_url:
-                yield _sse({"object": "status", "stage": "download", "message": "正在下载视频证据…"})
+            last_error = ""
+            for item in evidence_files:
+                kind_label = "视频" if item["kind"] == "video" else "抓拍图"
+                yield _sse(
+                    {
+                        "object": "status",
+                        "stage": "video",
+                        "message": f"正在调用违章判定接口（{kind_label}）…",
+                    }
+                )
+                text_parts: list[str] = []
+                v_result: dict[str, Any] | None = None
                 try:
-                    video_data, video_mime, ext = await _download_video_bytes(video_url)
-                except Exception as exc:
-                    logger.warning("下载视频失败: %s", exc)
-                    video_data = b""
-                    video_mime = ""
-                    ext = ".mp4"
-
-                if video_data:
+                    async for ev in agent_worker_client.analyze_video_violation_stream(
+                        user_id=user_id,
+                        company=company,
+                        filename=item["filename"],
+                        content=item["data"],
+                        content_type=item["mime"],
+                        session_id=session_id,
+                        extra_fields=_alarm_extra_form_fields(row),
+                    ):
+                        obj = str(ev.get("object") or "")
+                        if obj == "delta":
+                            if ev.get("type") == "text" and ev.get("text"):
+                                text_parts.append(str(ev["text"]))
+                                yield _sse(
+                                    {
+                                        "object": "content",
+                                        "type": "text",
+                                        "delta": True,
+                                        "text": ev["text"],
+                                    }
+                                )
+                            elif ev.get("type") == "tool_call":
+                                name = str(ev.get("name") or "tool")
+                                status = str(ev.get("status") or "")
+                                tip = f"[{name} {status}]".strip()
+                                yield _sse(
+                                    {
+                                        "object": "status",
+                                        "stage": "video",
+                                        "message": tip,
+                                    }
+                                )
+                        elif obj == "complete":
+                            v_result = dict(ev)
+                            v_result.pop("object", None)
+                        elif obj == "error":
+                            raise AgentWorkerError(
+                                str(ev.get("detail") or ev.get("message") or "违章判定失败")
+                            )
+                except AgentWorkerError as exc:
+                    last_error = str(exc)
+                    logger.warning("video/violation SSE 失败 kind=%s: %s", item["kind"], exc)
+                    v_result = None
                     yield _sse(
                         {
                             "object": "status",
                             "stage": "video",
-                            "message": "正在调用视频违章判定接口…",
+                            "message": f"{kind_label}判定失败：{exc}",
                         }
                     )
-                    text_parts: list[str] = []
-                    v_result: dict[str, Any] | None = None
-                    try:
-                        async for ev in agent_worker_client.analyze_video_violation_stream(
-                            user_id=user_id,
-                            company=company,
-                            filename=f"evidence{ext}",
-                            content=video_data,
-                            content_type=video_mime,
-                            session_id=session_id,
-                            extra_fields=_alarm_extra_form_fields(row),
-                        ):
-                            obj = str(ev.get("object") or "")
-                            if obj == "delta":
-                                # 进度/文本增量推给前端气泡
-                                if ev.get("type") == "text" and ev.get("text"):
-                                    text_parts.append(str(ev["text"]))
-                                    yield _sse(
-                                        {
-                                            "object": "content",
-                                            "type": "text",
-                                            "delta": True,
-                                            "text": ev["text"],
-                                        }
-                                    )
-                                elif ev.get("type") == "tool_call":
-                                    name = str(ev.get("name") or "tool")
-                                    status = str(ev.get("status") or "")
-                                    tip = f"[{name} {status}]".strip()
-                                    yield _sse(
-                                        {
-                                            "object": "status",
-                                            "stage": "video",
-                                            "message": tip,
-                                        }
-                                    )
-                            elif obj == "complete":
-                                v_result = dict(ev)
-                                v_result.pop("object", None)
-                            elif obj == "error":
-                                raise AgentWorkerError(
-                                    str(ev.get("detail") or ev.get("message") or "视频违章判定失败")
-                                )
-                    except AgentWorkerError as exc:
-                        logger.warning("视频违章判定 SSE 失败: %s", exc)
-                        v_result = None
-                        yield _sse(
-                            {
-                                "object": "status",
-                                "stage": "video",
-                                "message": f"视频判定失败，尝试图片分析…（{exc}）",
-                            }
-                        )
 
-                    if v_result is not None and _video_result_is_refusal(v_result):
-                        logger.warning("流式视频判定拒答，改走图片回退")
-                        v_result = None
-                        yield _sse(
-                            {
-                                "object": "status",
-                                "stage": "video",
-                                "message": "视频判定被拒答，正在重试图片分析…",
-                            }
-                        )
+                if v_result is not None and _video_result_is_refusal(v_result):
+                    last_error = "违章判定返回拒答文案"
+                    logger.warning("流式 video/violation 拒答 kind=%s", item["kind"])
+                    v_result = None
+                    yield _sse(
+                        {
+                            "object": "status",
+                            "stage": "video",
+                            "message": f"{kind_label}判定被拒答",
+                        }
+                    )
 
-                    if v_result is not None:
-                        # 若流里没有文本增量，把结论补推到气泡
-                        eval_text = _evaluation_from_video_result(v_result)
-                        if not text_parts and eval_text:
-                            yield _sse(
-                                {
-                                    "object": "content",
-                                    "type": "text",
-                                    "delta": True,
-                                    "text": eval_text,
-                                }
-                            )
-                        # 无违章直接误报；有违章再追问一轮「罚款/警告/误报」
-                        if _video_has_violation(v_result) is not False:
-                            yield _sse(
-                                {
-                                    "object": "status",
-                                    "stage": "disposition",
-                                    "message": "正在判定处罚建议（罚款 / 警告 / 误报）…",
-                                }
-                            )
-                        ticket_info = await _resolve_ticket_after_video(
-                            user_id=user_id,
-                            company=company,
-                            session_id=session_id,
-                            row=row,
-                            v_result=v_result,
-                        )
-                        existing, auto_false = await _save_assessment_from_video(
-                            db,
-                            row,
-                            existing,
-                            session_id=session_id,
-                            v_result=v_result,
-                            company=company,
-                            image_count=len(image_urls),
-                            ticket_info=ticket_info,
-                        )
-                        await db.commit()
-                        yield _sse(
-                            {
-                                "object": "assessment",
-                                "cached": False,
-                                "ai_queried": True,
-                                "source": "video_violation",
-                                "auto_false_alarm": auto_false,
-                                "status": (row.status or "").strip(),
-                                "assessment": _assessment_out(existing),
-                            }
-                        )
-                        return
+                if v_result is None:
+                    continue
 
-            # ---------- 回退：仅图片走 /api/chat ----------
-            yield _sse({"object": "status", "stage": "download", "message": "正在下载图片证据…"})
-            image_blocks = await _download_image_blocks(image_urls)
-            if not image_blocks:
-                yield _sse({"object": "skip", "reason": "证据下载失败或全部为空，已跳过 AI 分析"})
-                return
-
-            yield _sse(
-                {
-                    "object": "status",
-                    "stage": "chat",
-                    "message": "正在图片对话分析（若被拒答将自动多问几轮）…",
-                }
-            )
-            prompt = _build_prompt(
-                row,
-                video_analysis="",
-                image_count=len(image_blocks),
-                has_video=False,
-            )
-            content_blocks: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-            content_blocks.extend(image_blocks)
-
-            source = "chat_fallback"
-            try:
-                existing, auto_false = await _run_chat_fallback_assessment(
-                    db,
-                    row,
-                    existing,
+                eval_text = _evaluation_from_video_result(v_result)
+                if not text_parts and eval_text:
+                    yield _sse(
+                        {
+                            "object": "content",
+                            "type": "text",
+                            "delta": True,
+                            "text": eval_text,
+                        }
+                    )
+                if _video_has_violation(v_result) is not False:
+                    yield _sse(
+                        {
+                            "object": "status",
+                            "stage": "disposition",
+                            "message": "正在判定处罚建议（罚款 / 警告 / 误报）…",
+                        }
+                    )
+                ticket_info = await _resolve_ticket_after_video(
                     user_id=user_id,
                     company=company,
-                    image_blocks=image_blocks,
+                    session_id=session_id,
+                    row=row,
+                    v_result=v_result,
                 )
-                if (existing.session_id or "").endswith("_rules"):
-                    source = "text_rules_fallback"
-                elif (existing.session_id or "").endswith("_local"):
-                    source = "local_refusal_fallback"
-                eval_text = (existing.evaluation_text or "").strip()
-                if eval_text:
-                    yield _sse({"object": "content", "type": "text", "delta": True, "text": eval_text})
-            except AiRefusalError as exc:
-                # 理论上 chat 回退已含本地兜底；此处再兜一层
-                yield _sse(
-                    {
-                        "object": "status",
-                        "stage": "chat",
-                        "message": "助手拒答，已生成本地待复核建议…",
-                    }
-                )
-                source = "local_refusal_fallback"
-                existing, auto_false = await _run_local_refusal_fallback_assessment(
+                existing, auto_false = await _save_assessment_from_video(
                     db,
                     row,
                     existing,
+                    session_id=session_id,
+                    v_result=v_result,
                     company=company,
-                    image_count=len(image_blocks),
-                    reason=str(exc),
+                    image_count=len(image_urls),
+                    ticket_info=ticket_info,
                 )
-                eval_text = (existing.evaluation_text or "").strip()
-                if eval_text:
-                    yield _sse({"object": "content", "type": "text", "delta": True, "text": eval_text})
+                await db.commit()
+                yield _sse(
+                    {
+                        "object": "assessment",
+                        "cached": False,
+                        "ai_queried": True,
+                        "source": "video_violation",
+                        "auto_false_alarm": auto_false,
+                        "status": (row.status or "").strip(),
+                        "assessment": _assessment_out(existing),
+                    }
+                )
+                return
 
-            await db.commit()
-            yield _sse(
-                {
-                    "object": "assessment",
-                    "cached": False,
-                    "ai_queried": True,
-                    "source": source,
-                    "auto_false_alarm": auto_false,
-                    "status": (row.status or "").strip(),
-                    "assessment": _assessment_out(existing),
-                }
-            )
+            yield _sse({"object": "error", "message": f"违章判定失败：{last_error or '未知错误'}"})
         except Exception as exc:  # noqa: BLE001
             logger.exception("流式 AI 评估失败 violation_id=%s", violation_id)
             await db.rollback()

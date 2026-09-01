@@ -55,6 +55,7 @@ def _row_out(d: Driver, company_name: str | None) -> dict:
         "score": d.score,
         "native_place": d.native_place,
         "avatar_url": d.avatar_url,
+        "is_key_focus": 1 if getattr(d, "is_key_focus", False) else 0,
         "remark": d.remark,
         "created_at": d.created_at.isoformat() if d.created_at else None,
         "updated_at": d.updated_at.isoformat() if d.updated_at else None,
@@ -79,6 +80,7 @@ class DriverCreateIn(BaseModel):
     score: int | None = None
     native_place: str | None = Field(None, max_length=128)
     avatar_url: str | None = Field(None, max_length=256)
+    is_key_focus: int = Field(default=0)
 
     @field_validator("id_card")
     @classmethod
@@ -107,6 +109,7 @@ class DriverUpdateIn(BaseModel):
     score: int | None = None
     native_place: str | None = Field(None, max_length=128)
     avatar_url: str | None = Field(None, max_length=256)
+    is_key_focus: int | None = None
 
 
 class DriverBatchDeleteIn(BaseModel):
@@ -353,6 +356,7 @@ async def driver_create(body: DriverCreateIn, db: AsyncSession = Depends(get_db)
         score=body.score,
         native_place=(body.native_place.strip() if body.native_place else None) or None,
         avatar_url=(body.avatar_url.strip() if body.avatar_url else None) or None,
+        is_key_focus=bool(int(body.is_key_focus or 0)),
     )
     db.add(row)
     await db.flush()
@@ -418,6 +422,8 @@ async def driver_update(did: int, body: DriverUpdateIn, db: AsyncSession = Depen
     if "avatar_url" in patch:
         v = patch["avatar_url"]
         row.avatar_url = v.strip() if isinstance(v, str) and v.strip() else None
+    if "is_key_focus" in patch and patch["is_key_focus"] is not None:
+        row.is_key_focus = bool(int(patch["is_key_focus"]))
     await db.commit()
     await db.refresh(row)
     cn = await db.scalar(select(OrgCompany.name).where(OrgCompany.id == row.company_id).limit(1))

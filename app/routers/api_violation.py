@@ -39,6 +39,7 @@ from app.jt808_violation_sync import lookup_company_name, notify_violation_creat
 from app.violation_alert_cache import get_alerts_after
 from app.alarm_type_gate import (
     expand_disabled_alarm_type_names,
+    expand_violation_type_query_names,
     load_alarm_type_risk_map,
     load_disabled_alarm_type_names,
 )
@@ -665,6 +666,7 @@ async def violation_list(
     source: str | None = Query(None),
     appeal_status: str | None = Query(None, description="申诉状态筛选，如：申诉中"),
     violation_type_dict_id: int | None = Query(None, ge=1),
+    violation_type_name: str | None = Query(None, description="触发报警类型（基名或带一/二/三级）"),
     start_time: str | None = Query(None),
     end_time: str | None = Query(None),
     followed_only: bool = Query(False),
@@ -722,6 +724,9 @@ async def violation_list(
         vt_row = await db.get(ViolationTypeDict, int(violation_type_dict_id))
         if vt_row is not None and (vt_row.type_name or "").strip():
             q = q.where(VehicleViolation.violation_type_name == (vt_row.type_name or "").strip())
+    type_names = expand_violation_type_query_names(violation_type_name or "")
+    if type_names:
+        q = q.where(func.trim(VehicleViolation.violation_type_name).in_(type_names))
     start_dt = _parse_violation_query_time(start_time, end_of_day=False)
     end_dt = _parse_violation_query_time(end_time, end_of_day=True)
     start_dt, end_dt, time_clamp_meta = _clamp_violation_query_range(start_dt, end_dt)

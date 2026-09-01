@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -69,6 +70,51 @@ def expand_disabled_alarm_type_names(disabled_names: list[str] | None) -> list[s
         seen.add(n)
         uniq.append(n)
     return uniq
+
+
+_LEVEL_VARIANTS = ("一级", "二级", "三级", "1级", "2级", "3级")
+_SPEEDING_BASES = ("超速报警", "OBD超速", "OBD区域超速", "OBD限速路段超速")
+_LEVEL_STRIP_RE = re.compile(r"(一级|二级|三级|1级|2级|3级)$")
+
+
+def _strip_type_level_suffix(name: str) -> str:
+    return _LEVEL_STRIP_RE.sub("", (name or "").strip()).strip()
+
+
+def _is_speeding_type_base(base: str) -> bool:
+    text = (base or "").strip()
+    if not text:
+        return False
+    if text in _SPEEDING_BASES:
+        return True
+    return text.upper().startswith("OBD") and "超速" in text
+
+
+def expand_violation_type_query_names(selected: str) -> list[str]:
+    """列表筛选：选基名覆盖一/二/三级及 OBD 超速别名；选带级别则只匹配该级。"""
+    text = (selected or "").strip()
+    if not text:
+        return []
+    base = _strip_type_level_suffix(text) or text
+    selected_has_level = bool(base) and text != base
+    level = text[len(base) :] if selected_has_level else ""
+
+    bases = [base]
+    if _is_speeding_type_base(base):
+        for alias in _SPEEDING_BASES:
+            if alias not in bases:
+                bases.append(alias)
+
+    names: set[str] = set()
+    for item in bases:
+        if selected_has_level:
+            names.add(f"{item}{level}")
+            names.update(disabled_alarm_type_name_aliases(f"{item}{level}"))
+            continue
+        names.add(item)
+        for suffix in _LEVEL_VARIANTS:
+            names.add(f"{item}{suffix}")
+    return [name for name in names if name]
 
 
 def build_disabled_alarm_type_exclusion_clause(disabled_names: list[str] | None):

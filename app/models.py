@@ -59,6 +59,8 @@ class SysUser(Base):
     is_active = Column(Boolean, default=True)
     valid_until = Column(Date, nullable=True)
     single_login = Column(Boolean, default=False, nullable=False, server_default="0")
+    # 外协用户：登录后默认进入实时监控地图模式
+    is_outsource = Column(Boolean, default=False, nullable=False, server_default="0")
     login_session_token = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
@@ -146,6 +148,8 @@ class Driver(Base):
     score = Column(Integer, nullable=True)
     native_place = Column(String(128), nullable=True)
     avatar_url = Column(String(256), nullable=True)
+    # 重点关注司机：先落库，后续业务再接
+    is_key_focus = Column(Boolean, default=False, nullable=False, server_default="0")
     remark = Column(String(256))
     created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)

@@ -11,6 +11,7 @@ from app.timeutil import china_now_naive, china_today
 
 import bcrypt
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, not_, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -34,6 +35,7 @@ from app.org_scope import (
     org_scope_row_clause,
     require_user_company_subtree_ids,
 )
+from app.session_auth import attach_session_cookie, clear_session_cookie
 from app.vehicle_alloc_scope import parse_user_id_header, resolve_monitor_scope
 
 router = APIRouter(prefix="/api/user", tags=["user"])
@@ -132,6 +134,7 @@ class UserCreatePayload(BaseModel):
     user_status: int = Field(default=1)
     valid_until: date | None = None
     single_login: int = Field(default=0)
+    is_outsource: int = Field(default=0)
     identity: str | None = Field(None, max_length=64)
     phone: str | None = Field(None, max_length=32)
 
@@ -145,6 +148,7 @@ class UserUpdatePayload(BaseModel):
     user_status: int = Field(default=1)
     valid_until: date | None = None
     single_login: int = Field(default=0)
+    is_outsource: int = Field(default=0)
     identity: str | None = Field(None, max_length=64)
     phone: str | None = Field(None, max_length=32)
 
@@ -301,6 +305,7 @@ async def user_list(
                 "allow_pwd_edit": 1 if allow else 0,
                 "valid_until": _fmt_date(getattr(u, "valid_until", None)),
                 "single_login": 1 if getattr(u, "single_login", False) else 0,
+                "is_outsource": 1 if getattr(u, "is_outsource", False) else 0,
                 "identity": getattr(u, "identity", None) or "",
                 "phone": getattr(u, "phone", None) or "",
                 "updated_at": _fmt_dt(u.updated_at) or _fmt_dt(u.created_at),
@@ -346,6 +351,7 @@ async def user_create(
             is_active=bool(int(payload.user_status)),
             valid_until=payload.valid_until,
             single_login=bool(int(payload.single_login)),
+            is_outsource=bool(int(payload.is_outsource)),
         )
         db.add(user)
         await db.flush()
@@ -373,6 +379,7 @@ async def user_create(
             "user_status": 1 if user.is_active else 0,
             "valid_until": _fmt_date(user.valid_until),
             "single_login": 1 if user.single_login else 0,
+            "is_outsource": 1 if getattr(user, "is_outsource", False) else 0,
             "identity": user.identity or "",
             "phone": user.phone or "",
             "updated_at": _fmt_dt(user.updated_at) or _fmt_dt(user.created_at),
@@ -419,6 +426,7 @@ async def user_update(
         user.is_active = bool(int(payload.user_status))
         user.valid_until = payload.valid_until
         user.single_login = bool(int(payload.single_login))
+        user.is_outsource = bool(int(payload.is_outsource))
         await db.flush()
         await db.refresh(user)
     except IntegrityError:
@@ -443,6 +451,7 @@ async def user_update(
             "user_status": 1 if user.is_active else 0,
             "valid_until": _fmt_date(user.valid_until),
             "single_login": 1 if user.single_login else 0,
+            "is_outsource": 1 if getattr(user, "is_outsource", False) else 0,
             "identity": user.identity or "",
             "phone": user.phone or "",
             "updated_at": _fmt_dt(user.updated_at) or _fmt_dt(user.created_at),
@@ -615,7 +624,10 @@ async def user_logout(payload: UserLogoutPayload, request: Request, db: AsyncSes
         user.login_session_token = None
 
     await db.flush()
-    return {"ok": True, "message": "已退出登录"}
+    resp = JSONResponse(content={"ok": True, "message": "已退出登录"})
+    if user is not None and getattr(user, "single_login", False):
+        clear_session_cookie(resp)
+    return resp
 
 
 @router.post("/session/heartbeat")
@@ -867,7 +879,7 @@ async def _issue_login_response(
     *,
     login_method: str = "web",
     password_plain: str | None = None,
-) -> dict:
+) -> JSONResponse:
     """账号/手机号登录共用：会话、权限、登录日志。"""
     if not user.is_active:
         raise HTTPException(status_code=403, detail="当前用户已禁用，请联系管理员")
@@ -879,12 +891,17 @@ async def _issue_login_response(
         user.password_plain = pwd
         invalidate_openapi_token_if_service_user(user.username)
 
-    session_token = ""
     if getattr(user, "single_login", False):
-        # 开启“单点登录”时，每次成功登录刷新 token，旧浏览器持有的 token 随即失效。
+        # 单点登录：每次成功登录刷新 token，旧浏览器持有的 token 随即失效。
         session_token = secrets.token_urlsafe(32)
         user.login_session_token = session_token
-        await db.flush()
+    else:
+        # 非单点：所有业务接口都要带会话；已有 token 则复用，避免把其它设备踢下线。
+        session_token = (getattr(user, "login_session_token", None) or "").strip()
+        if not session_token:
+            session_token = secrets.token_urlsafe(32)
+            user.login_session_token = session_token
+    await db.flush()
 
     username = user.username or ""
     role = user.role
@@ -928,6 +945,7 @@ async def _issue_login_response(
         "user_status": 1 if user.is_active else 0,
         "valid_until": _fmt_date(user.valid_until),
         "single_login": 1 if user.single_login else 0,
+        "is_outsource": 1 if getattr(user, "is_outsource", False) else 0,
         "session_token": session_token,
         "login_method": login_method,
     }
@@ -963,7 +981,9 @@ async def _issue_login_response(
     else:
         await db.commit()
 
-    return {"ok": True, "message": "登录成功", "data": data}
+    resp = JSONResponse(content={"ok": True, "message": "登录成功", "data": data})
+    attach_session_cookie(resp, session_token)
+    return resp
 
 
 @router.post("/login")

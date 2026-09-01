@@ -17,8 +17,34 @@ from app.models import SysRole, SysUser, SysUserShortcut
 
 router = APIRouter(prefix="/api/shortcut", tags=["shortcut"])
 
-# 7x：旧报表；51/107：地图接口管理、报警类型已迁至后台 /obd-status；414：违章申诉页已下线
-_DEPRECATED_PERMISSION_IDS = frozenset({"7", "71", "72", "73", "51", "107", "414"})
+# 7x：旧报表；51/107：地图接口管理、报警类型已迁至后台 /obd-status
+# 4/41/43 及子页：车辆报修（含违章/报障）已从主菜单下线；414：违章申诉页已下线
+# 109/112：故障类型、违章类型维护已从基础数据侧栏下线
+_DEPRECATED_PERMISSION_IDS = frozenset(
+    {
+        "7",
+        "71",
+        "72",
+        "73",
+        "51",
+        "107",
+        "4",
+        "41",
+        "411",
+        "412",
+        "413",
+        "414",
+        "415",
+        "43",
+        "431",
+        "432",
+        "433",
+        "434",
+        "435",
+        "109",
+        "112",
+    }
+)
 
 _DATA_FILE = Path(__file__).resolve().parent.parent / "data" / "permission_menu.json"
 
@@ -35,20 +61,11 @@ _SHORTCUT_META: dict[str, dict[str, str]] = {
     "324": {"url": "/main/multitrack", "icon": "./images/svg/icon-jiankong.svg"},
     "33": {"url": "/main/realtimegroup", "icon": "./images/svg/icon-jiankong.svg"},
     "325": {"url": "/main/realtimealarm", "icon": "./images/svg/icon-jiankong.svg"},
-    "4": {"url": "/main/vehicle/fault/manual", "icon": "./images/svg/icon-carmanage.svg"},
-    "411": {"url": "/main/vehicle/violation/manual", "icon": "./images/svg/icon-carmanage.svg"},
-    "412": {"url": "/main/vehicle/violation/instruction", "icon": "./images/svg/icon-carmanage.svg"},
-    "413": {"url": "/main/vehicle/violation/review", "icon": "./images/svg/icon-carmanage.svg"},
-    "415": {"url": "/main/vehicle/violation/query", "icon": "./images/svg/icon-carmanage.svg"},
-    "421": {"url": "/main/vehicle/repair/list", "icon": "./images/svg/icon-carmanage.svg"},
-    "422": {"url": "/main/vehicle/repair/entry", "icon": "./images/svg/icon-carmanage.svg"},
-    "423": {"url": "/main/vehicle/repair/review", "icon": "./images/svg/icon-carmanage.svg"},
-    "424": {"url": "/main/vehicle/repair/uploaded", "icon": "./images/svg/icon-carmanage.svg"},
-    "431": {"url": "/main/vehicle/fault/manual", "icon": "./images/svg/icon-carmanage.svg"},
-    "432": {"url": "/main/vehicle/fault/handle", "icon": "./images/svg/icon-carmanage.svg"},
-    "433": {"url": "/main/vehicle/fault/handle", "icon": "./images/svg/icon-carmanage.svg"},
-    "434": {"url": "/main/vehicle/fault/upload", "icon": "./images/svg/icon-carmanage.svg"},
-    "435": {"url": "/main/vehicle/fault/query", "icon": "./images/svg/icon-carmanage.svg"},
+    "42": {"url": "/main/repair/list", "icon": "./images/svg/icon-carmanage.svg"},
+    "421": {"url": "/main/repair/archive", "icon": "./images/svg/icon-carmanage.svg"},
+    "422": {"url": "/main/repair/entry", "icon": "./images/svg/icon-carmanage.svg"},
+    "423": {"url": "/main/repair/review", "icon": "./images/svg/icon-carmanage.svg"},
+    "424": {"url": "/main/repair/uploaded", "icon": "./images/svg/icon-carmanage.svg"},
     "5": {"url": "/main/map/geofence", "icon": "./images/svg/icon-ditu.svg"},
     "52": {"url": "/main/map/geofence", "icon": "./images/svg/icon-ditu.svg"},
     "53": {"url": "/main/map/geofence", "icon": "./images/svg/icon-ditu.svg"},
@@ -96,9 +113,7 @@ _SHORTCUT_META: dict[str, dict[str, str]] = {
     "105": {"url": "/main/base/org", "icon": "./images/svg/icon-jichushuju.svg"},
     "106": {"url": "/main/base/vehicle-assignment", "icon": "./images/svg/icon-jichushuju.svg"},
     "108": {"url": "/main/base/roles", "icon": "./images/svg/icon-jichushuju.svg"},
-    "109": {"url": "/main/base/faults", "icon": "./images/svg/icon-jichushuju.svg"},
     "110": {"url": "/main/base/speed-rules", "icon": "./images/svg/icon-jichushuju.svg"},
-    "112": {"url": "/main/base/violation-types", "icon": "./images/svg/icon-jichushuju.svg"},
     "16": {"url": "/main/knowledge", "icon": "./images/svg/icon-zhihuikanban.svg"},
 }
 

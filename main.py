@@ -23,6 +23,7 @@ if sys.platform == "win32":
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.session_auth import SessionAuthMiddleware
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -80,6 +81,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="CESG 业务后端", version="1.0.0")
 
+# 先加会话校验（内侧），再加 CORS（外侧），这样 401 也能带跨域头；OPTIONS 由 CORS 直接放行。
+app.add_middleware(SessionAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

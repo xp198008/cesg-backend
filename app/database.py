@@ -80,6 +80,16 @@ async def init_models() -> None:
                     await conn.exec_driver_sql(
                         "ALTER TABLE sys_user ADD COLUMN jt808_lingxtoken VARCHAR(512)"
                     )
+                if "is_outsource" not in names:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE sys_user ADD COLUMN is_outsource BOOLEAN DEFAULT 0"
+                    )
+            cols = await conn.exec_driver_sql("PRAGMA table_info(driver)")
+            names = {row[1] for row in cols.fetchall()}
+            if names and "is_key_focus" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE driver ADD COLUMN is_key_focus BOOLEAN DEFAULT 0"
+                )
             cols = await conn.exec_driver_sql("PRAGMA table_info(map_api_config)")
             names = {row[1] for row in cols.fetchall()}
             if names and "web_service_key" not in names:
@@ -315,6 +325,32 @@ async def init_models() -> None:
                 if row is not None and int(row[0] or 0) == 0:
                     await conn.exec_driver_sql(
                         "ALTER TABLE sys_user ADD COLUMN jt808_lingxtoken VARCHAR(512) NULL"
+                    )
+            except Exception:
+                pass
+            try:
+                exists = await conn.exec_driver_sql(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sys_user' "
+                    "AND COLUMN_NAME = 'is_outsource'"
+                )
+                row = exists.fetchone()
+                if row is not None and int(row[0] or 0) == 0:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE sys_user ADD COLUMN is_outsource TINYINT(1) NOT NULL DEFAULT 0"
+                    )
+            except Exception:
+                pass
+            try:
+                exists = await conn.exec_driver_sql(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'driver' "
+                    "AND COLUMN_NAME = 'is_key_focus'"
+                )
+                row = exists.fetchone()
+                if row is not None and int(row[0] or 0) == 0:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE driver ADD COLUMN is_key_focus TINYINT(1) NOT NULL DEFAULT 0"
                     )
             except Exception:
                 pass
