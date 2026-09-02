@@ -3,6 +3,7 @@
 在线状态：online_source=db 读 Vehicle.is_connect；其余按 last_online_at 空闲窗口判定。
 （设备/视频/实时仍由 808 平台负责，本后端不探测设备网关。）
 """
+import asyncio
 import base64
 import os
 from datetime import date, datetime, timedelta, timezone
@@ -21,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import jt808_vehicle
 from app.database import get_db
 from app.jt808_openapi_client import jt808_openapi_client
+from app.tongtianxing_client import list_plate_device_pairs
 from app.models import (
     Driver,
     Fleet,
@@ -238,6 +240,42 @@ def _norm(s) -> str:
     if s is None:
         return ""
     return str(s).replace("\u3000", " ").strip()
+
+
+_DISABLED_VEHICLE_STATUSES = frozenset({"停用", "disabled"})
+_DEVICE_DISABLE_PREFIX = "S"
+
+
+def _is_vehicle_disabled(status: str | None) -> bool:
+    head = (_norm(status).split(",")[0] if _norm(status) else "")
+    return head in _DISABLED_VEHICLE_STATUSES
+
+
+def _bare_device_no(device_no: str | None) -> str:
+    """去掉停用占用前缀 S，得到真实设备号。"""
+    t = _norm(device_no)
+    if t[:1].upper() == _DEVICE_DISABLE_PREFIX:
+        return t[1:]
+    return t
+
+
+def _occupy_disabled_device_no(device_no: str | None) -> str:
+    """停用占用：真实设备号前加 S；已占用则保持单前缀。"""
+    t = _norm(device_no)
+    if not t:
+        return t
+    if t[:1].upper() == _DEVICE_DISABLE_PREFIX:
+        return _DEVICE_DISABLE_PREFIX + t[1:]
+    return _DEVICE_DISABLE_PREFIX + t
+
+
+def _stored_device_no_for_status(device_no: str | None, status: str | None) -> str:
+    t = _norm(device_no)
+    if not t:
+        return t
+    if _is_vehicle_disabled(status):
+        return _occupy_disabled_device_no(t)
+    return _bare_device_no(t)
 
 
 def _terminal_variants(terminal_id: str) -> list[str]:
@@ -492,7 +530,65 @@ async def _ensure_unique_plate_and_device(
     if current_vehicle_id:
         q_dev = q_dev.where(VehicleDevice.vehicle_id != current_vehicle_id)
     if await db.scalar(q_dev.limit(1)) is not None:
-        raise HTTPException(status_code=400, detail="设备号已存在")
+        raise HTTPException(status_code=400, detail=f"设备号 {device_no} 已在其它车辆上使用")
+
+
+async def _device_no_used_elsewhere(
+    db: AsyncSession, device_no: str, exclude_vehicle_id: int | None = None
+) -> bool:
+    t = _norm(device_no)
+    if not t:
+        return False
+    q = select(VehicleDevice.vehicle_id).where(VehicleDevice.device_no == t)
+    if exclude_vehicle_id:
+        q = q.where(VehicleDevice.vehicle_id != exclude_vehicle_id)
+    return await db.scalar(q.limit(1)) is not None
+
+
+async def _apply_status_device_occupy(
+    db: AsyncSession,
+    payload: VehicleSavePayload,
+    *,
+    current_vehicle_id: int | None = None,
+    current_status: str | None = None,
+    current_device_no: str | None = None,
+) -> None:
+    """停用：设备号前加 S 占用；启用：去掉 S，并拒绝已被其它车辆占用的设备号。"""
+    incoming = _norm(payload.device_no) or _norm(current_device_no)
+    effective_status = _norm(payload.status) or "正常"
+    payload.device_no = incoming or None
+    if not incoming:
+        return
+
+    will_disable = _is_vehicle_disabled(effective_status)
+    was_disabled = _is_vehicle_disabled(current_status)
+    stored = _stored_device_no_for_status(incoming, effective_status)
+    payload.device_no = stored
+
+    if will_disable or not stored:
+        return
+    if not was_disabled:
+        return
+
+    target = _bare_device_no(stored)
+    if await _device_no_used_elsewhere(db, target, current_vehicle_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"设备号 {target} 已在其它车辆上使用，无法启用",
+        )
+    try:
+        owner = await jt808_vehicle.lookup_device_owner(target)
+    except Exception:  # noqa: BLE001
+        owner = None
+    if not owner:
+        return
+    other_plate = _norm(owner.get("carno") if isinstance(owner, dict) else "")
+    self_plate = _norm(payload.plate_no)
+    if other_plate and self_plate and other_plate != self_plate:
+        raise HTTPException(
+            status_code=400,
+            detail=f"设备号 {target} 已在其它车辆（{other_plate}）上使用，无法启用",
+        )
 
 
 def _apply_vehicle_payload(v: Vehicle, co: OrgCompany, payload: VehicleSavePayload) -> None:
@@ -576,6 +672,7 @@ def _apply_vehicle_payload(v: Vehicle, co: OrgCompany, payload: VehicleSavePaylo
 async def vehicle_create(payload: VehicleSavePayload, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     co = await _ensure_company_and_fleet(db, payload.company_id, payload.fleet_id)
     await _ensure_driver_binding(db, payload.driver_id if payload.driver_id and payload.driver_id > 0 else None, payload.company_id)
+    await _apply_status_device_occupy(db, payload)
     await _ensure_unique_plate_and_device(db, payload, None)
     v = Vehicle()
     _apply_vehicle_payload(v, co, payload)
@@ -583,6 +680,9 @@ async def vehicle_create(payload: VehicleSavePayload, background_tasks: Backgrou
     await db.flush()
     await _upsert_main_device(db, v.id, payload)
     await _remove_reserve_for_device_no(db, _norm(payload.device_no or ""))
+    bare_no = _bare_device_no(payload.device_no)
+    if bare_no and bare_no != _norm(payload.device_no):
+        await _remove_reserve_for_device_no(db, bare_no)
     await db.flush()
     await db.commit()
     jt808_result = await jt808_vehicle.upsert_now(v.id)
@@ -602,14 +702,187 @@ async def vehicle_update(payload: VehicleSavePayload, background_tasks: Backgrou
     )
     co = await _ensure_company_and_fleet(db, payload.company_id, payload.fleet_id)
     await _ensure_driver_binding(db, payload.driver_id if payload.driver_id and payload.driver_id > 0 else None, payload.company_id)
+    await _apply_status_device_occupy(
+        db,
+        payload,
+        current_vehicle_id=vid,
+        current_status=v.status,
+        current_device_no=_norm(old_dev),
+    )
     await _ensure_unique_plate_and_device(db, payload, vid)
     _apply_vehicle_payload(v, co, payload)
     await _upsert_main_device(db, vid, payload)
     await _remove_reserve_for_device_no(db, _norm(payload.device_no or ""))
+    bare_no = _bare_device_no(payload.device_no)
+    if bare_no and bare_no != _norm(payload.device_no):
+        await _remove_reserve_for_device_no(db, bare_no)
     await db.flush()
     await db.commit()
     jt808_result = await jt808_vehicle.upsert_now(vid, old_dev)
     return {"ok": True, "message": "已更新", "data": {"id": vid}, "jt808_sync": _jt808_sync_status(jt808_result)}
+
+
+async def _upsert_device_no_only(db: AsyncSession, vehicle_id: int, store_no: str) -> None:
+    dr = await db.execute(
+        select(VehicleDevice).where(VehicleDevice.vehicle_id == vehicle_id, VehicleDevice.is_main.is_(True))
+    )
+    d = dr.scalar_one_or_none()
+    if not store_no:
+        if d is not None:
+            await db.execute(delete(VehicleDevice).where(VehicleDevice.id == d.id))
+        return
+    if d is None:
+        d = VehicleDevice(vehicle_id=vehicle_id, is_main=True, channel_no=1)
+        db.add(d)
+    d.device_no = store_no
+    await _remove_reserve_for_device_no(db, store_no)
+    bare_no = _bare_device_no(store_no)
+    if bare_no and bare_no != store_no:
+        await _remove_reserve_for_device_no(db, bare_no)
+
+
+@router.post("/sync-from-ttx")
+async def vehicle_sync_from_ttx(db: AsyncSession = Depends(get_db)):
+    """从通天星 queryUserVehicle 拉取车辆，只更新本库车牌与设备号，并同步 808。
+
+    不新建车辆、不改公司/车队/VIN 等其它字段。匹配顺序：先按车牌，再按设备号。
+    """
+    payload = await asyncio.to_thread(list_plate_device_pairs)
+    if not payload.get("ok"):
+        raise HTTPException(status_code=400, detail=str(payload.get("message") or "通天星车辆接口不可用"))
+
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    vehicles = (await db.execute(select(Vehicle))).scalars().all()
+    devices = (
+        await db.execute(select(VehicleDevice).where(VehicleDevice.is_main.is_(True)))
+    ).scalars().all()
+    by_id = {int(v.id): v for v in vehicles}
+    by_plate = {_norm(v.plate_no): v for v in vehicles if _norm(v.plate_no)}
+    dev_by_vid: dict[int, VehicleDevice] = {}
+    by_bare_dev: dict[str, list[int]] = {}
+    for d in devices:
+        vid = int(d.vehicle_id)
+        dev_by_vid[vid] = d
+        bare = _bare_device_no(d.device_no)
+        if bare:
+            by_bare_dev.setdefault(bare, []).append(vid)
+
+    updated = 0
+    skipped_unchanged = 0
+    skipped_not_in_cesg = 0
+    skipped_conflict = 0
+    skipped_no_device = 0
+    errors: list[str] = []
+    sync_queue: list[tuple[int, str | None]] = []
+
+    def note_error(msg: str) -> None:
+        if len(errors) < 40:
+            errors.append(msg)
+
+    for item in items:
+        ttx_plate = _norm(item.get("plate_no"))
+        ttx_dev = _norm(item.get("device_no"))
+        if not ttx_plate:
+            continue
+        if not ttx_dev:
+            skipped_no_device += 1
+            continue
+
+        v = by_plate.get(ttx_plate)
+        if v is None:
+            hits = by_bare_dev.get(_bare_device_no(ttx_dev)) or []
+            hits = [vid for vid in hits if vid in by_id]
+            if len(hits) == 1:
+                v = by_id[hits[0]]
+            else:
+                skipped_not_in_cesg += 1
+                continue
+
+        vid = int(v.id)
+        old_plate = _norm(v.plate_no)
+        old_dev = _norm(dev_by_vid[vid].device_no) if vid in dev_by_vid else ""
+        store_no = _stored_device_no_for_status(ttx_dev, v.status)
+        plate_changed = ttx_plate != old_plate
+        device_changed = store_no != old_dev
+        if not plate_changed and not device_changed:
+            skipped_unchanged += 1
+            continue
+
+        if plate_changed:
+            other = by_plate.get(ttx_plate)
+            if other is not None and int(other.id) != vid:
+                skipped_conflict += 1
+                note_error(f"{old_plate}→{ttx_plate}：目标车牌已被其它车辆使用")
+                continue
+
+        if device_changed and store_no:
+            await db.flush()
+            if await _device_no_used_elsewhere(db, store_no, vid):
+                skipped_conflict += 1
+                note_error(f"{ttx_plate}：设备号 {store_no} 已在其它车辆上使用")
+                continue
+
+        if plate_changed:
+            if old_plate in by_plate and by_plate[old_plate] is v:
+                del by_plate[old_plate]
+            v.plate_no = ttx_plate
+            by_plate[ttx_plate] = v
+
+        if device_changed:
+            old_bare = _bare_device_no(old_dev)
+            new_bare = _bare_device_no(store_no)
+            if old_bare and vid in (by_bare_dev.get(old_bare) or []):
+                by_bare_dev[old_bare] = [x for x in by_bare_dev[old_bare] if x != vid]
+            await _upsert_device_no_only(db, vid, store_no)
+            if vid in dev_by_vid:
+                dev_by_vid[vid].device_no = store_no
+            if new_bare:
+                by_bare_dev.setdefault(new_bare, [])
+                if vid not in by_bare_dev[new_bare]:
+                    by_bare_dev[new_bare].append(vid)
+
+        updated += 1
+        sync_queue.append((vid, old_dev or None))
+
+    await db.flush()
+    await db.commit()
+
+    jt808_ok = 0
+    jt808_fail = 0
+    for vid, old_dev in sync_queue:
+        try:
+            result = await jt808_vehicle.upsert_now(vid, old_dev)
+        except Exception:  # noqa: BLE001
+            jt808_fail += 1
+            continue
+        status = _jt808_sync_status(result)
+        if status == "success":
+            jt808_ok += 1
+        elif status == "fail":
+            jt808_fail += 1
+
+    msg = (
+        f"通天星 {int(payload.get('ttxVehicleCount') or len(items))} 台，"
+        f"更新 {updated} 台（车牌/设备号），"
+        f"未变化 {skipped_unchanged}，"
+        f"本库无此车 {skipped_not_in_cesg}，"
+        f"冲突跳过 {skipped_conflict}"
+    )
+    if jt808_ok or jt808_fail:
+        msg += f"；808 同步成功 {jt808_ok}、失败 {jt808_fail}"
+    return {
+        "ok": True,
+        "message": msg,
+        "updated": updated,
+        "skippedUnchanged": skipped_unchanged,
+        "skippedNotInCesg": skipped_not_in_cesg,
+        "skippedConflict": skipped_conflict,
+        "skippedNoDevice": skipped_no_device,
+        "ttxCount": int(payload.get("ttxVehicleCount") or len(items)),
+        "jt808_ok": jt808_ok,
+        "jt808_fail": jt808_fail,
+        "errors": errors,
+    }
 
 
 @router.get("/detail/{vehicle_id}")
@@ -942,6 +1215,7 @@ async def import_vehicle_from_carinfos(file: UploadFile = File(...), db: AsyncSe
         engine_no = _norm(_vehicle_import_cell(row, i_engine)) if i_engine is not None else ""
         product_model_code = _norm(_vehicle_import_cell(row, i_pmc)) if i_pmc is not None else ""
         dev_no = _norm(_vehicle_import_cell(row, i_dev_no))
+        row_status = (_norm(_vehicle_import_cell(row, i_status)) or "正常").split(",")[0]
 
         if not vin:
             skip("缺少车辆识别代码VIN")
@@ -955,8 +1229,9 @@ async def import_vehicle_from_carinfos(file: UploadFile = File(...), db: AsyncSe
         if not dev_no:
             skip("缺少设备号")
             continue
-        if dev_no in seen_devices:
-            skip(f"Excel 内设备号重复：{dev_no}")
+        store_no = _stored_device_no_for_status(dev_no, row_status)
+        if store_no in seen_devices:
+            skip(f"Excel 内设备号重复：{store_no}")
             continue
 
         try:
@@ -982,11 +1257,11 @@ async def import_vehicle_from_carinfos(file: UploadFile = File(...), db: AsyncSe
                 ).limit(1)
             )
 
-        dup_q = select(VehicleDevice.vehicle_id).where(VehicleDevice.device_no == dev_no)
+        dup_q = select(VehicleDevice.vehicle_id).where(VehicleDevice.device_no == store_no)
         if v is not None and v.id:
             dup_q = dup_q.where(VehicleDevice.vehicle_id != v.id)
         if await db.scalar(dup_q.limit(1)) is not None:
-            skip(f"设备号重复：{dev_no}")
+            skip(f"设备号已在其它车辆上使用：{store_no}")
             continue
 
         is_new = v is None
@@ -1008,7 +1283,7 @@ async def import_vehicle_from_carinfos(file: UploadFile = File(...), db: AsyncSe
         v.brand = _norm(_vehicle_import_cell(row, i_brand)) or None
         v.model = _norm(_vehicle_import_cell(row, i_model)) or None
         v.vehicle_category = _norm_vehicle_category(_vehicle_import_cell(row, i_category))
-        v.status = (_norm(_vehicle_import_cell(row, i_status)) or "正常").split(",")[0]
+        v.status = row_status
         v.channel_count = _to_int(_vehicle_import_cell(row, i_channel), 0) or 0
         await db.flush()
 
@@ -1020,13 +1295,16 @@ async def import_vehicle_from_carinfos(file: UploadFile = File(...), db: AsyncSe
         if d is None:
             d = VehicleDevice(vehicle_id=v.id, is_main=True, channel_no=1)
             db.add(d)
-        d.device_no = dev_no
+        d.device_no = store_no
         d.terminal_type = _norm(_vehicle_import_cell(row, i_dev_type)) or None
         d.sim_no = _norm(_vehicle_import_cell(row, i_dev_sim)) or None
-        await _remove_reserve_for_device_no(db, dev_no)
+        await _remove_reserve_for_device_no(db, store_no)
+        bare_no = _bare_device_no(store_no)
+        if bare_no and bare_no != store_no:
+            await _remove_reserve_for_device_no(db, bare_no)
 
         seen_plates.add(plate)
-        seen_devices.add(dev_no)
+        seen_devices.add(store_no)
         sync_queue.append((int(v.id), _norm(old_dev) or None))
         if is_new:
             imported += 1
@@ -1126,6 +1404,7 @@ def _parse_company_filter_ids(company_id: int | None, company_ids: str | None) -
 @router.get("/list")
 async def vehicle_list(
     plate_no: str | None = Query(None),
+    device_no: str | None = Query(None),
     status: str | None = Query(None),
     company_id: int | None = Query(None),
     company_ids: str | None = Query(None),
@@ -1149,6 +1428,13 @@ async def vehicle_list(
         q = q.where(Vehicle.company_id.in_(subtree))
     if plate_no:
         q = q.where(Vehicle.plate_no.ilike(f"%{plate_no.strip()}%"))
+    if device_no and device_no.strip():
+        kw = device_no.strip()
+        q = q.where(
+            Vehicle.id.in_(
+                select(VehicleDevice.vehicle_id).where(VehicleDevice.device_no.ilike(f"%{kw}%"))
+            )
+        )
     if status:
         q = q.where(Vehicle.status == status)
     selected_raw = _parse_company_filter_ids(company_id, company_ids)

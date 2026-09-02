@@ -109,5 +109,11 @@ class Settings(BaseSettings):
     risk_api_base_url: str = "http://113.207.68.94:8000"
     risk_api_timeout: float = 20.0
 
+    # ---- 通天星 CMS（queryUserVehicle：同步车牌 / 设备号）----
+    tongtianxing_base_url: str = ""
+    tongtianxing_username: str = ""
+    tongtianxing_password: str = ""
+    tongtianxing_timeout_ms: int = 60000
+
 
 settings = Settings()

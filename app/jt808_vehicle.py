@@ -400,6 +400,18 @@ async def _lookup_car_id(dev: str) -> int | None:
     return None
 
 
+async def lookup_device_owner(device_no: str) -> dict | None:
+    """Best-effort：808 上占用该设备号的车辆 {id, tid, carno}。"""
+    dev = (device_no or "").strip()
+    if not _enabled() or not dev:
+        return None
+    try:
+        return await _lookup_car_row(dev)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("lookup_device_owner 失败: %s", e)
+        return None
+
+
 async def _lookup_car_row_by_plate(plate_no: str) -> dict | None:
     plate = (plate_no or "").strip()
     if not plate:
