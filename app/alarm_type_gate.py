@@ -90,11 +90,11 @@ def _is_speeding_type_base(base: str) -> bool:
     return text.upper().startswith("OBD") and "超速" in text
 
 
-def expand_violation_type_query_names(selected: str) -> list[str]:
-    """列表筛选：选基名覆盖一/二/三级及 OBD 超速别名；选带级别则只匹配该级。"""
+def _expand_one_violation_type_query_name(selected: str) -> set[str]:
+    """单个筛选项：选基名覆盖一/二/三级及 OBD 超速别名；选带级别则只匹配该级。"""
     text = (selected or "").strip()
     if not text:
-        return []
+        return set()
     base = _strip_type_level_suffix(text) or text
     selected_has_level = bool(base) and text != base
     level = text[len(base) :] if selected_has_level else ""
@@ -114,6 +114,17 @@ def expand_violation_type_query_names(selected: str) -> list[str]:
         names.add(item)
         for suffix in _LEVEL_VARIANTS:
             names.add(f"{item}{suffix}")
+    return {name for name in names if name}
+
+
+def expand_violation_type_query_names(selected: str) -> list[str]:
+    """列表筛选：支持逗号分隔多选。选基名覆盖一/二/三级及 OBD 超速别名；选带级别则只匹配该级。"""
+    text = (selected or "").strip()
+    if not text:
+        return []
+    names: set[str] = set()
+    for part in text.replace("，", ",").split(","):
+        names.update(_expand_one_violation_type_query_name(part))
     return [name for name in names if name]
 
 

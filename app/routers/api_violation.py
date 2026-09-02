@@ -666,7 +666,7 @@ async def violation_list(
     source: str | None = Query(None),
     appeal_status: str | None = Query(None, description="申诉状态筛选，如：申诉中"),
     violation_type_dict_id: int | None = Query(None, ge=1),
-    violation_type_name: str | None = Query(None, description="触发报警类型（基名或带一/二/三级）"),
+    violation_type_name: str | None = Query(None, description="触发报警类型（基名或带一/二/三级；多个用逗号分隔）"),
     start_time: str | None = Query(None),
     end_time: str | None = Query(None),
     followed_only: bool = Query(False),
