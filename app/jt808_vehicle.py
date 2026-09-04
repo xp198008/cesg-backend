@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import re
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -462,6 +463,7 @@ async def _build_1251_request(data: dict, token: str) -> tuple[dict[str, Any] | 
 
     plate = (data.get("plate_no") or "").strip()
     device_id, car_id = await _resolve_1251_device_id_and_car_id(dev, plate)
+    sim = (data.get("sim_no") or data.get("actual_sim") or "").strip()
 
     body: dict[str, Any] = {
         "language": "zh-CN",
@@ -470,6 +472,7 @@ async def _build_1251_request(data: dict, token: str) -> tuple[dict[str, Any] | 
         "deviceId": device_id,
         "groupId": int(gid),
         "carno": plate,
+        "sim": sim,
         "deviceType": _device_type(data),
         "oilBox": _oil_box(data),
         "ext_json": _build_ext_json(data),
@@ -536,13 +539,50 @@ async def _sync_upsert(data: dict, trace: dict | None = None) -> bool | None:
         return False
 
     if r.get("code") != 1:
-        logger.warning(
-            "JT808 1251 车辆同步失败 vehicle_id=%s tid=%s: %s",
-            data.get("id"),
-            tid,
-            r.get("message") or r,
-        )
-        return False
+        msg = str(r.get("message") or r)
+        if car_id is None and "Field 'sim'" in msg:
+            mid = await asyncio.to_thread(
+                _mysql_ensure_car,
+                tid,
+                plate,
+                (data.get("sim_no") or data.get("actual_sim") or "").strip(),
+                int(gid),
+            )
+            if mid:
+                payload["id"] = mid
+                car_id = mid
+                call_body = {k: v for k, v in payload.items() if k not in ("language", "lingxtoken")}
+                r = await _call(call_body)
+                if r.get("code") == 1:
+                    logger.info(
+                        "JT808 1251 车辆同步成功(先MySQL插入) vehicle_id=%s tid=%s carno=%s",
+                        data.get("id"),
+                        tid,
+                        plate,
+                    )
+                else:
+                    logger.warning(
+                        "JT808 1251 更新仍失败但车已入库 vehicle_id=%s tid=%s: %s",
+                        data.get("id"),
+                        tid,
+                        r.get("message") or r,
+                    )
+            else:
+                logger.warning(
+                    "JT808 1251 车辆同步失败 vehicle_id=%s tid=%s: %s",
+                    data.get("id"),
+                    tid,
+                    msg,
+                )
+                return False
+        else:
+            logger.warning(
+                "JT808 1251 车辆同步失败 vehicle_id=%s tid=%s: %s",
+                data.get("id"),
+                tid,
+                msg,
+            )
+            return False
 
     if car_id is None:
         data_obj = r.get("data") or {}
@@ -614,6 +654,39 @@ def _car_id_by_tid_mysql(cur, tid: str) -> int | None:
     cur.execute("select id from tgps_car where tid=%s limit 1", (tid,))
     row = cur.fetchone()
     return int(row[0]) if row else None
+
+
+def _mysql_ensure_car(tid: str, carno: str, sim: str, group_id: int) -> int | None:
+    """808 的 1251 新建不写 sim，而 tgps_car.sim 又无默认值。这里先插入再交给 1251 更新。"""
+    conn = _connect_mysql()
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor()
+        existed = _car_id_by_tid_mysql(cur, tid)
+        if existed is not None:
+            if sim:
+                cur.execute("update tgps_car set sim=%s, carno=%s where id=%s", (sim, carno, existed))
+                conn.commit()
+            return existed
+        now = datetime.now()
+        now14 = now.strftime("%Y%m%d%H%M%S")
+        stime = now.strftime("%Y%m%d")
+        etime = (now + timedelta(days=365)).strftime("%Y%m%d")
+        cur.execute(
+            "insert into tgps_car(tid,carno,sim,group_id,icon_type,oiltype_id,create_time,modify_time,stime,etime) "
+            "values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (tid, carno, sim or "", int(group_id), "car_icon_0", 0, now14, now14, stime, etime),
+        )
+        conn.commit()
+        cid = int(cur.lastrowid) if cur.lastrowid else _car_id_by_tid_mysql(cur, tid)
+        logger.info("JT808 MySQL 预插入车辆 tid=%s carno=%s id=%s", tid, carno, cid)
+        return cid
+    except Exception as e:  # noqa: BLE001
+        logger.warning("JT808 MySQL 预插入车辆失败 tid=%s carno=%s: %s", tid, carno, e)
+        return None
+    finally:
+        conn.close()
 
 
 def _sync_channels_mysql(tid: str, ch: int, car_id: int | None = None) -> None:
