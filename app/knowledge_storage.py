@@ -7,16 +7,18 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from datetime import datetime
+from typing import Any
 
 from app.timeutil import china_now_naive
 from pathlib import Path
 
 from fastapi import HTTPException
 
-from app.config import settings
+from app.agent_worker_config import cached_default_company
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +57,7 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 def company_dir_key(company: str) -> str:
     """公司目录名（与 AI x-company 一致，仅替换非法路径字符）。"""
-    s = (company or settings.agent_worker_default_company or "default").strip()
+    s = (company or cached_default_company() or "default").strip()
     s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", s)
     return s or "default"
 
@@ -85,6 +87,68 @@ def safe_filename(raw: str) -> str:
     if not name or name in {".", ".."}:
         raise HTTPException(status_code=400, detail="文件名无效")
     return name
+
+
+def file_sha256(content: bytes) -> str:
+    return hashlib.sha256(content or b"").hexdigest()
+
+
+def unique_target_path(directory: Path, filename: str) -> Path:
+    name = safe_filename(filename)
+    target = directory / name
+    if not target.exists():
+        return target
+    stamp = china_now_naive().strftime("%Y%m%d%H%M%S")
+    return directory / f"{Path(name).stem}_{stamp}{Path(name).suffix.lower()}"
+
+
+def iter_company_files(company_key: str) -> list[dict[str, Any]]:
+    """扫描本公司全部 16 类本地文件（含内容哈希，供去重）。"""
+    ensure_company_tree(company_key)
+    rows: list[dict[str, Any]] = []
+    for cid, cname in KNOWLEDGE_CATEGORIES:
+        d = category_dir(company_key, cid)
+        for p in d.iterdir():
+            if not p.is_file():
+                continue
+            try:
+                data = p.read_bytes()
+            except OSError:
+                continue
+            rows.append(
+                {
+                    "category_id": cid,
+                    "category_name": cname,
+                    "name": p.name,
+                    "size": len(data),
+                    "sha256": file_sha256(data),
+                }
+            )
+    return rows
+
+
+def find_local_duplicates(
+    company_key: str,
+    *,
+    filename: str,
+    sha256: str,
+) -> list[dict[str, Any]]:
+    want_name = safe_filename(filename).casefold()
+    want_hash = (sha256 or "").strip().lower()
+    hits: list[dict[str, Any]] = []
+    for row in iter_company_files(company_key):
+        same_hash = bool(want_hash) and row["sha256"] == want_hash
+        same_name = (row["name"] or "").casefold() == want_name
+        if not (same_hash or same_name):
+            continue
+        hits.append(
+            {
+                **row,
+                "reason": "content" if same_hash else "filename",
+                "source": "local",
+            }
+        )
+    return hits
 
 
 def list_files_in_category(company_key: str, category_id: int) -> list[dict]:
@@ -120,6 +184,7 @@ def build_catalog(company: str, company_key: str, dataset_id: str | None) -> dic
         "company": company,
         "company_key": company_key,
         "dataset_id": dataset_id,
+        "dataset_name": company,
         "total_files": total_files,
         "categories": categories,
     }
@@ -127,7 +192,7 @@ def build_catalog(company: str, company_key: str, dataset_id: str | None) -> dic
 
 def migrate_legacy_flat_dirs() -> None:
     """旧版 knowledge_files/01..16 迁移到默认公司目录（仅执行一次）。"""
-    default_key = company_dir_key(settings.agent_worker_default_company or "三峰城服")
+    default_key = company_dir_key(cached_default_company())
     target_root = KNOWLEDGE_ROOT / default_key
     if target_root.exists() and any(target_root.iterdir()):
         return

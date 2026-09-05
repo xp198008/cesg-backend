@@ -27,8 +27,8 @@ from fastapi import HTTPException
 from sqlalchemy import and_, func, or_, select
 
 from app.agent_worker_client import agent_worker_client
+from app.agent_worker_config import cached_runtime
 from app.alarm_type_gate import load_disabled_alarm_type_names
-from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models import VehicleViolation, ViolationAiAssessment
 from app.timeutil import china_now_naive, china_today
@@ -173,7 +173,7 @@ async def list_recent_assessed(db, *, limit: int = 30) -> list[dict[str, Any]]:
 async def run_violation_ai_assess_once() -> AiAssessRoundResult:
     result = AiAssessRoundResult()
     if not agent_worker_client.configured():
-        result.error = "Agent Worker 未配置（AGENT_WORKER_BASE_URL）"
+        result.error = "AI 接口未配置或未启用"
         return result
 
     defer_ids = violation_ai_assessment_scheduler.active_defer_ids()
@@ -324,7 +324,7 @@ class ViolationAiAssessmentScheduler:
             "defer_seconds": _DEFER_NO_EVIDENCE_SEC,
             "deferred_count": len(self.active_defer_ids()),
             "agent_worker_configured": agent_worker_client.configured(),
-            "agent_worker_base_url": (getattr(settings, "agent_worker_base_url", None) or ""),
+            "agent_worker_base_url": str(cached_runtime().get("base_url") or ""),
             "last_run_at": self._last_run_at.isoformat(sep=" ", timespec="seconds") if self._last_run_at else None,
             "last_result": self._last_result,
             "last_error": self._last_error,

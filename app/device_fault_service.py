@@ -45,9 +45,11 @@ _IMAGE_MEDIA_TYPES = {
 _AUDIT_PENDING = frozenset({"待审核", "待预审", "未处理", "待处理"})
 # 仅待审核可操作；驳回后审核页不可见、不可再审
 _AUDIT_ACTIONS_FROM = _AUDIT_PENDING
-# 可上传单据：审核通过；兼容旧状态（预审通过/待终审/终审驳回）
-_RECEIPT_ELIGIBLE = frozenset({"审核通过", "预审通过", "待终审", "终审驳回"})
+# 可上传单据：仅审核通过；兼容旧「预审通过」
+_RECEIPT_ELIGIBLE = frozenset({"审核通过", "预审通过"})
 _COMPLETED = frozenset({"已完结", "完结", "已通过", "已处理"})
+# 单据上传页：待上传 + 已完结（上传后仍可查看核对）
+_RECEIPT_PAGE_VISIBLE = _RECEIPT_ELIGIBLE | frozenset({"已完结", "完结"})
 _REJECTED = frozenset({"驳回", "预审驳回", "审核驳回", "终审驳回"})
 # 查询页：通过类 + 完结 + 驳回（含历史状态）
 _QUERY_VISIBLE = frozenset(
@@ -79,7 +81,7 @@ def _handle_status_match_values(handle_status: str) -> list[str] | None:
         return list(_AUDIT_PENDING)
     if hs in ("查询可见", "已审核"):
         return list(_QUERY_VISIBLE)
-    if hs in ("已完结", "完结"):
+    if hs in ("已完结", "完结", "已通过", "已处理"):
         return list(_COMPLETED)
     if hs in ("审核通过", "预审通过"):
         return ["审核通过", "预审通过"]
@@ -90,7 +92,7 @@ def _handle_status_match_values(handle_status: str) -> list[str] | None:
 
 def _apply_handle_status_filter(q, column, handle_status: str | None, *, receipt_eligible_only: bool):
     if receipt_eligible_only:
-        return q.where(column.in_(list(_RECEIPT_ELIGIBLE)))
+        return q.where(column.in_(list(_RECEIPT_PAGE_VISIBLE)))
     if not handle_status or not str(handle_status).strip():
         return q
     values = _handle_status_match_values(str(handle_status))
@@ -105,8 +107,11 @@ def _dt_text(v) -> str | None:
     if v is None:
         return None
     try:
-        return v.isoformat()[:19]
-    except AttributeError:
+        if hasattr(v, "strftime"):
+            naive = v.replace(tzinfo=None) if getattr(v, "tzinfo", None) else v
+            return naive.strftime("%Y-%m-%d %H:%M:%S")
+        return str(v).replace("T", " ")[:19]
+    except Exception:
         return str(v)[:19]
 
 

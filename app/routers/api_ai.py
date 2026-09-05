@@ -14,8 +14,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_worker_client import AgentWorkerError, agent_worker_client
+from app.agent_worker_config import (
+    config_out,
+    ensure_ai_worker_config,
+    save_ai_worker_config,
+)
 from app.ai_datasets import AI_DATASETS, resolve_ai_company, resolve_dataset_id
-from app.config import settings
 from app.database import get_db
 from app.models import OrgCompany, SysUser
 
@@ -50,6 +54,17 @@ class VideoUrlRequest(BaseModel):
     session_id: str | None = Field(None, max_length=128)
 
 
+class AgentWorkerConfigBody(BaseModel):
+    provider: str = "agent"
+    enabled: bool = True
+    base_url: str | None = None
+    api_key: str | None = None
+    default_company: str | None = "三峰城服"
+    timeout_seconds: int | None = Field(default=60, ge=5, le=600)
+    video_timeout_seconds: int | None = Field(default=600, ge=30, le=3600)
+    remark: str | None = None
+
+
 async def _resolve_user_org_name(db: AsyncSession, user_id: str | None) -> str:
     if not user_id or not str(user_id).isdigit():
         return ""
@@ -77,7 +92,53 @@ async def _ai_context(
 
 def _ensure_configured() -> None:
     if not agent_worker_client.configured():
-        raise HTTPException(status_code=503, detail="Agent Worker 未配置（AGENT_WORKER_BASE_URL）")
+        raise HTTPException(status_code=503, detail="AI 接口未配置或未启用")
+
+
+@router.get("/worker-config")
+async def ai_worker_config_get(db: AsyncSession = Depends(get_db)):
+    row = await ensure_ai_worker_config(db)
+    data = config_out(row)
+    return {
+        "ok": True,
+        "data": data,
+        "ready": bool(data.get("ready")),
+        "ready_reason": data.get("ready_reason"),
+    }
+
+
+@router.put("/worker-config")
+async def ai_worker_config_put(body: AgentWorkerConfigBody, db: AsyncSession = Depends(get_db)):
+    row = await save_ai_worker_config(
+        db,
+        provider=body.provider,
+        enabled=body.enabled,
+        base_url=body.base_url,
+        api_key=body.api_key,
+        default_company=body.default_company,
+        timeout_seconds=body.timeout_seconds,
+        video_timeout_seconds=body.video_timeout_seconds,
+        remark=body.remark,
+    )
+    data = config_out(row)
+    return {
+        "ok": True,
+        "data": data,
+        "ready": bool(data.get("ready")),
+        "ready_reason": data.get("ready_reason"),
+    }
+
+
+@router.post("/worker-config/test")
+async def ai_worker_config_test():
+    """用当前已保存配置探测 Agent Worker /health。"""
+    try:
+        data = await agent_worker_client.health()
+        return {"ok": True, "data": data, "message": "连通正常"}
+    except AgentWorkerError as exc:
+        return {"ok": False, "message": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "message": f"不可达：{exc}"}
 
 
 @router.get("/health")
@@ -93,7 +154,10 @@ async def ai_health():
 
 @router.get("/datasets")
 async def ai_datasets():
-    items = [{"name": name, "dataset_id": dataset_id} for name, dataset_id in AI_DATASETS.items()]
+    items = [
+        {"name": name, "dataset_id": dataset_id, "dataset_name": name}
+        for name, dataset_id in AI_DATASETS.items()
+    ]
     return {"ok": True, "items": items, "total": len(items)}
 
 
@@ -111,6 +175,7 @@ async def ai_company(
             "user_id": user_id,
             "org_name": org_name,
             "company": resolved,
+            "dataset_name": resolved,
             "dataset_id": resolve_dataset_id(resolved),
         },
     }

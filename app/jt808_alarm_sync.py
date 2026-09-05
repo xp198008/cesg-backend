@@ -192,6 +192,50 @@ def _as_float(raw: Any) -> float | None:
         return None
 
 
+# 接打电话 + 报警包 GPS 车速不超过该值（含）→ 停车场景，自动误报
+_PHONE_CALL_STOPPED_MAX_KMH = 5.0
+_PHONE_CALL_STOPPED_HANDLER = "系统自动判定"
+_PHONE_CALL_NAME_HINTS = ("接打电话", "打电话报警", "使用手机")
+
+
+def _is_phone_call_alarm(type_name: str, item: dict[str, Any] | None = None) -> bool:
+    # 不看 bjlx：1208 里 ADAS/DSM 编号重叠（2=车道偏离 / 接打电话），以类型名为准
+    texts = [_strip_alarm_level_suffix(type_name or "")]
+    if item:
+        texts.append(_strip_alarm_level_suffix(str(item.get("name") or "")))
+    for text in texts:
+        if any(hint in text for hint in _PHONE_CALL_NAME_HINTS):
+            return True
+        if text.startswith("打电话"):
+            return True
+    return False
+
+
+def _alarm_packet_speed_kmh(item: dict[str, Any] | None) -> float | None:
+    if not item:
+        return None
+    for key in ("speed", "velocity", "gps_speed", "gpsspeed", "sudu"):
+        value = _as_float(item.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _phone_call_stopped_false_alarm(type_name: str, item: dict[str, Any] | None) -> tuple[float, str] | None:
+    """停车接打电话：返回 (车速, 备注)；不命中则 None。"""
+    if not _is_phone_call_alarm(type_name, item):
+        return None
+    speed = _alarm_packet_speed_kmh(item)
+    if speed is None or speed > _PHONE_CALL_STOPPED_MAX_KMH:
+        return None
+    speed_txt = str(int(speed)) if float(speed).is_integer() else str(round(speed, 1))
+    remark = (
+        f"接打电话时车辆处于停止（报警包车速 {speed_txt} km/h ≤ "
+        f"{int(_PHONE_CALL_STOPPED_MAX_KMH)}），系统自动判定为误报"
+    )
+    return speed, remark
+
+
 def _stable_biz_no(source: str, external_id: str, violation_time: datetime) -> str:
     digest = hashlib.md5(f"{source}:{external_id}".encode("utf-8")).hexdigest()[:8].upper()  # noqa: S324
     return f"WZ{violation_time.strftime('%Y%m%d%H%M%S')}{digest}"
@@ -542,6 +586,7 @@ async def _sync_alarm_source(db: AsyncSession, source: str, start_at: datetime, 
                     db, lat, lng, existing=str(item.get("address") or "")
                 )
                 company_name = await lookup_company_name(db, vehicle.company_id, company_name_cache)
+                auto_false = _phone_call_stopped_false_alarm(type_name, item)
                 row = VehicleViolation(
                     biz_no=_stable_biz_no(source, ext_id, alarm_time),
                     external_alarm_id=ext_id,
@@ -561,10 +606,22 @@ async def _sync_alarm_source(db: AsyncSession, source: str, start_at: datetime, 
                     transparent_type=_as_int(item.get("bjid")),
                     raw_preview=json.dumps(item, ensure_ascii=False)[:4000],
                     ttx_evidence_refs=json.dumps(media, ensure_ascii=False),
-                    status="待处理",
+                    status="误报" if auto_false else "待处理",
+                    pre_audit_kind="false_alarm" if auto_false else None,
+                    handler_name=_PHONE_CALL_STOPPED_HANDLER if auto_false else None,
+                    handler_remark=auto_false[1] if auto_false else None,
+                    handled_at=_now() if auto_false else None,
                 )
                 db.add(row)
                 await db.flush()
+                if auto_false:
+                    logger.info(
+                        "接打电话停车自动误报: plate=%s speed=%s type=%s ext_id=%s",
+                        vehicle.plate_no,
+                        auto_false[0],
+                        type_name,
+                        ext_id,
+                    )
                 await notify_violation_created(db, row)
                 result.inserted += 1
                 if terminal_id:

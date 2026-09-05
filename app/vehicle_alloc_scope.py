@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import pymysql
 from sqlalchemy import select
@@ -19,6 +20,10 @@ from app.config import settings
 from app.models import SysUser, Vehicle, VehicleAllocRuleUser, VehicleAllocRuleVehicle, VehicleDevice
 
 logger = logging.getLogger(__name__)
+
+# 选车弹窗每次都会打 monitor-scope；短缓存避免反复扫全表 + 查 808
+_MONITOR_SCOPE_TTL_SEC = 45.0
+_monitor_scope_cache: dict[int, tuple[float, dict[str, object]]] = {}
 
 
 def parse_user_id_header(x_user_id: str | None) -> int | None:
@@ -357,5 +362,12 @@ async def resolve_monitor_scope(
     if user is None or not user.is_active:
         return {"scoped": True, "plates": [], "device_nos": [], "car_ids": []}
 
+    now = time.monotonic()
+    cached = _monitor_scope_cache.get(int(user_id))
+    if cached and (now - cached[0]) < _MONITOR_SCOPE_TTL_SEC:
+        return cached[1]
+
     vehicle_ids, unrestricted = await _resolve_scope_vehicle_ids(db, user)
-    return await _build_monitor_scope_payload(db, vehicle_ids, unrestricted=unrestricted)
+    payload = await _build_monitor_scope_payload(db, vehicle_ids, unrestricted=unrestricted)
+    _monitor_scope_cache[int(user_id)] = (now, payload)
+    return payload

@@ -46,6 +46,8 @@ def violation_alert_payload(row) -> dict[str, Any]:
         "vehicle_id": row.vehicle_id,
         "terminal_id": row.terminal_id or "",
         "company_id": row.company_id,
+        "company_name": (getattr(row, "company_name", None) or "").strip(),
+        "group_name": (getattr(row, "company_name", None) or "").strip(),
         "source": row.source or "",
         "status": row.status or "待处理",
         "weather": getattr(row, "weather", None) or "",

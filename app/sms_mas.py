@@ -11,25 +11,27 @@ import logging
 import random
 import re
 import string
-import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import SmsPlatformConfig
+from app.models import SmsLoginCode, SmsPlatformConfig
 from app.timeutil import china_now_naive
 
 logger = logging.getLogger(__name__)
 
 _PHONE_RE = re.compile(r"^1\d{10}$")
 _FAIL_MSG = "无法获取短信"
-
-# phone -> {code, expire_at, sent_at}
-_code_store: dict[str, dict[str, Any]] = {}
 _RATE_SECONDS = 60
+_CODE_LEN = 4
+
+STATUS_PENDING = "待验证"
+STATUS_SUCCESS = "登录成功"
+STATUS_EXPIRED = "已失效"
 
 
 @dataclass
@@ -188,15 +190,16 @@ async def send_mas_sms(
         return SmsSendResult(ok=False, message=_FAIL_MSG, detail="request_error")
 
 
-def _gen_code(length: int = 6) -> str:
+def _gen_code(length: int = _CODE_LEN) -> str:
     return "".join(random.choices(string.digits, k=length))
 
 
-def _purge_codes(now: float | None = None) -> None:
-    now = now if now is not None else time.time()
-    dead = [k for k, v in _code_store.items() if float(v.get("expire_at") or 0) < now]
-    for k in dead:
-        _code_store.pop(k, None)
+def _as_naive(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
 
 
 def _norm_phone(phone: str) -> str:
@@ -218,6 +221,32 @@ async def phone_bound_user_exists(db: AsyncSession, phone: str) -> bool:
     return uid is not None
 
 
+async def _expire_stale_pending(db: AsyncSession, phone: str | None = None) -> None:
+    now = china_now_naive()
+    q = select(SmsLoginCode).where(
+        SmsLoginCode.status == STATUS_PENDING,
+        SmsLoginCode.expire_at.is_not(None),
+        SmsLoginCode.expire_at < now,
+    )
+    if phone:
+        q = q.where(SmsLoginCode.phone == phone)
+    rows = (await db.execute(q)).scalars().all()
+    for rec in rows:
+        rec.status = STATUS_EXPIRED
+
+
+async def _invalidate_pending(db: AsyncSession, phone: str, *, except_id: int | None = None) -> None:
+    q = select(SmsLoginCode).where(
+        SmsLoginCode.phone == phone,
+        SmsLoginCode.status == STATUS_PENDING,
+    )
+    if except_id is not None:
+        q = q.where(SmsLoginCode.id != except_id)
+    rows = (await db.execute(q)).scalars().all()
+    for rec in rows:
+        rec.status = STATUS_EXPIRED
+
+
 async def send_login_sms_code(db: AsyncSession, phone: str) -> SmsSendResult:
     """发送登录验证码；配置缺失/错误/未绑定时仅返回无法获取短信。"""
     phone = _norm_phone(phone)
@@ -234,13 +263,21 @@ async def send_login_sms_code(db: AsyncSession, phone: str) -> SmsSendResult:
         logger.info("验证码未发送：%s", reason)
         return SmsSendResult(ok=False, message=_FAIL_MSG, detail=reason)
 
-    now = time.time()
-    _purge_codes(now)
-    prev = _code_store.get(phone)
-    if prev and now - float(prev.get("sent_at") or 0) < _RATE_SECONDS:
-        return SmsSendResult(ok=False, message="发送过于频繁，请稍后再试")
+    await _expire_stale_pending(db, phone)
+    last = await db.scalar(
+        select(SmsLoginCode)
+        .where(SmsLoginCode.phone == phone)
+        .order_by(SmsLoginCode.requested_at.desc())
+        .limit(1)
+    )
+    now = china_now_naive()
+    last_at = _as_naive(getattr(last, "requested_at", None)) if last is not None else None
+    if last_at is not None:
+        elapsed = (now - last_at).total_seconds()
+        if elapsed < _RATE_SECONDS:
+            return SmsSendResult(ok=False, message="发送过于频繁，请稍后再试")
 
-    code = _gen_code(6)
+    code = _gen_code(_CODE_LEN)
     ttl = int(row.code_ttl_seconds or 300)
     if ttl < 60:
         ttl = 60
@@ -254,28 +291,57 @@ async def send_login_sms_code(db: AsyncSession, phone: str) -> SmsSendResult:
 
     result = await send_mas_sms(db, mobiles=phone, content=content_for_send)
     if result.ok:
-        _code_store[phone] = {
-            "code": code,
-            "expire_at": now + ttl,
-            "sent_at": now,
-        }
+        await _invalidate_pending(db, phone)
+        rec = SmsLoginCode(
+            requested_at=now,
+            phone=phone,
+            code=code,
+            status=STATUS_PENDING,
+            expire_at=now + timedelta(seconds=ttl),
+            msg_group=result.msg_group,
+        )
+        db.add(rec)
+        await db.flush()
+        logger.info("登录验证码已落库 phone=%s rec_id=%s ttl=%s", phone, rec.id, ttl)
     return result
 
 
-def verify_login_sms_code(phone: str, code: str) -> bool:
+async def consume_login_sms_code(
+    db: AsyncSession, phone: str, code: str, *, user_id: int | None = None
+) -> bool:
+    """校验待验证记录：匹配且未过期则改为登录成功，该验证码立即失效。"""
     phone = _norm_phone(phone)
     code = _trim(code)
     if not phone or not code:
         return False
-    now = time.time()
-    _purge_codes(now)
-    item = _code_store.get(phone)
-    if not item:
+    await _expire_stale_pending(db, phone)
+    rec = await db.scalar(
+        select(SmsLoginCode)
+        .where(
+            SmsLoginCode.phone == phone,
+            SmsLoginCode.code == code,
+            SmsLoginCode.status == STATUS_PENDING,
+        )
+        .order_by(SmsLoginCode.requested_at.desc())
+        .limit(1)
+    )
+    if rec is None:
         return False
-    if str(item.get("code")) != code:
+    now = china_now_naive()
+    expire_at = _as_naive(rec.expire_at)
+    if expire_at is not None and expire_at < now:
+        rec.status = STATUS_EXPIRED
         return False
-    _code_store.pop(phone, None)
+    rec.status = STATUS_SUCCESS
+    rec.used_at = now
+    if user_id is not None:
+        rec.user_id = user_id
+    await _invalidate_pending(db, phone, except_id=rec.id)
     return True
+
+
+async def verify_login_sms_code(db: AsyncSession, phone: str, code: str) -> bool:
+    return await consume_login_sms_code(db, phone, code)
 
 
 def config_out(row: SmsPlatformConfig | None, *, mask_secret: bool = False) -> dict[str, Any] | None:

@@ -12,12 +12,23 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPExcep
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook, load_workbook
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import jt808_group
 from app.database import get_db
-from app.models import Driver, Fleet, OrgCompany, Vehicle
+from app.models import (
+    Driver,
+    Fleet,
+    MapRuleCategory,
+    OrgCompany,
+    PrivateMapRule,
+    SysRole,
+    SysUser,
+    Vehicle,
+    VehicleAllocRule,
+)
 from app.org_scope import (
     require_user_company_subtree_ids,
     wants_org_tree_scope,
@@ -584,6 +595,73 @@ async def resolve_jt808_groups(
     return {"items": items}
 
 
+async def _org_usage_counts(db: AsyncSession, company_ids: list[int]) -> dict[int, dict[str, int]]:
+    """统计组织下车辆（含子树）/ 直接下级 / 车队数量，供删除前提示。"""
+    ids = sorted({int(x) for x in company_ids if x is not None})
+    out = {cid: {"vehicle_count": 0, "child_count": 0, "fleet_count": 0} for cid in ids}
+    if not ids:
+        return out
+
+    by_parent: dict[int | None, list[int]] = {}
+    for oid, pid in (await db.execute(select(OrgCompany.id, OrgCompany.parent_id))).all():
+        by_parent.setdefault(pid, []).append(int(oid))
+
+    def _subtree(root_id: int) -> set[int]:
+        found: set[int] = set()
+        stack = [root_id]
+        while stack:
+            cur = stack.pop()
+            if cur in found:
+                continue
+            found.add(cur)
+            stack.extend(by_parent.get(cur, []))
+        return found
+
+    needed: set[int] = set()
+    subtrees = {cid: _subtree(cid) for cid in ids}
+    for tree in subtrees.values():
+        needed.update(tree)
+
+    direct_vehicles: dict[int, int] = {}
+    if needed:
+        for cid, cnt in (
+            await db.execute(
+                select(Vehicle.company_id, func.count())
+                .where(Vehicle.company_id.in_(needed))
+                .group_by(Vehicle.company_id)
+            )
+        ).all():
+            if cid is None:
+                continue
+            direct_vehicles[int(cid)] = int(cnt or 0)
+
+    for cid in ids:
+        out[cid]["vehicle_count"] = sum(direct_vehicles.get(oid, 0) for oid in subtrees[cid])
+
+    for cid, cnt in (
+        await db.execute(
+            select(OrgCompany.parent_id, func.count())
+            .where(OrgCompany.parent_id.in_(ids))
+            .group_by(OrgCompany.parent_id)
+        )
+    ).all():
+        if cid is None:
+            continue
+        out[int(cid)]["child_count"] = int(cnt or 0)
+
+    for cid, cnt in (
+        await db.execute(
+            select(Fleet.company_id, func.count())
+            .where(Fleet.company_id.in_(ids))
+            .group_by(Fleet.company_id)
+        )
+    ).all():
+        if cid is None:
+            continue
+        out[int(cid)]["fleet_count"] = int(cnt or 0)
+    return out
+
+
 @router.get("/companies", response_model=dict)
 async def company_list(
     page: int = Query(1, ge=1),
@@ -627,6 +705,7 @@ async def company_list(
         q = q.where(*conds)
     rows = (await db.execute(q)).scalars().all()
     pmap = await _load_all_map(db)
+    usage = await _org_usage_counts(db, [x.id for x in rows if x.id is not None])
 
     items = []
     for x in rows:
@@ -636,6 +715,7 @@ async def company_list(
             pn = pmap[x.parent_id].name
         else:
             pn = "—"
+        counts = usage.get(int(x.id), {})
         items.append(
             {
                 "id": x.id,
@@ -647,6 +727,9 @@ async def company_list(
                 "contact_phone": x.contact_phone,
                 "address": x.address,
                 "created_at": _fmt_dt(x.created_at),
+                "vehicle_count": counts.get("vehicle_count", 0),
+                "child_count": counts.get("child_count", 0),
+                "fleet_count": counts.get("fleet_count", 0),
             }
         )
     return {"total": total, "items": items, "page": page, "page_size": page_size}
@@ -659,6 +742,7 @@ async def company_detail(company_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(404, "组织不存在")
     pmap = await _load_all_map(db)
     pn = pmap[x.parent_id].name if x.parent_id and x.parent_id in pmap else None
+    counts = (await _org_usage_counts(db, [x.id])).get(int(x.id), {})
     return {
         "id": x.id,
         "org_code": x.org_code,
@@ -670,6 +754,9 @@ async def company_detail(company_id: int, db: AsyncSession = Depends(get_db)):
         "address": x.address,
         "jt808_group_id": int(x.jt808_group_id) if x.jt808_group_id is not None else None,
         "created_at": _fmt_dt(x.created_at),
+        "vehicle_count": counts.get("vehicle_count", 0),
+        "child_count": counts.get("child_count", 0),
+        "fleet_count": counts.get("fleet_count", 0),
     }
 
 
@@ -785,6 +872,19 @@ async def company_update(
     return {"ok": True, "jt808_sync": ("queued" if do_edit else None)}
 
 
+def _org_delete_order(root_id: int, by_parent: dict[int | None, list[int]]) -> list[int]:
+    """自下而上：先删下级，再删本级。"""
+    order: list[int] = []
+
+    def _walk(nid: int) -> None:
+        for child in by_parent.get(nid, []):
+            _walk(child)
+        order.append(nid)
+
+    _walk(root_id)
+    return order
+
+
 @router.delete("/companies/{company_id}")
 async def company_delete(
     company_id: int,
@@ -794,19 +894,40 @@ async def company_delete(
     row = (await db.execute(select(OrgCompany).where(OrgCompany.id == company_id))).scalar_one_or_none()
     if not row:
         raise HTTPException(404, "组织不存在")
-    ch = await db.scalar(select(func.count()).select_from(OrgCompany).where(OrgCompany.parent_id == company_id))
-    if ch and ch > 0:
-        raise HTTPException(400, "存在下级组织，无法删除")
-    fv = await db.scalar(select(func.count()).select_from(Fleet).where(Fleet.company_id == company_id))
-    if fv and fv > 0:
-        raise HTTPException(400, "该组织下存在车队，无法删除")
-    vv = await db.scalar(select(func.count()).select_from(Vehicle).where(Vehicle.company_id == company_id))
-    if vv and vv > 0:
-        raise HTTPException(400, "该组织下存在车辆，无法删除")
 
-    gid = row.jt808_group_id
-    await db.execute(delete(OrgCompany).where(OrgCompany.id == company_id))
-    await db.commit()
-    if gid:
+    tree_ids = await _descendant_ids(db, company_id)
+    vv = await db.scalar(select(func.count()).select_from(Vehicle).where(Vehicle.company_id.in_(tree_ids)))
+    if vv and vv > 0:
+        raise HTTPException(400, "该组织或其下级组织下存在车辆，请先将车辆转移到其他组织后再删除")
+
+    by_parent: dict[int | None, list[int]] = {}
+    gid_map: dict[int, int] = {}
+    for oid, pid, gid in (
+        await db.execute(
+            select(OrgCompany.id, OrgCompany.parent_id, OrgCompany.jt808_group_id).where(OrgCompany.id.in_(tree_ids))
+        )
+    ).all():
+        by_parent.setdefault(pid, []).append(int(oid))
+        if gid is not None:
+            gid_map[int(oid)] = int(gid)
+
+    delete_ids = _org_delete_order(company_id, by_parent)
+    try:
+        await db.execute(update(Driver).where(Driver.company_id.in_(tree_ids)).values(company_id=None))
+        await db.execute(update(SysUser).where(SysUser.org_id.in_(tree_ids)).values(org_id=None))
+        await db.execute(update(SysRole).where(SysRole.org_id.in_(tree_ids)).values(org_id=None))
+        await db.execute(delete(MapRuleCategory).where(MapRuleCategory.company_id.in_(tree_ids)))
+        await db.execute(delete(PrivateMapRule).where(PrivateMapRule.company_id.in_(tree_ids)))
+        await db.execute(delete(VehicleAllocRule).where(VehicleAllocRule.company_id.in_(tree_ids)))
+        await db.execute(delete(Fleet).where(Fleet.company_id.in_(tree_ids)))
+        for oid in delete_ids:
+            await db.execute(delete(OrgCompany).where(OrgCompany.id == oid))
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(400, "该组织仍被其他数据引用，无法删除") from exc
+
+    gids = [gid_map[oid] for oid in delete_ids if oid in gid_map]
+    for gid in gids:
         background_tasks.add_task(jt808_group.bg_delete, gid)
-    return {"ok": True, "jt808_sync": ("queued" if gid else None)}
+    return {"ok": True, "jt808_sync": ("queued" if gids else None)}

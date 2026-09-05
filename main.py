@@ -265,35 +265,41 @@ async def _background_address_backfill() -> None:
         logger.warning("报警地址启动回填失败: %s", exc)
 
 
+async def _background_startup_backfill() -> None:
+    """只补登录统计等轻量字段；公司名全表回填已完成，不再每次启动扫 1.4 万行。"""
+    await asyncio.sleep(1)
+    from app.database import AsyncSessionLocal
+    from app.user_online_daily import backfill_login_log_org_names, rebuild_daily_from_login_logs
+    from app.violation_risk_backfill import backfill_violation_risk_levels
+
+    try:
+        async with AsyncSessionLocal() as s:
+            filled = await backfill_login_log_org_names(s)
+            if filled:
+                logger.info("已补全 %s 条登录明细的所属公司", filled)
+            rebuilt = await rebuild_daily_from_login_logs(s)
+            await backfill_violation_risk_levels(s)
+            await s.commit()
+            if rebuilt:
+                logger.info("已重建 %s 条登录会话的用户按日在线记录", rebuilt)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("启动后台回填失败: %s", exc)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     await init_models()
     from app.database import AsyncSessionLocal
-    from app.user_online_daily import backfill_login_log_org_names, rebuild_daily_from_login_logs
+    from app.agent_worker_config import ensure_ai_worker_config
 
     async with AsyncSessionLocal() as s:
-        filled = await backfill_login_log_org_names(s)
-        if filled:
-            logger.info("已补全 %s 条登录明细的所属公司", filled)
-        rebuilt = await rebuild_daily_from_login_logs(s)
-        from app.violation_risk_backfill import backfill_violation_risk_levels
-
-        risk_updated = await backfill_violation_risk_levels(s)
-        from app.jt808_violation_sync import backfill_violation_company_names
-
-        company_name_stats = await backfill_violation_company_names(s)
-        await s.commit()
-        if rebuilt:
-            logger.info("已重建 %s 条登录会话的用户按日在线记录", rebuilt)
-        remote_stats = company_name_stats.get("remote") or {}
+        ai_row = await ensure_ai_worker_config(s)
         logger.info(
-            "启动回填安全报警公司名称完成：本地补写=%s，808补齐=%s，808空值 %s→%s，错误=%s",
-            company_name_stats.get("local_updated"),
-            remote_stats.get("updated_rows"),
-            remote_stats.get("empty_before"),
-            remote_stats.get("empty_after"),
-            remote_stats.get("error"),
+            "AI 接口配置已加载：enabled=%s base_url=%s",
+            bool(ai_row.enabled),
+            (ai_row.base_url or "").strip() or "—",
         )
+    asyncio.create_task(_background_startup_backfill())
     asyncio.create_task(_background_address_backfill())
     # 不再启动时删除「无图片/视频证据」的 JT808 报警：证据常晚于报警到达，删掉会导致
     # 安全监控/安全管理只剩 OBD 等无需证据的来源。保留无车辆关联与未知类型清理。

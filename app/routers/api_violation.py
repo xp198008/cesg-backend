@@ -77,6 +77,10 @@ class ViolationAppealResolveIn(BaseModel):
     handler_name: str | None = Field(None, max_length=64)
 
 
+class ViolationPendingAliveIn(BaseModel):
+    ids: list[int] = Field(default_factory=list, max_length=3000)
+
+
 class ViolationManualIn(BaseModel):
     plate_no: str = Field(..., min_length=1, max_length=16)
     violation_type_dict_id: int | None = Field(None, ge=1)
@@ -381,6 +385,13 @@ async def _load_org_company_maps(db: AsyncSession) -> tuple[dict[int, str | None
     return dict(company_map), dict(parent_map), dict(fleet_map)
 
 
+def _leaf_org_name(company_id: int | None, company_map: dict[int, str | None]) -> str:
+    """车辆实际挂靠组织名（叶子，如站点/组），不抬到车队或上级公司。"""
+    if not company_id:
+        return ""
+    return (company_map.get(int(company_id)) or "").strip()
+
+
 def _apply_vehicle_display_fields(
     out: dict[str, Any],
     *,
@@ -391,13 +402,19 @@ def _apply_vehicle_display_fields(
     fleet_map: dict[int, str | None],
     drivers: dict[int, Driver],
 ) -> dict[str, Any]:
-    """与车辆列表一致：所属公司展示上级真实公司名，而非叶子机构编号。"""
+    """安全监控/违章列表：所属公司用车辆挂靠组织名，车队名仍按组织树上溯。"""
+    cid = vehicle.company_id if vehicle is not None else company_id
+    leaf_name = _leaf_org_name(cid, company_map)
+    _, display_fleet = _vehicle_list_company_fleet_names(
+        cid,
+        vehicle.fleet_id if vehicle is not None else None,
+        company_map,
+        parent_map,
+        fleet_map,
+    )
+    out["company_name"] = leaf_name or "—"
+    out["fleet_name"] = display_fleet or ""
     if vehicle is not None:
-        display_company, display_fleet = _vehicle_list_company_fleet_names(
-            vehicle.company_id, vehicle.fleet_id, company_map, parent_map, fleet_map
-        )
-        out["company_name"] = display_company or "—"
-        out["fleet_name"] = display_fleet or ""
         out["vehicle_type"] = vehicle.vehicle_type or ""
         out["resolved_vehicle_id"] = vehicle.id
         out["driver_id"] = vehicle.driver_id
@@ -407,11 +424,6 @@ def _apply_vehicle_display_fields(
         out["driver_name"] = driver_name
         return out
 
-    display_company, display_fleet = _vehicle_list_company_fleet_names(
-        company_id, None, company_map, parent_map, fleet_map
-    )
-    out["company_name"] = display_company or "—"
-    out["fleet_name"] = display_fleet or ""
     out["vehicle_type"] = ""
     out["driver_name"] = ""
     return out
@@ -456,6 +468,7 @@ async def _rows_out(
             snap = (getattr(row, "company_name", None) or "").strip()
             if snap:
                 out["company_name"] = snap
+        out["group_name"] = out.get("company_name") or ""
         items.append(out)
     return items
 
@@ -499,6 +512,7 @@ def _row_out(
         "vehicle_id": row.vehicle_id,
         "plate_no": row.plate_no,
         "company_id": row.company_id,
+        "company_name": (getattr(row, "company_name", None) or "").strip() or None,
         "violation_type_code": row.violation_type_code,
         "violation_type_name": type_name_display,
         "risk_level": risk,
@@ -846,6 +860,7 @@ async def violation_alert_cache(
     之后带上次返回的 max_seq 轮询，有新条目即弹窗。按 X-Org-Id 过滤可见公司。
     停用报警类型的历史/缓存条目一并隐藏。"""
     alerts, max_seq = get_alerts_after(after_seq)
+    alerts = [a for a in alerts if (a.get("status") or "待处理").strip() == "待处理"]
     disabled = set(expand_disabled_alarm_type_names(await load_disabled_alarm_type_names(db)))
     if alerts and disabled:
         alerts = [
@@ -882,6 +897,30 @@ async def violation_pending_watermark(
     )
     max_id = await db.scalar(select(func.max(VehicleViolation.id)).select_from(q.subquery()))
     return {"ok": True, "max_id": int(max_id or 0)}
+
+
+@router.post("/pending-alive")
+async def violation_pending_alive(
+    body: ViolationPendingAliveIn,
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """安全监控列表心跳：返回仍为待处理（或预处理待审核）的 id，便于页面踢掉已误报/已处理。"""
+    ids = sorted({int(x) for x in (body.ids or []) if int(x) > 0})[:3000]
+    if not ids:
+        return {"ok": True, "alive_ids": []}
+    disabled_names = await load_disabled_alarm_type_names(db)
+    q = await _scoped_query(db, x_org_id, disabled_names, x_user_id)
+    q = q.where(
+        VehicleViolation.id.in_(ids),
+        or_(
+            VehicleViolation.status == "待处理",
+            and_(VehicleViolation.status == "待审核", VehicleViolation.pre_audit_kind == "preprocess"),
+        ),
+    )
+    alive = list((await db.execute(select(VehicleViolation.id).select_from(q.subquery()))).scalars().all())
+    return {"ok": True, "alive_ids": [int(x) for x in alive]}
 
 
 @router.post("/manual/ocr")

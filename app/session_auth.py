@@ -15,6 +15,9 @@ _PUBLIC_EXACT = {
     "/api/user/login-by-phone",
     "/api/sms/send-code",
     "/favicon.ico",
+    # 运维页先出密码框；校验接口只收 admin 密码
+    "/obd-status",
+    "/api/obd-status/unlock",
 }
 
 _PUBLIC_PREFIXES = (

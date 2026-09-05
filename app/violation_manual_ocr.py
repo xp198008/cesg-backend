@@ -31,7 +31,10 @@ from app.violation_ai_assessment import (
 
 logger = logging.getLogger(__name__)
 
-_MAX_IMAGE_BYTES = 8 * 1024 * 1024
+# 与页面提示一致：单张不超过 1MB。
+_MAX_IMAGE_BYTES = 1 * 1024 * 1024
+_OCR_MAX_EDGE = 1920
+_OCR_TARGET_BYTES = 1_200_000
 _IMAGE_MIME = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -120,29 +123,73 @@ def _mime_for(filename: str | None, content_type: str | None) -> str:
 
 
 def _to_jpeg_bytes(content: bytes, *, filename: str | None, content_type: str | None) -> tuple[bytes, str]:
-    """统一转 JPEG，提升 Worker VLM/OCR 兼容性（尤其 BMP）。"""
+    """统一转 JPEG 并缩小，避免手机原图把网关/Worker 打到 413。"""
     mime = _mime_for(filename, content_type)
-    if mime in ("image/jpeg", "image/jpg") and not (filename or "").lower().endswith(".bmp"):
-        return content, "image/jpeg"
     try:
         from PIL import Image  # type: ignore
 
         img = Image.open(io.BytesIO(content))
+        img.load()
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
         elif img.mode == "L":
             img = img.convert("RGB")
-        out = io.BytesIO()
-        img.save(out, format="JPEG", quality=92)
-        return out.getvalue(), "image/jpeg"
+        width, height = img.size
+        longest = max(width, height) or 1
+        if longest > _OCR_MAX_EDGE:
+            scale = _OCR_MAX_EDGE / float(longest)
+            resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+            img = img.resize(
+                (max(1, int(width * scale)), max(1, int(height * scale))),
+                resample,
+            )
+        quality = 85
+        out_bytes = b""
+        while quality >= 55:
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=quality, optimize=True)
+            out_bytes = out.getvalue()
+            if len(out_bytes) <= _OCR_TARGET_BYTES:
+                break
+            quality -= 10
+        logger.info(
+            "违章 OCR 压图 %sB -> %sB q=%s %sx%s",
+            len(content),
+            len(out_bytes),
+            quality,
+            img.size[0],
+            img.size[1],
+        )
+        return out_bytes, "image/jpeg"
     except Exception as exc:
         logger.warning("图片转 JPEG 失败，沿用原图: %s", exc)
+        if len(content) > _OCR_TARGET_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail="图片无法压缩识别，请另存为 jpg/png 后再上传",
+            ) from exc
         return content, mime or "image/jpeg"
 
 
 def _image_data_uri(data: bytes, mime: str) -> str:
     mt = (mime or "image/jpeg").split(";")[0].strip() or "image/jpeg"
     return f"data:{mt};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _chat_image_ref(upload: dict[str, Any], *, user_id: str, session_id: str) -> str:
+    file_path = str(upload.get("file_path") or "").strip()
+    if file_path:
+        return file_path
+    name = str(upload.get("filename") or "ocr.jpg").strip() or "ocr.jpg"
+    url = str(upload.get("url") or "").strip().lstrip("/")
+    if url.startswith("uploads/") or url.startswith("files/"):
+        return url
+    return f"uploads/{user_id}/{session_id}/{name}"
+
+
+def _ocr_unprocessable(detail: str) -> HTTPException:
+    """识别失败用 422，避免前端把 CESG 后端当成宕机（http 拦截器把 >=502 当不可达）。"""
+    return HTTPException(status_code=422, detail=detail)
 
 
 def _build_extract_text_prompt() -> str:
@@ -372,7 +419,7 @@ async def run_violation_manual_ocr(
     x_user_id: str | None,
 ) -> dict[str, Any]:
     if not agent_worker_client.configured():
-        raise HTTPException(status_code=503, detail="Agent Worker 未配置（AGENT_WORKER_BASE_URL）")
+        raise _ocr_unprocessable("识别服务未配置或未启用，请手工填写")
 
     ext = _ext_of(filename)
     mime = _mime_for(filename, content_type)
@@ -381,16 +428,32 @@ async def run_violation_manual_ocr(
     if not content:
         raise HTTPException(status_code=400, detail="图片内容为空")
     if len(content) > _MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail="图片不能超过 8MB")
+        raise HTTPException(status_code=400, detail="图片不能超过 1MB")
 
     jpeg_bytes, jpeg_mime = _to_jpeg_bytes(content, filename=filename, content_type=content_type)
     user_id, company = await _ai_context(db, x_user_id=x_user_id)
     session_id = f"violation_manual_ocr_{uuid.uuid4().hex[:16]}"
+    jpeg_name = f"{(filename or 'ocr').rsplit('.', 1)[0] or 'ocr'}.jpg"
+
+    # 优先 /file/upload 再引用路径（Worker 会走视觉 OCR，且不会把 3MB 图打成巨型 JSON）
+    image_url = _image_data_uri(jpeg_bytes, jpeg_mime)
+    try:
+        uploaded = await agent_worker_client.upload_chat_file(
+            user_id=user_id,
+            session_id=session_id,
+            filename=jpeg_name,
+            content=jpeg_bytes,
+            content_type="image/jpeg",
+        )
+        image_url = _chat_image_ref(uploaded, user_id=user_id, session_id=session_id)
+        logger.info("违章 OCR 已上传识别附件 ref=%s size=%s", image_url, len(jpeg_bytes))
+    except Exception as exc:
+        logger.warning("违章 OCR 附件上传失败，改内联压缩图: %s", exc)
 
     # 1) 带图文档解析：只提取全文（可触发 VLMImageOCR）
     content_blocks: list[dict[str, Any]] = [
         {"type": "text", "text": _build_extract_text_prompt()},
-        {"type": "image", "image_url": _image_data_uri(jpeg_bytes, jpeg_mime)},
+        {"type": "image", "image_url": image_url},
     ]
     try:
         ocr_text = await _chat_collect_with_retries(
@@ -403,16 +466,16 @@ async def run_violation_manual_ocr(
         )
     except AiRefusalError as exc:
         logger.warning("违章 OCR 拒答: %s", exc)
-        raise HTTPException(status_code=502, detail="AI 拒答或暂无法识别该图片，请手工填写") from exc
+        raise _ocr_unprocessable("暂无法识别该图片，请换更清晰的单据或手工填写") from exc
     except AgentWorkerError as exc:
         logger.warning("违章 OCR 调用失败: %s", exc)
-        raise HTTPException(status_code=502, detail=f"AI 识别失败：{exc}") from exc
+        raise _ocr_unprocessable("识别服务暂时不可用，请稍后重试或手工填写") from exc
     except Exception as exc:
         logger.exception("违章 OCR 调用异常")
-        raise HTTPException(status_code=502, detail=f"AI 识别异常：{exc}") from exc
+        raise _ocr_unprocessable("识别服务暂时不可用，请稍后重试或手工填写") from exc
 
     if _looks_like_ai_refusal(ocr_text):
-        raise HTTPException(status_code=502, detail="AI 拒答或暂无法识别该图片，请手工填写")
+        raise _ocr_unprocessable("暂无法识别该图片，请换更清晰的单据或手工填写")
 
     clean_text = sanitize_ai_display_text(ocr_text)
     fields = _parse_fields_from_ocr_text(clean_text)
@@ -449,9 +512,8 @@ async def run_violation_manual_ocr(
             logger.warning("二次结构化失败，沿用规则结果: %s", exc)
 
     if not _fields_useful(fields):
-        raise HTTPException(
-            status_code=502,
-            detail="已完成文字识别但未能解析出车牌/时间等字段，请手工填写或换更清晰图片",
+        raise _ocr_unprocessable(
+            "已完成文字识别但未能解析出车牌/时间等字段，请手工填写或换更清晰图片"
         )
 
     local_hit = await _enrich_fields_from_local_vehicle(db, fields)

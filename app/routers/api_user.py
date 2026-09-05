@@ -72,7 +72,7 @@ class UserLoginPayload(BaseModel):
 
 class UserPhoneLoginPayload(BaseModel):
     phone: str = Field(..., min_length=11, max_length=20)
-    code: str = Field(..., min_length=4, max_length=12)
+    code: str = Field(..., min_length=4, max_length=4)
 
 
 class UserSessionCheckPayload(BaseModel):
@@ -784,6 +784,7 @@ async def user_online_duration_stats(
 async def user_operation_logs(
     username: str | None = Query(default=None),
     module: str | None = Query(default=None),
+    menu: str | None = Query(default=None),
     action: str | None = Query(default=None),
     vehicle: str | None = Query(default=None),
     vehicle_only: int | None = Query(default=None),
@@ -814,8 +815,12 @@ async def user_operation_logs(
         count_stmt = count_stmt.where(UserOperationLog.username.like(f"%{uname}%"))
     mod = (module or "").strip()
     if mod:
-        stmt = stmt.where(or_(UserOperationLog.module.like(f"%{mod}%"), UserOperationLog.menu.like(f"%{mod}%")))
-        count_stmt = count_stmt.where(or_(UserOperationLog.module.like(f"%{mod}%"), UserOperationLog.menu.like(f"%{mod}%")))
+        stmt = stmt.where(UserOperationLog.module.like(f"%{mod}%"))
+        count_stmt = count_stmt.where(UserOperationLog.module.like(f"%{mod}%"))
+    menu_name = (menu or "").strip()
+    if menu_name:
+        stmt = stmt.where(UserOperationLog.menu.like(f"%{menu_name}%"))
+        count_stmt = count_stmt.where(UserOperationLog.menu.like(f"%{menu_name}%"))
     act = (action or "").strip()
     if act:
         stmt = stmt.where(UserOperationLog.action.like(f"%{act}%"))
@@ -1022,17 +1027,15 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
 async def user_login_by_phone(
     payload: UserPhoneLoginPayload, request: Request, db: AsyncSession = Depends(get_db)
 ):
-    """短信验证码登录：校验验证码 → 按手机号取系统用户 → 与账号登录同一会话后续。"""
-    from app.sms_mas import verify_login_sms_code
+    """短信验证码登录：按手机号取系统用户 → 校验并消费短信登录记录 → 与账号登录同一会话后续。"""
+    from app.sms_mas import consume_login_sms_code
 
     phone = _norm_login_phone(payload.phone)
     code = (payload.code or "").strip()
     if not re.fullmatch(r"1\d{10}", phone):
         raise HTTPException(status_code=400, detail="请输入正确的手机号")
-    if not code:
-        raise HTTPException(status_code=400, detail="请输入验证码")
-    if not verify_login_sms_code(phone, code):
-        raise HTTPException(status_code=401, detail="验证码错误或已过期")
+    if not re.fullmatch(r"\d{4}", code):
+        raise HTTPException(status_code=400, detail="请输入4位验证码")
 
     rows = (
         await db.execute(
@@ -1048,6 +1051,8 @@ async def user_login_by_phone(
         raise HTTPException(status_code=400, detail="该手机号绑定了多个账号，请使用账号密码登录")
 
     user = rows[0]
+    if not await consume_login_sms_code(db, phone, code, user_id=user.id):
+        raise HTTPException(status_code=401, detail="验证码错误或已过期")
     return await _issue_login_response(user, request, db, login_method="sms")
 
 

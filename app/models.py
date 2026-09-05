@@ -425,6 +425,22 @@ class MapApiConfig(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
 
+class AgentWorkerConfig(Base):
+    """Agent Worker AI 接口配置（后台运维页维护，不进 .env）。"""
+
+    __tablename__ = "agent_worker_config"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    provider = Column(String(50), nullable=False, unique=True, default="agent")
+    enabled = Column(Boolean, nullable=False, default=True, server_default="1")
+    base_url = Column(String(255))
+    api_key = Column(String(255))
+    default_company = Column(String(128), default="三峰城服")
+    timeout_seconds = Column(Integer, nullable=False, default=60, server_default="60")
+    video_timeout_seconds = Column(Integer, nullable=False, default=600, server_default="600")
+    remark = Column(String(255))
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive, default=china_now_naive)
+
+
 class SmsPlatformConfig(Base):
     """云 MAS 短信平台接口配置（后台运维页维护）。"""
 
@@ -451,6 +467,22 @@ class SmsPlatformConfig(Base):
     code_ttl_seconds = Column(Integer, nullable=False, default=300, server_default="300")
     remark = Column(String(255))
     updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive, default=china_now_naive)
+
+
+class SmsLoginCode(Base):
+    """登录页短信验证码记录：云 MAS 返回成功后落库，登录成功后失效。"""
+
+    __tablename__ = "sms_login_code"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    requested_at = Column(DateTime(timezone=True), nullable=False, default=china_now_naive, index=True)
+    phone = Column(String(20), nullable=False, index=True)
+    code = Column(String(8), nullable=False)
+    # 待验证 / 登录成功 / 已失效
+    status = Column(String(32), nullable=False, default="待验证", server_default="待验证", index=True)
+    expire_at = Column(DateTime(timezone=True), nullable=True)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    msg_group = Column(String(64), nullable=True)
+    user_id = Column(Integer, nullable=True, index=True)
 
 
 class PublicMapRule(Base):

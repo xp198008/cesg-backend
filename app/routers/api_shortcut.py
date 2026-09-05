@@ -21,6 +21,7 @@ router = APIRouter(prefix="/api/shortcut", tags=["shortcut"])
 # 42/421-424：设备报修已从主菜单下线
 # 414：违章申诉页已下线；433：报障终审已并入审核 432
 # 109/112：故障类型、违章类型维护已从基础数据侧栏下线
+# 801：车辆风险画像已从安全管理侧栏/角色树/快捷桌面下线
 _DEPRECATED_PERMISSION_IDS = frozenset(
     {
         "7",
@@ -38,17 +39,24 @@ _DEPRECATED_PERMISSION_IDS = frozenset(
         "433",
         "109",
         "112",
+        "801",
     }
 )
 
 _DATA_FILE = Path(__file__).resolve().parent.parent / "data" / "permission_menu.json"
+
+_MONITOR_MODE_IDS = ("312", "313", "314")
+_MONITOR_PARENT_IDS = frozenset({"3", "31"})
+_MONITOR_LEGACY_SHORTCUT_IDS = frozenset({"3", "31"})
 
 # permission_id → Vue 路由（与 jt808-vue3 shortcutRoutes.js 对齐；点击跳转以前端 MAP 为准）
 _SHORTCUT_META: dict[str, dict[str, str]] = {
     "1": {"url": "/main/board", "icon": "./images/svg/icon-zhihuikanban.svg"},
     "2": {"url": "/main/home", "icon": "./images/svg/icon-zhihuikanban.svg"},
     "3": {"url": "/main/realtime", "icon": "./images/svg/icon-jiankong.svg"},
-    "31": {"url": "/main/realtime", "icon": "./images/svg/icon-jiankong.svg"},
+    "312": {"url": "/main/realtime?mode=video", "icon": "./images/svg/icon-jiankong.svg"},
+    "313": {"url": "/main/realtime?mode=map", "icon": "./images/svg/icon-ditu.svg"},
+    "314": {"url": "/main/realtime?mode=poll", "icon": "./images/svg/icon-jiankong.svg"},
     "311": {"url": "/main/realtimealarm", "icon": "./images/svg/icon-jiankong.svg"},
     "321": {"url": "/main/history?mode=video", "icon": "./images/svg/icon-jiankong.svg"},
     "322": {"url": "/main/history?mode=track", "icon": "./images/svg/icon-jiankong.svg"},
@@ -156,6 +164,8 @@ def _role_permission_ids(role: SysRole | None, username: str) -> set[str] | None
         arr = []
     result = {str(x) for x in arr if x is not None and str(x).strip()}
     result.add("1")
+    if result & _MONITOR_PARENT_IDS:
+        result.update(_MONITOR_MODE_IDS)
     return result
 
 
@@ -305,6 +315,36 @@ async def _migrate_legacy_board_shortcuts(
     await db.flush()
 
 
+async def _migrate_realtime_shortcuts(
+    db: AsyncSession,
+    user_id: int,
+    rows: list[SysUserShortcut],
+    allowed: dict[str, dict[str, Any]],
+) -> None:
+    """将旧「实时监控」(3/31) 快捷项展开为视频/地图/轮询三条。"""
+    legacy = [row for row in rows if str(row.permission_id) in _MONITOR_LEGACY_SHORTCUT_IDS]
+    if not legacy:
+        return
+    existing_modes = {str(row.permission_id) for row in rows if str(row.permission_id) in _MONITOR_MODE_IDS}
+    insert_at = min(int(row.sort_order or 0) for row in legacy)
+    to_add = [pid for pid in _MONITOR_MODE_IDS if pid in allowed and pid not in existing_modes]
+    for row in legacy:
+        await db.delete(row)
+    for offset, pid in enumerate(to_add):
+        meta = allowed[pid]
+        db.add(
+            SysUserShortcut(
+                user_id=user_id,
+                permission_id=pid,
+                title=meta["title"],
+                url=meta["url"],
+                icon=meta.get("icon") or "",
+                sort_order=insert_at + offset,
+            )
+        )
+    await db.flush()
+
+
 @router.get("/list")
 async def shortcut_list(user_id: int = Query(..., ge=1), db: AsyncSession = Depends(get_db)):
     user = await _load_user(db, user_id)
@@ -318,6 +358,14 @@ async def shortcut_list(user_id: int = Query(..., ge=1), db: AsyncSession = Depe
         )
     ).scalars().all()
     await _migrate_legacy_board_shortcuts(db, user_id, list(rows), allowed)
+    rows = (
+        await db.execute(
+            select(SysUserShortcut)
+            .where(SysUserShortcut.user_id == user_id)
+            .order_by(SysUserShortcut.sort_order.asc(), SysUserShortcut.id.asc())
+        )
+    ).scalars().all()
+    await _migrate_realtime_shortcuts(db, user_id, list(rows), allowed)
     rows = (
         await db.execute(
             select(SysUserShortcut)
@@ -356,6 +404,12 @@ async def shortcut_save(payload: ShortcutSavePayload, db: AsyncSession = Depends
         pid = str(x).strip()
         if pid in legacy_board_ids:
             pid = "1"
+        if pid in _MONITOR_LEGACY_SHORTCUT_IDS:
+            for mode_id in _MONITOR_MODE_IDS:
+                if mode_id in allowed and mode_id not in seen:
+                    seen.add(mode_id)
+                    selected.append(mode_id)
+            continue
         if not pid or pid in seen or pid not in allowed:
             continue
         seen.add(pid)

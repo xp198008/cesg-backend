@@ -10,8 +10,9 @@ from datetime import date, datetime, timedelta, timezone
 
 from app.timeutil import china_now_naive
 from io import BytesIO
+from urllib.parse import quote
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
@@ -46,6 +47,12 @@ from app.vehicle_alloc_scope import (
     apply_vehicle_id_scope,
     parse_user_id_header,
     resolve_allowed_vehicle_ids,
+)
+from app.vehicle_op_log import (
+    diff_vehicle_snapshot,
+    format_change_content,
+    snapshot_vehicle,
+    write_vehicle_operation_log,
 )
 
 router = APIRouter(prefix="/api/vehicle", tags=["vehicle"])
@@ -383,11 +390,11 @@ class VehicleSavePayload(BaseModel):
     vehicle_type: str | None = None
     vehicle_type_ii: str | None = None
     color: str | None = None
-    vin: str | None = None
-    driving_license_no: str | None = None
-    engine_no: str | None = None
-    product_model_code: str | None = None
-    frame_no: str | None = None
+    vin: str | None = Field(None, max_length=64)
+    driving_license_no: str | None = Field(None, max_length=64)
+    engine_no: str | None = Field(None, max_length=64)
+    product_model_code: str | None = Field(None, max_length=64)
+    frame_no: str | None = Field(None, max_length=64)
     vehicle_type_code: str | None = None
     vehicle_length: float | None = None
     vehicle_width: float | None = None
@@ -448,7 +455,7 @@ class VehicleSavePayload(BaseModel):
     night_speed_percent: float | None = None
     icon_id: int | None = None
     remark: str | None = None
-    device_no: str | None = None
+    device_no: str | None = Field(None, max_length=64)
     device_sn: str | None = None
     terminal_type: str | None = None
     sim_no: str | None = None
@@ -669,7 +676,13 @@ def _apply_vehicle_payload(v: Vehicle, co: OrgCompany, payload: VehicleSavePaylo
 
 
 @router.post("/create")
-async def vehicle_create(payload: VehicleSavePayload, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+async def vehicle_create(
+    payload: VehicleSavePayload,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
     co = await _ensure_company_and_fleet(db, payload.company_id, payload.fleet_id)
     await _ensure_driver_binding(db, payload.driver_id if payload.driver_id and payload.driver_id > 0 else None, payload.company_id)
     await _apply_status_device_occupy(db, payload)
@@ -684,13 +697,29 @@ async def vehicle_create(payload: VehicleSavePayload, background_tasks: Backgrou
     if bare_no and bare_no != _norm(payload.device_no):
         await _remove_reserve_for_device_no(db, bare_no)
     await db.flush()
+    await write_vehicle_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="新增",
+        content=f"新增车辆信息：{_norm(payload.plate_no) or '--'}",
+        plate=_norm(payload.plate_no),
+        plate_color=_norm(payload.plate_color),
+        device_no=_norm(payload.device_no),
+    )
     await db.commit()
     jt808_result = await jt808_vehicle.upsert_now(v.id)
     return {"ok": True, "message": "已创建", "data": {"id": v.id}, "jt808_sync": _jt808_sync_status(jt808_result)}
 
 
 @router.post("/update")
-async def vehicle_update(payload: VehicleSavePayload, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+async def vehicle_update(
+    payload: VehicleSavePayload,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
     vid = int(payload.vehicle_id or 0)
     if vid <= 0:
         raise HTTPException(status_code=400, detail="vehicle_id 必填")
@@ -700,6 +729,7 @@ async def vehicle_update(payload: VehicleSavePayload, background_tasks: Backgrou
     old_dev = await db.scalar(
         select(VehicleDevice.device_no).where(VehicleDevice.vehicle_id == vid, VehicleDevice.is_main.is_(True)).limit(1)
     )
+    old_snap = await snapshot_vehicle(db, v)
     co = await _ensure_company_and_fleet(db, payload.company_id, payload.fleet_id)
     await _ensure_driver_binding(db, payload.driver_id if payload.driver_id and payload.driver_id > 0 else None, payload.company_id)
     await _apply_status_device_occupy(
@@ -717,6 +747,19 @@ async def vehicle_update(payload: VehicleSavePayload, background_tasks: Backgrou
     if bare_no and bare_no != _norm(payload.device_no):
         await _remove_reserve_for_device_no(db, bare_no)
     await db.flush()
+    new_snap = await snapshot_vehicle(db, v)
+    changes = diff_vehicle_snapshot(old_snap, new_snap)
+    if changes:
+        await write_vehicle_operation_log(
+            db,
+            request=request,
+            x_user_id=x_user_id,
+            action="修改",
+            content=format_change_content(_norm(payload.plate_no) or _norm(v.plate_no), changes),
+            plate=_norm(payload.plate_no) or _norm(v.plate_no),
+            plate_color=_norm(payload.plate_color) or _norm(v.plate_color),
+            device_no=_norm(payload.device_no) or _norm(old_dev),
+        )
     await db.commit()
     jt808_result = await jt808_vehicle.upsert_now(vid, old_dev)
     return {"ok": True, "message": "已更新", "data": {"id": vid}, "jt808_sync": _jt808_sync_status(jt808_result)}
@@ -1028,6 +1071,113 @@ _VEHICLE_IMPORT_HEADERS = [
     "通道数",
 ]
 
+_VEHICLE_IMPORT_EXAMPLE_ROW = [
+    "测A12345",
+    "黄牌",
+    "LSVXXXXXXXXXXXXXXX",
+    "ENG001",
+    "PMC001",
+    "FRAME001",
+    "请填写系统中已有公司全称",
+    "",
+    "123456789012",
+    "JT808",
+    "",
+    "燃油车",
+    "",
+    "",
+    "正常",
+    "",
+    "",
+    "",
+    "4",
+]
+
+_VEHICLE_IMPORT_TIPS = (
+    "1. 请使用本模板填写后上传 .xlsx；带*为导入必填，与页面「添加车辆」一致。",
+    "2. 必填：车牌号、车辆识别代码VIN、车辆发动机号、车辆产品型号代码、所属公司、设备号。",
+    "3. 所属公司必须与「组织架构」中公司名称完全一致；该公司需已配置 JT808 分组才能同步到 808。",
+    "4. 车队可空；填写时须为该公司下已存在的车队名称。",
+    "5. 车辆类别可填：燃油车/新能源车（或 fuel/new）。",
+    "6. 车牌已存在则更新该车；设备号不可被其它车辆占用。",
+    "7. 导入成功后会自动同步到 808 平台（与单车保存相同逻辑）。",
+    "8. 「导出至Excel」生成的文件与本模板列一致，改完后可直接再导入。",
+    "9. 若文件含示例行，导入前请删除或改成真实车辆。",
+)
+
+
+def _export_date_text(v) -> str:
+    d = _to_date(v)
+    return d.isoformat() if d else ""
+
+
+def _export_vehicle_category_label(raw) -> str:
+    mapped = _norm_vehicle_category(raw)
+    if mapped == "fuel":
+        return "燃油车"
+    if mapped == "new":
+        return "新能源车"
+    return _norm(raw)
+
+
+def _vehicle_carinfos_row(
+    v: Vehicle,
+    company_name: str,
+    fleet_name: str,
+    device: VehicleDevice | None,
+) -> list:
+    status = (_norm(v.status) or "正常").split(",")[0]
+    raw_dev = _norm(device.device_no) if device else ""
+    return [
+        _norm(v.plate_no),
+        _norm(v.plate_color) or "黄牌",
+        _norm(v.vin),
+        _norm(v.engine_no),
+        _norm(v.product_model_code),
+        _norm(v.frame_no),
+        _norm(company_name),
+        _norm(fleet_name),
+        _bare_device_no(raw_dev) if raw_dev else "",
+        _norm(device.terminal_type) if device else "",
+        _norm(device.sim_no) if device else "",
+        _export_vehicle_category_label(v.vehicle_category),
+        _norm(v.brand),
+        _norm(v.model),
+        status,
+        _export_date_text(v.service_start_date),
+        _export_date_text(v.service_end_date),
+        _export_date_text(v.install_date),
+        int(v.channel_count) if v.channel_count else "",
+    ]
+
+
+def _vehicle_carinfos_workbook(data_rows: list[list], *, include_example: bool = False) -> Workbook:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "车辆信息导入"
+    ws.append(list(_VEHICLE_IMPORT_HEADERS))
+    if include_example:
+        ws.append(list(_VEHICLE_IMPORT_EXAMPLE_ROW))
+    for row in data_rows:
+        ws.append(row)
+    tip = wb.create_sheet("填写说明")
+    tip.append(["说明"])
+    for line in _VEHICLE_IMPORT_TIPS:
+        tip.append([line])
+    return wb
+
+
+def _stream_xlsx(wb: Workbook, filename: str) -> StreamingResponse:
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    cd = f"attachment; filename*=UTF-8''{quote(filename)}"
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": cd},
+    )
+
 
 def _vehicle_import_cell(row: tuple, idx: int | None):
     if idx is None or idx < 0 or idx >= len(row):
@@ -1061,60 +1211,17 @@ def _header_index(headers: list[str], *names: str, required: bool = True) -> int
 
 @router.get("/import-template-carinfos")
 async def download_vehicle_import_template():
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "车辆信息导入"
-    ws.append(list(_VEHICLE_IMPORT_HEADERS))
-    # 示例行（导入前请删除或改成真实数据）
-    ws.append(
-        [
-            "测A12345",
-            "黄牌",
-            "LSVXXXXXXXXXXXXXXX",
-            "ENG001",
-            "PMC001",
-            "FRAME001",
-            "请填写系统中已有公司全称",
-            "",
-            "123456789012",
-            "JT808",
-            "",
-            "燃油车",
-            "",
-            "",
-            "正常",
-            "",
-            "",
-            "",
-            "4",
-        ]
-    )
-    tip = wb.create_sheet("填写说明")
-    tip.append(["说明"])
-    for line in (
-        "1. 请使用本模板填写后上传 .xlsx；带*为导入必填，与页面「添加车辆」一致。",
-        "2. 必填：车牌号、车辆识别代码VIN、车辆发动机号、车辆产品型号代码、所属公司、设备号。",
-        "3. 所属公司必须与「组织架构」中公司名称完全一致；该公司需已配置 JT808 分组才能同步到 808。",
-        "4. 车队可空；填写时须为该公司下已存在的车队名称。",
-        "5. 车辆类别可填：燃油车/新能源车（或 fuel/new）。",
-        "6. 车牌已存在则更新该车；设备号不可被其它车辆占用。",
-        "7. 导入成功后会自动同步到 808 平台（与单车保存相同逻辑）。",
-        "8. 填写完请删除本说明页中的示例数据行，或整行改成真实车辆后再导入。",
-    ):
-        tip.append([line])
-    bio = BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    cd = "attachment; filename*=UTF-8''%E8%BD%A6%E8%BE%86%E4%BF%A1%E6%81%AF%E5%AF%BC%E5%85%A5%E6%A8%A1%E6%9D%BF.xlsx"
-    return StreamingResponse(
-        bio,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": cd},
-    )
+    wb = _vehicle_carinfos_workbook([], include_example=True)
+    return _stream_xlsx(wb, "车辆信息导入模板.xlsx")
 
 
 @router.post("/import-carinfos")
-async def import_vehicle_from_carinfos(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+async def import_vehicle_from_carinfos(
+    request: Request,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
     if not file.filename or not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="仅支持 .xlsx 文件。")
     payload = await file.read()
@@ -1313,6 +1420,14 @@ async def import_vehicle_from_carinfos(file: UploadFile = File(...), db: AsyncSe
 
     wb.close()
     await db.flush()
+    if imported or updated:
+        await write_vehicle_operation_log(
+            db,
+            request=request,
+            x_user_id=x_user_id,
+            action="导入",
+            content=f"批量导入车辆信息：新增{imported}台，更新{updated}台，跳过{len(skipped_rows)}行",
+        )
     await db.commit()
 
     jt808_ok = 0
@@ -1401,20 +1516,18 @@ def _parse_company_filter_ids(company_id: int | None, company_ids: str | None) -
     return selected
 
 
-@router.get("/list")
-async def vehicle_list(
-    plate_no: str | None = Query(None),
-    device_no: str | None = Query(None),
-    status: str | None = Query(None),
-    company_id: int | None = Query(None),
-    company_ids: str | None = Query(None),
-    scope_org_tree: bool = Query(False),
-    online_source: str = Query("db"),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=1000),
-    x_org_id: str | None = Header(None, alias="X-Org-Id"),
-    x_user_id: str | None = Header(None, alias="X-User-Id"),
-    db: AsyncSession = Depends(get_db),
+async def _build_vehicle_list_query(
+    db: AsyncSession,
+    *,
+    plate_no: str | None,
+    device_no: str | None,
+    status: str | None,
+    company_id: int | None,
+    company_ids: str | None,
+    scope_org_tree: bool,
+    x_org_id: str | None,
+    x_user_id: str | None,
+    ids: str | None = None,
 ):
     q = select(Vehicle)
     allowed_vehicle_ids = await resolve_allowed_vehicle_ids(db, parse_user_id_header(x_user_id))
@@ -1426,6 +1539,9 @@ async def vehicle_list(
             raise HTTPException(status_code=400, detail="X-Org-Id 对应公司不存在")
         subtree = await collect_org_company_subtree_ids(db, root)
         q = q.where(Vehicle.company_id.in_(subtree))
+    selected_ids = _parse_company_filter_ids(None, ids)
+    if selected_ids:
+        return q.where(Vehicle.id.in_(selected_ids))
     if plate_no:
         q = q.where(Vehicle.plate_no.ilike(f"%{plate_no.strip()}%"))
     if device_no and device_no.strip():
@@ -1449,12 +1565,43 @@ async def vehicle_list(
             company_subtree = await expand_company_filter_ids(db, local_selected)
             if company_subtree:
                 q = q.where(Vehicle.company_id.in_(company_subtree))
+    return q
+
+
+@router.get("/list")
+async def vehicle_list(
+    plate_no: str | None = Query(None),
+    device_no: str | None = Query(None),
+    status: str | None = Query(None),
+    company_id: int | None = Query(None),
+    company_ids: str | None = Query(None),
+    scope_org_tree: bool = Query(False),
+    online_source: str = Query("db"),
+    fields: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=1000),
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    q = await _build_vehicle_list_query(
+        db,
+        plate_no=plate_no,
+        device_no=device_no,
+        status=status,
+        company_id=company_id,
+        company_ids=company_ids,
+        scope_org_tree=scope_org_tree,
+        x_org_id=x_org_id,
+        x_user_id=x_user_id,
+    )
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
     # 最新创建的车辆优先，便于列表查看新数据
     q = q.order_by(Vehicle.created_at.desc(), Vehicle.id.desc())
     q = q.offset((page - 1) * page_size).limit(page_size)
     rows = (await db.execute(q)).scalars().all()
 
+    compact = str(fields or "").strip().lower() in ("picker", "select", "compact")
     company_map: dict[int, str | None] = {}
     company_org_map: dict[int, str | None] = {}
     parent_map: dict[int, int | None] = {}
@@ -1464,6 +1611,26 @@ async def vehicle_list(
         company_map[cid] = cname
         company_org_map[cid] = ocode
         parent_map[cid] = pid
+    if compact:
+        fleet_map = {}
+        for fid, fname in (await db.execute(select(Fleet.id, Fleet.name))).all():
+            fleet_map[fid] = fname
+        items = []
+        for r in rows:
+            display_company_name, display_fleet_name = _vehicle_list_company_fleet_names(
+                r.company_id, r.fleet_id, company_map, parent_map, fleet_map
+            )
+            items.append(
+                {
+                    "id": r.id,
+                    "plate_no": r.plate_no,
+                    "company_id": r.company_id,
+                    "company_name": display_company_name,
+                    "fleet_id": r.fleet_id,
+                    "fleet_name": display_fleet_name,
+                }
+            )
+        return {"total": total, "items": items, "page": page, "page_size": page_size}
 
     fleet_map = {}
     for fid, fname in (await db.execute(select(Fleet.id, Fleet.name))).all():
@@ -1552,12 +1719,81 @@ async def vehicle_list(
     return {"total": total, "items": items, "page": page, "page_size": page_size}
 
 
+@router.get("/export-carinfos")
+async def export_vehicle_carinfos(
+    plate_no: str | None = Query(None),
+    device_no: str | None = Query(None),
+    status: str | None = Query(None),
+    company_id: int | None = Query(None),
+    company_ids: str | None = Query(None),
+    scope_org_tree: bool = Query(False),
+    ids: str | None = Query(None),
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """导出与导入模板相同列的车辆 xlsx，可改完再导入。勾选 ids 优先，否则按当前筛选。"""
+    q = await _build_vehicle_list_query(
+        db,
+        plate_no=plate_no,
+        device_no=device_no,
+        status=status,
+        company_id=company_id,
+        company_ids=company_ids,
+        scope_org_tree=scope_org_tree,
+        x_org_id=x_org_id,
+        x_user_id=x_user_id,
+        ids=ids,
+    )
+    q = q.order_by(Vehicle.created_at.desc(), Vehicle.id.desc())
+    rows = (await db.execute(q)).scalars().all()
+
+    company_map: dict[int, str] = {}
+    for cid, cname in (await db.execute(select(OrgCompany.id, OrgCompany.name))).all():
+        company_map[int(cid)] = _norm(cname)
+    fleet_map: dict[int, str] = {}
+    for fid, fname in (await db.execute(select(Fleet.id, Fleet.name))).all():
+        fleet_map[int(fid)] = _norm(fname)
+
+    vehicle_ids = [r.id for r in rows]
+    main_dev_map: dict[int, VehicleDevice] = {}
+    if vehicle_ids:
+        dr = await db.execute(
+            select(VehicleDevice)
+            .where(VehicleDevice.vehicle_id.in_(vehicle_ids))
+            .order_by(VehicleDevice.is_main.desc(), VehicleDevice.id.asc())
+        )
+        for d in dr.scalars().all():
+            if d.vehicle_id not in main_dev_map:
+                main_dev_map[d.vehicle_id] = d
+
+    data_rows = [
+        _vehicle_carinfos_row(
+            r,
+            company_map.get(int(r.company_id)) if r.company_id else "",
+            fleet_map.get(int(r.fleet_id)) if r.fleet_id else "",
+            main_dev_map.get(r.id),
+        )
+        for r in rows
+    ]
+    wb = _vehicle_carinfos_workbook(data_rows)
+    stamp = china_now_naive().strftime("%Y%m%d_%H%M%S")
+    return _stream_xlsx(wb, f"车辆信息_{stamp}.xlsx")
+
+
 @router.delete("/{vehicle_id}")
-async def vehicle_delete(vehicle_id: int, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+async def vehicle_delete(
+    vehicle_id: int,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
     row = (await db.execute(select(Vehicle).where(Vehicle.id == vehicle_id))).scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=404, detail="车辆不存在")
     plate_no = row.plate_no
+    plate_color = row.plate_color
     main_dev = await db.scalar(
         select(VehicleDevice.device_no)
         .where(VehicleDevice.vehicle_id == vehicle_id, VehicleDevice.is_main.is_(True))
@@ -1567,6 +1803,16 @@ async def vehicle_delete(vehicle_id: int, background_tasks: BackgroundTasks, db:
         main_dev = await db.scalar(
             select(VehicleDevice.device_no).where(VehicleDevice.vehicle_id == vehicle_id).limit(1)
         )
+    await write_vehicle_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="删除",
+        content=f"删除车辆信息：{plate_no or '--'}",
+        plate=plate_no,
+        plate_color=plate_color,
+        device_no=_norm(main_dev),
+    )
     await db.execute(
         delete(VehicleAllocRuleVehicle).where(VehicleAllocRuleVehicle.vehicle_id == vehicle_id)
     )

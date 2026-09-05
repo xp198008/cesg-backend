@@ -60,16 +60,25 @@ def _gen_biz_no() -> str:
 
 def _parse_discovery_time(raw: str | datetime | None) -> datetime:
     if isinstance(raw, datetime):
-        return raw
-    s = (raw or "").strip()
-    if not s:
-        return china_now_naive()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-    raise HTTPException(status_code=400, detail="发现时间格式无效，应为 yyyy-MM-dd HH:mm:ss")
+        parsed = raw.replace(tzinfo=None) if raw.tzinfo else raw
+    else:
+        s = (raw or "").strip().replace("T", " ")
+        if not s:
+            return china_now_naive()
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(s, fmt)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            raise HTTPException(status_code=400, detail="发现时间格式无效，应为 yyyy-MM-dd HH:mm:ss")
+    now = china_now_naive()
+    # 只选了日期、时分秒被写成 00:00:00 时，当天用当前时间，避免审核页全是零点
+    if parsed.hour == 0 and parsed.minute == 0 and parsed.second == 0 and parsed.date() == now.date():
+        return now
+    return parsed
 
 
 async def _resolve_terminal_bind_no(db: AsyncSession, vehicle_id: int | None, plate: str) -> str | None:

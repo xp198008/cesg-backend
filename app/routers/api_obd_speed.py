@@ -1,10 +1,17 @@
 """OBD 时速违章监测管理接口 + 独立状态页。"""
 from __future__ import annotations
 
+import secrets
+
+import bcrypt
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from app.database import AsyncSessionLocal
+from app.models import SysUser
+from app.session_auth import attach_session_cookie
 
 from app.jt808_openapi_client import jt808_openapi_client
 from app.jt808_obd_fuel_sync import (
@@ -265,16 +272,20 @@ _STATUS_PAGE = """<!DOCTYPE html>
   }
   .modal h3 { margin-bottom: 14px; font-size: 16px; }
   .modal .form-grid { margin-bottom: 14px; }
+  #opsGate { z-index: 80; }
+  #opsGate .modal { width: min(420px, 100%); }
+  #opsGateErr { color: #fca5a5; min-height: 18px; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>后台运维</h1>
-  <div class="sub">OBD 监测 · AI 自动评估 · 报警类型 · 地图接口 · 短信平台</div>
+  <div class="sub">OBD 监测 · AI 自动评估 · AI 接口 · 报警类型 · 地图接口 · 短信平台</div>
 
   <div class="tabs">
     <button type="button" class="active" data-tab="status">监测状态</button>
     <button type="button" data-tab="ai">AI 评估</button>
+    <button type="button" data-tab="aiapi">AI 接口</button>
     <button type="button" data-tab="alarms">报警类型</button>
     <button type="button" data-tab="map">地图接口管理</button>
     <button type="button" data-tab="sms">短信平台接口</button>
@@ -465,6 +476,48 @@ _STATUS_PAGE = """<!DOCTYPE html>
       </div>
     </div>
   </div>
+
+  <div id="panel-aiapi" class="panel">
+    <div class="card">
+      <h2><span class="dot" id="dotAiApi"></span>AI 接口管理（Agent Worker）</h2>
+      <p class="muted" style="margin-bottom:12px">
+        维护对话、知识库、违章判定所用的 Agent Worker 地址与 API Key。保存在数据表 <code>agent_worker_config</code>，不写 .env。
+        公司名会作为 <code>x-company</code> 请求头（自动 URL 编码）。视频违章判定建议超时 600 秒。
+      </p>
+      <div class="form-grid" id="aiApiForm">
+        <label>启用</label>
+        <select id="awEnabled"><option value="1">启用</option><option value="0">停用</option></select>
+        <label>接口根地址</label><input id="awBaseUrl" placeholder="http://主机:端口">
+        <label>API Key</label><input id="awApiKey" type="password" placeholder="Bearer Token">
+        <label>默认公司 x-company</label><input id="awCompany" placeholder="三峰城服">
+        <label>普通超时(秒)</label><input id="awTimeout" type="number" min="5" max="600" value="60">
+        <label>视频超时(秒)</label><input id="awVideoTimeout" type="number" min="30" max="3600" value="600">
+        <label>备注</label><textarea id="awRemark" placeholder="可选"></textarea>
+        <label>就绪状态</label><div id="awReadyText" class="muted">—</div>
+      </div>
+      <div class="btns" style="margin-top:14px;margin-bottom:0">
+        <button id="btnAiApiSave">保存</button>
+        <button id="btnAiApiReload" class="ghost">重新加载</button>
+        <button id="btnAiApiTest" class="ghost">测试连通</button>
+        <span class="muted" id="aiApiMsg"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-mask show" id="opsGate">
+  <div class="modal">
+    <h3>后台运维登录</h3>
+    <p class="muted" style="margin-bottom:14px">请输入 admin 密码。已有会话则直接沿用，不会把前台 admin 踢下线。</p>
+    <div class="form-grid">
+      <label>用户名</label><input value="admin" readonly>
+      <label>密码</label><input id="opsPwd" type="password" placeholder="请输入 admin 密码" autocomplete="current-password">
+    </div>
+    <div class="btns" style="margin-bottom:0">
+      <button id="btnOpsUnlock" type="button">进入</button>
+      <span class="muted" id="opsGateErr"></span>
+    </div>
+  </div>
 </div>
 
 <div class="modal-mask" id="alModal">
@@ -491,6 +544,29 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const row = (k, v, cls) => `<tr><td>${esc(k)}</td><td class="${cls||""}">${v}</td></tr>`;
 
+let opsToken = sessionStorage.getItem("obd_ops_token") || "";
+let opsReady = false;
+
+function showOpsGate(msg) {
+  opsReady = false;
+  $("opsGate").classList.add("show");
+  if (msg) $("opsGateErr").textContent = msg;
+  setTimeout(() => $("opsPwd").focus(), 50);
+}
+
+function hideOpsGate() {
+  $("opsGate").classList.remove("show");
+  $("opsGateErr").textContent = "";
+  $("opsPwd").value = "";
+}
+
+function authFetch(url, opts) {
+  opts = opts || {};
+  const headers = Object.assign({}, opts.headers || {});
+  if (opsToken) headers["X-Session-Token"] = opsToken;
+  return fetch(url, Object.assign({}, opts, { credentials: "include", headers }));
+}
+
 let schedRunning = false;
 let alPage = 1;
 const alPageSize = 20;
@@ -506,6 +582,7 @@ document.querySelectorAll(".tabs button").forEach((btn) => {
     if (btn.dataset.tab === "alarms") loadAlarms();
     if (btn.dataset.tab === "map") loadMapConfig();
     if (btn.dataset.tab === "sms") loadSmsConfig();
+    if (btn.dataset.tab === "aiapi") loadAiApiConfig();
     if (btn.dataset.tab === "status") loadStatus();
     if (btn.dataset.tab === "ai") loadAiStatus();
   };
@@ -659,7 +736,8 @@ function renderPing(p) {
 
 async function loadStatus() {
   try {
-    const res = await fetch("/api/obd-speed-check/status");
+    const res = await authFetch("/api/obd-speed-check/status");
+    if (res.status === 401) { showOpsGate("请输入 admin 密码"); return; }
     renderStatus(await res.json());
     $("refreshed").textContent = "状态刷新于 " + new Date().toLocaleString() + "（每 15 秒自动刷新）";
   } catch (e) {
@@ -672,7 +750,7 @@ $("btnToggle").onclick = async () => {
   btn.disabled = true;
   btn.textContent = schedRunning ? "停止中…" : "启动中…";
   try {
-    const res = await fetch(schedRunning ? "/api/obd-speed-check/stop" : "/api/obd-speed-check/start", { method: "POST" });
+    const res = await authFetch(schedRunning ? "/api/obd-speed-check/stop" : "/api/obd-speed-check/start", { method: "POST" });
     const data = await res.json();
     schedRunning = !!(data.scheduler && data.scheduler.running);
   } catch (e) {
@@ -686,7 +764,7 @@ $("btnPing").onclick = async () => {
   const btn = $("btnPing");
   btn.disabled = true; btn.textContent = "连接中…";
   try {
-    const res = await fetch("/api/obd-speed-check/ping");
+    const res = await authFetch("/api/obd-speed-check/ping");
     renderPing((await res.json()).redis || {});
   } catch (e) {
     renderPing({ connected: false, error: String(e), target: "-" });
@@ -698,7 +776,7 @@ $("btnRun").onclick = async () => {
   const btn = $("btnRun");
   btn.disabled = true; btn.textContent = "执行中…";
   try {
-    const res = await fetch("/api/obd-speed-check/run-once", { method: "POST" });
+    const res = await authFetch("/api/obd-speed-check/run-once", { method: "POST" });
     const data = await res.json();
     renderRun(data.result, data.result && data.result.error);
   } catch (e) {
@@ -764,8 +842,12 @@ $("btnParkAlarmReset").onclick = async () => {
 };
 
 async function apiJson(url, opts) {
-  const res = await fetch(url, opts);
+  const res = await authFetch(url, opts);
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401) {
+    showOpsGate(typeof data.detail === "string" ? data.detail : "请输入 admin 密码");
+    throw new Error(typeof data.detail === "string" ? data.detail : "未登录");
+  }
   if (!res.ok) {
     const detail = data.detail;
     const msg = typeof detail === "string" ? detail : (detail && JSON.stringify(detail)) || res.statusText;
@@ -1022,6 +1104,73 @@ $("btnSmsSave").onclick = async () => {
     alert("保存失败：" + e.message);
   }
 };
+function fillAiApiForm(d) {
+  d = d || {};
+  $("awEnabled").value = d.enabled ? "1" : "0";
+  $("awBaseUrl").value = d.base_url || "";
+  $("awApiKey").value = d.api_key || "";
+  $("awCompany").value = d.default_company || "三峰城服";
+  $("awTimeout").value = d.timeout_seconds != null ? d.timeout_seconds : 60;
+  $("awVideoTimeout").value = d.video_timeout_seconds != null ? d.video_timeout_seconds : 600;
+  $("awRemark").value = d.remark || "";
+  const ready = !!d.ready;
+  $("dotAiApi").className = "dot " + (ready ? "ok" : "bad");
+  $("awReadyText").innerHTML = ready
+    ? '<span class="okc">就绪，可调用对话 / 知识库 / 违章判定</span>'
+    : ('<span class="err">未就绪：' + esc(d.ready_reason || "请完善并启用配置") + "</span>");
+}
+
+async function loadAiApiConfig() {
+  $("aiApiMsg").textContent = "加载中…";
+  try {
+    const data = await apiJson("/api/ai/worker-config");
+    fillAiApiForm(data.data || {});
+    $("aiApiMsg").textContent = data.data
+      ? ("已加载" + (data.data.updated_at ? " · 更新于 " + String(data.data.updated_at).replace("T", " ").slice(0, 19) : ""))
+      : "尚无配置，填写后保存";
+  } catch (e) {
+    $("aiApiMsg").textContent = "加载失败：" + e.message;
+  }
+}
+
+$("btnAiApiReload").onclick = () => loadAiApiConfig();
+$("btnAiApiSave").onclick = async () => {
+  const body = {
+    provider: "agent",
+    enabled: $("awEnabled").value === "1",
+    base_url: $("awBaseUrl").value.trim() || null,
+    api_key: $("awApiKey").value.trim() || null,
+    default_company: $("awCompany").value.trim() || "三峰城服",
+    timeout_seconds: $("awTimeout").value === "" ? 60 : Number($("awTimeout").value),
+    video_timeout_seconds: $("awVideoTimeout").value === "" ? 600 : Number($("awVideoTimeout").value),
+    remark: $("awRemark").value.trim() || null,
+  };
+  try {
+    const data = await apiJson("/api/ai/worker-config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    fillAiApiForm(data.data || {});
+    $("aiApiMsg").textContent = "保存成功 " + new Date().toLocaleString()
+      + (data.ready ? " · 已就绪" : (" · 未就绪：" + (data.ready_reason || "")));
+  } catch (e) {
+    $("aiApiMsg").textContent = "保存失败：" + e.message;
+    alert("保存失败：" + e.message);
+  }
+};
+$("btnAiApiTest").onclick = async () => {
+  $("aiApiMsg").textContent = "探测中…";
+  try {
+    const data = await apiJson("/api/ai/worker-config/test", { method: "POST" });
+    $("aiApiMsg").textContent = data.ok ? "连通正常" : ("探测失败：" + (data.message || ""));
+    if (!data.ok) alert("探测失败：" + (data.message || ""));
+  } catch (e) {
+    $("aiApiMsg").textContent = "探测失败：" + e.message;
+    alert("探测失败：" + e.message);
+  }
+};
+
 $("btnSmsTest").onclick = async () => {
   const phone = ($("sTestPhone").value || "").trim();
   if (!/^1\\d{10}$/.test(phone)) {
@@ -1122,7 +1271,8 @@ function renderAiStatus(s) {
 
 async function loadAiStatus() {
   try {
-    const res = await fetch("/api/violation-ai-assess/status");
+    const res = await authFetch("/api/violation-ai-assess/status");
+    if (res.status === 401) { showOpsGate("请输入 admin 密码"); return; }
     const data = await res.json();
     renderAiStatus(data.scheduler || {});
     $("aiRefreshed").textContent = "AI 状态刷新于 " + new Date().toLocaleString() + "（停留本页时每 15 秒刷新）";
@@ -1136,7 +1286,7 @@ $("btnAiToggle").onclick = async () => {
   btn.disabled = true;
   btn.textContent = aiSchedRunning ? "停止中…" : "启动中…";
   try {
-    await fetch(aiSchedRunning ? "/api/violation-ai-assess/stop" : "/api/violation-ai-assess/start", { method: "POST" });
+    await authFetch(aiSchedRunning ? "/api/violation-ai-assess/stop" : "/api/violation-ai-assess/start", { method: "POST" });
   } catch (e) {
     alert("操作失败：" + e);
   }
@@ -1147,7 +1297,7 @@ $("btnAiRun").onclick = async () => {
   const btn = $("btnAiRun");
   btn.disabled = true; btn.textContent = "评估中…";
   try {
-    const res = await fetch("/api/violation-ai-assess/run-once", { method: "POST" });
+    const res = await authFetch("/api/violation-ai-assess/run-once", { method: "POST" });
     const data = await res.json();
     if (!res.ok) alert((data && data.detail) || "执行失败");
     renderAiStatus(data.scheduler || {});
@@ -1160,24 +1310,138 @@ $("btnAiRun").onclick = async () => {
 
 $("btnAiRefresh").onclick = () => loadAiStatus();
 
-loadStatus();
-statusTimer = setInterval(() => {
-  if ($("panel-status").classList.contains("active")) loadStatus();
-  if ($("panel-ai").classList.contains("active")) loadAiStatus();
-}, 15000);
-
-const hash = (location.hash || "").replace("#", "");
-if (hash === "alarms" || hash === "map" || hash === "ai" || hash === "sms") {
-  const btn = document.querySelector('.tabs button[data-tab="' + hash + '"]');
-  if (btn) btn.click();
+function startOpsPage() {
+  if (opsReady) return;
+  opsReady = true;
+  hideOpsGate();
+  const hash = (location.hash || "").replace("#", "");
+  if (hash === "alarms" || hash === "map" || hash === "ai" || hash === "aiapi" || hash === "sms") {
+    const btn = document.querySelector('.tabs button[data-tab="' + hash + '"]');
+    if (btn) btn.click();
+    else loadStatus();
+  } else {
+    loadStatus();
+  }
+  if (!statusTimer) {
+    statusTimer = setInterval(() => {
+      if (!opsReady) return;
+      if ($("panel-status").classList.contains("active")) loadStatus();
+      if ($("panel-ai").classList.contains("active")) loadAiStatus();
+    }, 15000);
+  }
 }
+
+async function hasOpsSession() {
+  try {
+    const res = await authFetch("/api/obd-speed-check/ping");
+    return res.ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function unlockOps() {
+  const pwd = ($("opsPwd").value || "").trim();
+  $("opsGateErr").textContent = "";
+  if (!pwd) {
+    $("opsGateErr").textContent = "请输入 admin 密码";
+    $("opsPwd").focus();
+    return;
+  }
+  const btn = $("btnOpsUnlock");
+  btn.disabled = true;
+  btn.textContent = "校验中…";
+  try {
+    const res = await fetch("/api/obd-status/unlock", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: pwd }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      const detail = data.detail;
+      throw new Error(typeof detail === "string" ? detail : "密码错误");
+    }
+    opsToken = data.session_token || "";
+    if (opsToken) sessionStorage.setItem("obd_ops_token", opsToken);
+    startOpsPage();
+  } catch (e) {
+    $("opsGateErr").textContent = e.message || "密码错误";
+    $("opsPwd").focus();
+    $("opsPwd").select();
+  }
+  btn.disabled = false;
+  btn.textContent = "进入";
+}
+
+$("btnOpsUnlock").onclick = unlockOps;
+$("opsPwd").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") {
+    ev.preventDefault();
+    unlockOps();
+  }
+});
+
+(async () => {
+  if (await hasOpsSession()) startOpsPage();
+  else showOpsGate();
+})();
 </script>
 </body>
 </html>"""
 
 
 
+class ObdStatusUnlockBody(BaseModel):
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+def _admin_password_ok(user: SysUser, password: str) -> bool:
+    pwd = (password or "").strip()
+    if not pwd:
+        return False
+    saved_hash = user.password_hash or ""
+    try:
+        if saved_hash and bcrypt.checkpw(pwd.encode("utf-8"), saved_hash.encode("utf-8")):
+            return True
+    except Exception:
+        pass
+    if saved_hash and not saved_hash.startswith("$2") and pwd == saved_hash:
+        return True
+    return bool((getattr(user, "password_plain", None) or "").strip() == pwd)
+
+
+@router.post("/api/obd-status/unlock")
+async def obd_status_unlock(body: ObdStatusUnlockBody):
+    """运维页门禁：校验 admin 密码。已有会话则复用，没有则签发，不踢前台。"""
+    async with AsyncSessionLocal() as db:
+        user = await db.scalar(select(SysUser).where(SysUser.username == "admin").limit(1))
+        if user is None:
+            raise HTTPException(status_code=401, detail="未找到 admin 账号")
+        if not bool(user.is_active):
+            raise HTTPException(status_code=403, detail="admin 已禁用")
+        if not _admin_password_ok(user, body.password):
+            raise HTTPException(status_code=401, detail="密码错误")
+        token = (getattr(user, "login_session_token", None) or "").strip()
+        reused = bool(token)
+        if not token:
+            token = secrets.token_urlsafe(32)
+            user.login_session_token = token
+            await db.commit()
+    resp = JSONResponse(
+        {
+            "ok": True,
+            "reused": reused,
+            "session_token": token,
+            "username": "admin",
+        }
+    )
+    attach_session_cookie(resp, token)
+    return resp
+
+
 @router.get("/obd-status", response_class=HTMLResponse, include_in_schema=False)
 async def obd_status_page():
-    """后台运维页：OBD / AI / 报警类型 / 地图 / 短信。访问 /obd-status（#ai / #alarms / #map / #sms）。"""
+    """后台运维页：OBD / AI / AI 接口 / 报警类型 / 地图 / 短信。访问 /obd-status（#ai / #aiapi / #alarms / #map / #sms）。"""
     return HTMLResponse(_STATUS_PAGE)

@@ -1,7 +1,7 @@
 """主动安全报警 AI 评估。
 
 一律走 Agent Worker ``POST /api/video/violation``（SSE 违章判定）：
-有视频传视频，没有视频则把抓拍图作为 file 继续调同一接口。
+有视频传 ``file``，没有视频则把抓拍图作为 ``images`` 一次提交。
 """
 from __future__ import annotations
 
@@ -19,7 +19,8 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent_worker_client import AgentWorkerError, agent_worker_client
+from app.agent_worker_client import AgentWorkerError, agent_worker_client, video_complete_failed
+from app.agent_worker_config import cached_default_company
 from app.ai_datasets import match_ai_company
 from app.media_url import extract_adas_relative_path, jt808_media_origin
 from app.config import settings
@@ -41,7 +42,7 @@ class AiRefusalError(RuntimeError):
     """Agent Worker 返回「超出服务范围」类拒答，评估未落库，可供定时器稍后重试。"""
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
-_MAX_IMAGE_BYTES = 8 * 1024 * 1024
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
 _MAX_VIDEO_BYTES = 80 * 1024 * 1024
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 # 罚单建议三选一（无违章对应「误报」；有违章在「罚款/警告」中择一）
@@ -739,7 +740,7 @@ async def _resolve_company_for_violation(db: AsyncSession, row: VehicleViolation
             return matched
         company_id = org.parent_id
 
-    return (settings.agent_worker_default_company or "三峰城服").strip()
+    return cached_default_company()
 
 
 async def _download_image_blocks(image_urls: list[str]) -> list[dict[str, Any]]:
@@ -780,6 +781,8 @@ def _evaluation_from_video_result(v_result: dict[str, Any]) -> str:
 
 def _video_has_violation(v_result: dict[str, Any]) -> bool | None:
     """从视频接口 complete 结果解析是否违章；无法判断时返回 None。"""
+    if video_complete_failed(v_result):
+        return None
     vtype = str(v_result.get("violation_type") or "").strip()
     if vtype == "无":
         vtype = ""
@@ -1135,7 +1138,7 @@ def _image_ext_and_mime(url: str, mime: str) -> tuple[str, str]:
 
 
 async def _download_image_file(image_url: str) -> tuple[bytes, str, str]:
-    """下载抓拍图，返回 (bytes, mime, filename_ext)，供 /api/video/violation 的 file 字段。"""
+    """下载抓拍图，返回 (bytes, mime, filename_ext)，供 /api/video/violation 的 images 字段。"""
     data, mime = await _download_media(image_url)
     if not data:
         raise ValueError("图片内容为空")
@@ -1145,45 +1148,71 @@ async def _download_image_file(image_url: str) -> tuple[bytes, str, str]:
     return data, mime, ext
 
 
-async def _collect_violation_files(
+async def _collect_violation_evidence(
     image_urls: list[str],
     video_url: str | None,
-) -> list[dict[str, Any]]:
-    """优先视频，没有或失败再收集抓拍图，都作为 /api/video/violation 的 file。"""
-    files: list[dict[str, Any]] = []
+) -> dict[str, Any]:
+    """下载视频（可选）和最多 9 张抓拍图；判定时视频走 file，图片走 images。"""
+    video: dict[str, Any] | None = None
+    images: list[dict[str, Any]] = []
     if video_url:
         try:
             data, mime, ext = await _download_video_bytes(video_url)
             if data:
-                files.append(
-                    {
-                        "kind": "video",
-                        "data": data,
-                        "mime": mime,
-                        "ext": ext,
-                        "filename": f"evidence{ext}",
-                    }
-                )
-        except Exception as exc:
-            logger.warning("下载视频失败，将改用抓拍图调用 video/violation: %s", exc)
-    if files:
-        return files
-    for url in image_urls:
-        try:
-            data, mime, ext = await _download_image_file(url)
-            files.append(
-                {
-                    "kind": "image",
+                video = {
+                    "kind": "video",
                     "data": data,
                     "mime": mime,
                     "ext": ext,
                     "filename": f"evidence{ext}",
                 }
+        except Exception as exc:
+            logger.warning("下载视频失败，将改用抓拍图调用 video/violation: %s", exc)
+    for idx, url in enumerate(image_urls[:9], start=1):
+        try:
+            data, mime, ext = await _download_image_file(url)
+            images.append(
+                {
+                    "filename": f"image_{idx}{ext}",
+                    "content": data,
+                    "content_type": mime,
+                }
             )
-            break
         except Exception as exc:
             logger.warning("下载图片失败 %s: %s", url, exc)
-    return files
+    return {"video": video, "images": images}
+
+
+def _violation_attempts(evidence: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """视频优先走 file；失败或无视频时，抓拍图一次按 images 提交。"""
+    attempts: list[tuple[str, dict[str, Any]]] = []
+    video = evidence.get("video")
+    images = evidence.get("images") or []
+    if video:
+        attempts.append(
+            (
+                "video",
+                {
+                    "filename": video["filename"],
+                    "content": video["data"],
+                    "content_type": video["mime"],
+                    "images": None,
+                },
+            )
+        )
+    if images:
+        attempts.append(
+            (
+                "image",
+                {
+                    "filename": None,
+                    "content": None,
+                    "content_type": None,
+                    "images": images,
+                },
+            )
+        )
+    return attempts
 
 
 def _alarm_type_display(row: VehicleViolation) -> str:
@@ -1424,25 +1453,24 @@ async def run_violation_ai_assessment(
         return _skip_response(reason="暂无图片或视频证据，已跳过 AI 分析")
 
     session_id = f"violation_assess_{violation_id}"
-    evidence_files = await _collect_violation_files(image_urls, video_url)
-    if not evidence_files:
+    evidence = await _collect_violation_evidence(image_urls, video_url)
+    attempts = _violation_attempts(evidence)
+    if not attempts:
         return _skip_response(reason="证据下载失败或全部为空，已跳过 AI 分析")
 
     last_error = ""
-    for item in evidence_files:
+    for kind, kwargs in attempts:
         try:
             v_result = await agent_worker_client.analyze_video_violation(
                 user_id=user_id,
                 company=company,
-                filename=item["filename"],
-                content=item["data"],
-                content_type=item["mime"],
                 session_id=session_id,
                 extra_fields=_alarm_extra_form_fields(row),
+                **kwargs,
             )
-            if _video_result_is_refusal(v_result):
-                last_error = "违章判定返回拒答文案"
-                logger.warning("video/violation 拒答 kind=%s violation_id=%s", item["kind"], violation_id)
+            if video_complete_failed(v_result) or _video_result_is_refusal(v_result):
+                last_error = "违章判定失败或拒答"
+                logger.warning("video/violation 拒答/失败 kind=%s violation_id=%s", kind, violation_id)
                 continue
             ticket_info = await _resolve_ticket_after_video(
                 user_id=user_id,
@@ -1472,10 +1500,10 @@ async def run_violation_ai_assessment(
             }
         except AiRefusalError as exc:
             last_error = str(exc)
-            logger.warning("video/violation 拒答 kind=%s: %s", item["kind"], exc)
+            logger.warning("video/violation 拒答 kind=%s: %s", kind, exc)
         except Exception as exc:
             last_error = str(exc)
-            logger.warning("video/violation 失败 kind=%s: %s", item["kind"], exc)
+            logger.warning("video/violation 失败 kind=%s: %s", kind, exc)
 
     raise HTTPException(status_code=502, detail=f"违章判定失败：{last_error or '未知错误'}")
 
@@ -1495,7 +1523,7 @@ async def stream_violation_ai_assessment(
     一律走 Worker ``POST /api/video/violation``（SSE）：有视频传视频，无视频传抓拍图。
     """
     if not agent_worker_client.configured():
-        yield _sse({"object": "error", "message": "Agent Worker 未配置（AGENT_WORKER_BASE_URL）"})
+        yield _sse({"object": "error", "message": "AI 接口未配置或未启用"})
         return
 
     async with AsyncSessionLocal() as db:
@@ -1552,14 +1580,15 @@ async def stream_violation_ai_assessment(
                     "message": "正在下载证据（视频优先，无视频则用抓拍图）…",
                 }
             )
-            evidence_files = await _collect_violation_files(image_urls, video_url)
-            if not evidence_files:
+            evidence = await _collect_violation_evidence(image_urls, video_url)
+            attempts = _violation_attempts(evidence)
+            if not attempts:
                 yield _sse({"object": "skip", "reason": "证据下载失败或全部为空，已跳过 AI 分析"})
                 return
 
             last_error = ""
-            for item in evidence_files:
-                kind_label = "视频" if item["kind"] == "video" else "抓拍图"
+            for kind, kwargs in attempts:
+                kind_label = "视频" if kind == "video" else "抓拍图"
                 yield _sse(
                     {
                         "object": "status",
@@ -1573,11 +1602,9 @@ async def stream_violation_ai_assessment(
                     async for ev in agent_worker_client.analyze_video_violation_stream(
                         user_id=user_id,
                         company=company,
-                        filename=item["filename"],
-                        content=item["data"],
-                        content_type=item["mime"],
                         session_id=session_id,
                         extra_fields=_alarm_extra_form_fields(row),
+                        **kwargs,
                     ):
                         obj = str(ev.get("object") or "")
                         if obj == "delta":
@@ -1603,6 +1630,10 @@ async def stream_violation_ai_assessment(
                                     }
                                 )
                         elif obj == "complete":
+                            if video_complete_failed(ev):
+                                raise AgentWorkerError(
+                                    str(ev.get("analysis") or ev.get("conclusion") or "违章判定分析失败")
+                                )
                             v_result = dict(ev)
                             v_result.pop("object", None)
                         elif obj == "error":
@@ -1611,7 +1642,7 @@ async def stream_violation_ai_assessment(
                             )
                 except AgentWorkerError as exc:
                     last_error = str(exc)
-                    logger.warning("video/violation SSE 失败 kind=%s: %s", item["kind"], exc)
+                    logger.warning("video/violation SSE 失败 kind=%s: %s", kind, exc)
                     v_result = None
                     yield _sse(
                         {
@@ -1623,7 +1654,7 @@ async def stream_violation_ai_assessment(
 
                 if v_result is not None and _video_result_is_refusal(v_result):
                     last_error = "违章判定返回拒答文案"
-                    logger.warning("流式 video/violation 拒答 kind=%s", item["kind"])
+                    logger.warning("流式 video/violation 拒答 kind=%s", kind)
                     v_result = None
                     yield _sse(
                         {

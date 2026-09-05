@@ -6,7 +6,7 @@ from __future__ import annotations
 
 
 
-from app.config import settings
+from app.agent_worker_config import cached_default_company
 
 
 
@@ -140,7 +140,7 @@ def resolve_ai_company(org_name: str | None, *, override: str | None = None) -> 
 
         return matched
 
-    return (settings.agent_worker_default_company or "三峰城服").strip()
+    return cached_default_company()
 
 
 
@@ -149,4 +149,20 @@ def resolve_ai_company(org_name: str | None, *, override: str | None = None) -> 
 def resolve_dataset_id(company: str) -> str | None:
 
     return AI_DATASETS.get((company or "").strip())
+
+
+def resolve_dataset_name(*, dataset_id: str | None = None, dataset_name: str | None = None) -> str:
+    """新文档按库名对接；旧调用若仍传 UUID，这里反查回中文库名。"""
+    name = (dataset_name or "").strip()
+    if name:
+        return name
+    raw = (dataset_id or "").strip()
+    if not raw:
+        raise ValueError("dataset_name 与 dataset_id 必须提供一个")
+    if raw in AI_DATASETS:
+        return raw
+    for key, uid in AI_DATASETS.items():
+        if uid == raw:
+            return key
+    return raw
 

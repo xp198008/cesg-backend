@@ -15,7 +15,7 @@ from threading import Lock
 from typing import Any
 
 import pymysql
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -333,12 +333,7 @@ async def ensure_violation_company_name(db: AsyncSession, row: VehicleViolation)
 
 async def notify_violation_created(db: AsyncSession, row: VehicleViolation) -> None:
     """本地入库后：弹窗缓存 + 同步 808（失败不影响主流程）。"""
-    try:
-        push_violation_alert(violation_alert_payload(row))
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("push_violation_alert 失败: %s", exc)
-
-    if row is None or row.id is None:
+    if row is None:
         return
 
     try:
@@ -346,6 +341,15 @@ async def notify_violation_created(db: AsyncSession, row: VehicleViolation) -> N
         await db.flush()
     except Exception as exc:  # noqa: BLE001
         logger.debug("回填 company_name 失败: %s", exc)
+
+    try:
+        if (getattr(row, "status", None) or "").strip() in ("", "待处理"):
+            push_violation_alert(violation_alert_payload(row))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("push_violation_alert 失败: %s", exc)
+
+    if row.id is None:
+        return
 
     row_dict = serialize_violation_row(row)
     all_rows: list[dict[str, Any]] | None = None
@@ -509,6 +513,11 @@ def _backfill_remote_company_names(
                     """
                 )
                 out["empty_before"] = int((cur.fetchone() or [0])[0] or 0)
+                if out["empty_before"] <= 0:
+                    out["ok"] = True
+                    out["empty_after"] = 0
+                    out["skipped"] = True
+                    return out
 
                 updated_by_id = 0
                 if rows_by_id:
@@ -572,10 +581,17 @@ async def backfill_violation_company_names(db: AsyncSession) -> dict[str, Any]:
             name_by_id[int(cid)] = text
 
     local_updated = 0
-    rows = (await db.execute(select(VehicleViolation))).scalars().all()
-    for row in rows:
-        if (getattr(row, "company_name", None) or "").strip():
-            continue
+    empty_rows = (
+        await db.execute(
+            select(VehicleViolation).where(
+                or_(
+                    VehicleViolation.company_name.is_(None),
+                    VehicleViolation.company_name == "",
+                )
+            )
+        )
+    ).scalars().all()
+    for row in empty_rows:
         cid = int(row.company_id) if row.company_id is not None else None
         if cid is None:
             continue
@@ -587,9 +603,9 @@ async def backfill_violation_company_names(db: AsyncSession) -> dict[str, Any]:
     if local_updated:
         await db.flush()
 
-    # 带名称的本地行，按 id 回写 808
+    # 808 侧若已无空公司名会直接跳过，不必再把本地全表 id 送过去
     named_rows: list[tuple[int, str]] = []
-    for row in rows:
+    for row in empty_rows:
         if row.id is None:
             continue
         name = (getattr(row, "company_name", None) or "").strip()

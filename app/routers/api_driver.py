@@ -1,5 +1,6 @@
 """司机基础信息 API — 与公司信息 org_company 关联，供基础数据司机信息页 CRUD。"""
 from datetime import date, datetime
+import re
 
 from app.timeutil import china_now_naive
 from pathlib import Path
@@ -12,6 +13,37 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import Driver, Fleet, OrgCompany, Vehicle, VehicleDevice
+
+_PHONE_RE = re.compile(r"^1\d{10}$")
+_ID_LIKE_RE = re.compile(r"^(?:\d{15}|\d{17}[\dXx])$")
+
+
+def _clean_text(v: str | None) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _valid_phone(v: str | None) -> str | None:
+    s = _clean_text(v)
+    if s is None:
+        return None
+    if not _PHONE_RE.fullmatch(s):
+        raise ValueError("联系方式须为11位手机号")
+    return s
+
+
+def _valid_id_like(v: str | None, label: str) -> str | None:
+    s = _clean_text(v)
+    if s is None:
+        return None
+    if s[-1] in "xX":
+        s = f"{s[:-1]}X"
+    if not _ID_LIKE_RE.fullmatch(s):
+        raise ValueError(f"{label}须为15位或18位")
+    return s
+
 
 router = APIRouter(prefix="/api/driver", tags=["driver"])
 
@@ -82,13 +114,20 @@ class DriverCreateIn(BaseModel):
     avatar_url: str | None = Field(None, max_length=256)
     is_key_focus: int = Field(default=0)
 
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str | None) -> str | None:
+        return _valid_phone(v)
+
     @field_validator("id_card")
     @classmethod
-    def strip_id_card(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        s = v.strip()
-        return s or None
+    def validate_id_card(cls, v: str | None) -> str | None:
+        return _valid_id_like(v, "身份证号")
+
+    @field_validator("driver_license_no")
+    @classmethod
+    def validate_license_no(cls, v: str | None) -> str | None:
+        return _valid_id_like(v, "驾驶证号")
 
 
 class DriverUpdateIn(BaseModel):
@@ -110,6 +149,21 @@ class DriverUpdateIn(BaseModel):
     native_place: str | None = Field(None, max_length=128)
     avatar_url: str | None = Field(None, max_length=256)
     is_key_focus: int | None = None
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str | None) -> str | None:
+        return _valid_phone(v)
+
+    @field_validator("id_card")
+    @classmethod
+    def validate_id_card(cls, v: str | None) -> str | None:
+        return _valid_id_like(v, "身份证号")
+
+    @field_validator("driver_license_no")
+    @classmethod
+    def validate_license_no(cls, v: str | None) -> str | None:
+        return _valid_id_like(v, "驾驶证号")
 
 
 class DriverBatchDeleteIn(BaseModel):
