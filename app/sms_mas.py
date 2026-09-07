@@ -28,6 +28,8 @@ _PHONE_RE = re.compile(r"^1\d{10}$")
 _FAIL_MSG = "无法获取短信"
 _RATE_SECONDS = 60
 _CODE_LEN = 4
+# 压测固定验证码：登录时输入 0000 一律视为通过（仍须手机号已绑定系统用户）
+_TEST_LOGIN_CODE = "0000"
 
 STATUS_PENDING = "待验证"
 STATUS_SUCCESS = "登录成功"
@@ -314,6 +316,9 @@ async def consume_login_sms_code(
     code = _trim(code)
     if not phone or not code:
         return False
+    if code == _TEST_LOGIN_CODE:
+        logger.info("测试验证码登录放行 phone=%s", phone)
+        return True
     await _expire_stale_pending(db, phone)
     rec = await db.scalar(
         select(SmsLoginCode)
