@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import json
 import logging
 import re
@@ -27,10 +28,16 @@ from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models import OrgCompany, Vehicle, VehicleViolation, ViolationAiAssessment
 from app.timeutil import china_now_naive
-from app.violation_filters import violation_row_is_page_visible
+from app.violation_filters import is_obd_speed_source, violation_row_is_page_visible
 
 _AI_AUTO_FALSE_ALARM_HANDLER = "AI自动评估"
 _AI_AUTO_FALSE_ALARM_REMARK = "AI评估建议为误报，系统自动处理"
+_INSUFFICIENT_EVIDENCE_REMARK = "证据不足（未满3张图片+1段有效视频，或视频长度为0），未调用AI，系统按误报处理"
+_AI_REQUIRED_IMAGE_COUNT = 3
+_MIN_USABLE_VIDEO_BYTES = 2048
+_DOWNLOAD_TIMEOUT = httpx.Timeout(20.0, connect=8.0, read=20.0, write=10.0, pool=5.0)
+_DOWNLOAD_LIMITS = httpx.Limits(max_connections=6, max_keepalive_connections=0)
+_AI_SLOT = asyncio.Semaphore(1)
 # 助手拒答时同一条再问几轮（换 session，避免会话上下文污染）
 _AI_CHAT_MAX_ATTEMPTS = 3
 _AI_CHAT_RETRY_DELAY_SEC = 2.0
@@ -40,6 +47,123 @@ logger = logging.getLogger(__name__)
 
 class AiRefusalError(RuntimeError):
     """Agent Worker 返回「超出服务范围」类拒答，评估未落库，可供定时器稍后重试。"""
+
+
+def is_unreadable_evidence_error(text: str | None) -> bool:
+    """证据文件本身损坏：再试也没用，应永久跳出自动评估队列。"""
+    raw = str(text or "")
+    if not raw:
+        return False
+    keys = (
+        "unreadable_input",
+        "image file is truncated",
+        "缺少 moov",
+        "缺 moov",
+        "moov atom",
+        "文件损坏",
+        "无法解码",
+        "无法打开",
+    )
+    return any(k in raw for k in keys)
+
+
+def _mp4_missing_moov(data: bytes | None) -> bool:
+    if not data or len(data) < 16:
+        return True
+    head = data[: min(len(data), 2 * 1024 * 1024)]
+    tail = data[-min(len(data), 2 * 1024 * 1024) :]
+    return b"moov" not in head and b"moov" not in tail
+
+
+def _mp4_duration_seconds(data: bytes | None) -> float | None:
+    """从 mvhd 读时长；解析失败返回 None，时长为 0 表示空片。"""
+    if not data or len(data) < 32:
+        return None
+
+    def find_mvhd(blob: bytes, base: int) -> int:
+        idx = blob.find(b"mvhd")
+        return -1 if idx < 0 else base + idx
+
+    head_n = min(len(data), 2 * 1024 * 1024)
+    pos = find_mvhd(data[:head_n], 0)
+    if pos < 0:
+        tail_n = min(len(data), 2 * 1024 * 1024)
+        pos = find_mvhd(data[-tail_n:], len(data) - tail_n)
+    if pos < 0 or pos + 36 > len(data):
+        return None
+    ver = data[pos + 4]
+    if ver == 0:
+        timescale = int.from_bytes(data[pos + 16 : pos + 20], "big")
+        duration = int.from_bytes(data[pos + 20 : pos + 24], "big")
+    elif ver == 1:
+        if pos + 36 > len(data):
+            return None
+        timescale = int.from_bytes(data[pos + 24 : pos + 28], "big")
+        duration = int.from_bytes(data[pos + 28 : pos + 36], "big")
+    else:
+        return None
+    if timescale <= 0:
+        return None
+    return duration / float(timescale)
+
+
+def _as_meta_length(raw: Any) -> float | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _video_bytes_usable(data: bytes | None) -> bool:
+    if not data or len(data) < _MIN_USABLE_VIDEO_BYTES:
+        return False
+    if _mp4_missing_moov(data):
+        return False
+    duration = _mp4_duration_seconds(data)
+    if duration is not None and duration <= 0:
+        return False
+    return True
+
+
+def _release_evidence(evidence: dict[str, Any] | None) -> None:
+    """评估结束立刻丢掉视频/图片字节，避免超时后仍占着内存。"""
+    if not isinstance(evidence, dict):
+        return
+    big = False
+    video = evidence.get("video")
+    if isinstance(video, dict):
+        raw = video.get("data")
+        if isinstance(raw, (bytes, bytearray)) and len(raw) > 1024 * 1024:
+            big = True
+        video["data"] = b""
+    for item in evidence.get("images") or []:
+        if isinstance(item, dict):
+            item["content"] = b""
+    evidence.clear()
+    if big:
+        gc.collect()
+
+
+def _jpeg_truncated(data: bytes | None) -> bool:
+    return bool(data) and data[:2] == b"\xff\xd8" and data[-2:] != b"\xff\xd9"
+
+
+def _drop_unreadable_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    """本机丢掉缺 moov / 截断图，避免再打到 AI Worker 把接口拖死。"""
+    video = evidence.get("video")
+    if isinstance(video, dict) and _mp4_missing_moov(video.get("data")):
+        logger.warning("本机判定视频缺 moov，跳过上传 Worker")
+        video = None
+    images = []
+    for item in evidence.get("images") or []:
+        content = item.get("content") if isinstance(item, dict) else None
+        if _jpeg_truncated(content):
+            logger.warning("本机判定图片截断，跳过上传 Worker")
+            continue
+        images.append(item)
+    return {"video": video, "images": images}
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
@@ -202,9 +326,16 @@ async def _download_media(url: str) -> tuple[bytes, str]:
 
     local = _local_media_path(resolved)
     if local and local.exists() and local.is_file():
-        data = local.read_bytes()
+        size = local.stat().st_size
+        if size <= 0:
+            ext = local.suffix.lower()
+            mime = "video/mp4" if ext in {".mp4", ".mov", ".avi", ".mkv", ".flv"} else "application/octet-stream"
+            return b"", mime
+        if size > _MAX_VIDEO_BYTES:
+            raise ValueError("文件过大")
+        data = await asyncio.to_thread(local.read_bytes)
         ext = local.suffix.lower()
-        mime = "image/jpeg" if ext in {".jpg", ".jpeg"} else f"application/octet-stream"
+        mime = "image/jpeg" if ext in {".jpg", ".jpeg"} else "application/octet-stream"
         if ext == ".png":
             mime = "image/png"
         elif ext == ".webp":
@@ -213,43 +344,105 @@ async def _download_media(url: str) -> tuple[bytes, str]:
             mime = "video/mp4"
         return data, mime
 
-    async with httpx.AsyncClient(timeout=agent_worker_client._video_timeout(), follow_redirects=True) as client:
-        resp = await client.get(resolved)
-        resp.raise_for_status()
-        content_type = (resp.headers.get("content-type") or "application/octet-stream").split(";")[0].strip()
-        return resp.content, content_type
+    async with httpx.AsyncClient(
+        timeout=_DOWNLOAD_TIMEOUT,
+        follow_redirects=True,
+        limits=_DOWNLOAD_LIMITS,
+        trust_env=False,
+    ) as client:
+        async with client.stream("GET", resolved) as resp:
+            resp.raise_for_status()
+            content_type = (resp.headers.get("content-type") or "application/octet-stream").split(";")[0].strip()
+            content_length = resp.headers.get("content-length")
+            if content_length is not None and str(content_length).isdigit():
+                n = int(content_length)
+                if n <= 0:
+                    return b"", content_type
+                if n > _MAX_VIDEO_BYTES:
+                    raise ValueError("文件过大")
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.aiter_bytes(64 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > _MAX_VIDEO_BYTES:
+                    raise ValueError("文件过大")
+                chunks.append(chunk)
+            return b"".join(chunks), content_type
 
 
-def _gather_media_refs(row: VehicleViolation) -> tuple[list[str], str | None]:
-    image_urls: list[str] = []
-    video_url: str | None = None
+def _list_image_urls(row: VehicleViolation) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str | None) -> None:
+        text = (raw or "").strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        urls.append(text)
 
     snapshots = _json_loads(row.stream_snapshot_refs, [])
     if isinstance(snapshots, list):
-        for item in snapshots[:3]:
-            if len(image_urls) >= 3:
-                break
+        for item in snapshots:
             if isinstance(item, str) and item.strip():
-                image_urls.append(f"/media/violation-snapshots/{item.strip().lstrip('/')}")
+                add(f"/media/violation-snapshots/{item.strip().lstrip('/')}")
             elif isinstance(item, dict):
-                u = _extract_url(item)
-                if u:
-                    image_urls.append(u)
+                add(_extract_url(item))
 
     evidence = _json_loads(row.ttx_evidence_refs, {})
     if isinstance(evidence, dict):
         imgs = evidence.get("images") if isinstance(evidence.get("images"), list) else []
-        vids = evidence.get("videos") if isinstance(evidence.get("videos"), list) else []
         for item in imgs:
-            if len(image_urls) >= 3:
-                break
-            u = _extract_url(item)
-            if u:
-                image_urls.append(u)
-        if vids:
-            video_url = _extract_url(vids[0]) or None
+            add(_extract_url(item))
+    return urls
 
-    return image_urls[:3], video_url
+
+def _iter_video_items(row: VehicleViolation) -> list[Any]:
+    evidence = _json_loads(row.ttx_evidence_refs, {})
+    if not isinstance(evidence, dict):
+        return []
+    vids = evidence.get("videos")
+    return vids if isinstance(vids, list) else []
+
+
+def _has_zero_length_video(row: VehicleViolation) -> bool:
+    for item in _iter_video_items(row):
+        if not isinstance(item, dict):
+            continue
+        length = _as_meta_length(item.get("length"))
+        if length is not None and length <= 0:
+            return True
+    return False
+
+
+def _first_video_url(row: VehicleViolation) -> str | None:
+    """跳过申报长度为 0 的空片，避免再下载/送 AI。"""
+    for item in _iter_video_items(row):
+        if isinstance(item, dict):
+            length = _as_meta_length(item.get("length"))
+            if length is not None and length <= 0:
+                continue
+        url = _extract_url(item)
+        if url:
+            return url
+    return None
+
+
+def _gather_media_refs(row: VehicleViolation) -> tuple[list[str], str | None]:
+    return _list_image_urls(row)[:_AI_REQUIRED_IMAGE_COUNT], _first_video_url(row)
+
+
+def _should_false_alarm_for_insufficient_evidence(row: VehicleViolation) -> bool:
+    """非 OBD：必须满 3 张图 + 1 段有效视频才问 AI，否则直接误报。"""
+    if is_obd_speed_source(getattr(row, "source", None)):
+        return False
+    if len(_list_image_urls(row)) < _AI_REQUIRED_IMAGE_COUNT:
+        return True
+    if not _first_video_url(row):
+        return True
+    return False
 
 
 def _image_data_uri(data: bytes, mime: str) -> str:
@@ -901,6 +1094,104 @@ def _maybe_auto_false_alarm(row: VehicleViolation, process_type: str | None) -> 
     return True
 
 
+async def _ensure_assessment_row(
+    db: AsyncSession,
+    violation_id: int,
+    existing: ViolationAiAssessment | None,
+) -> ViolationAiAssessment:
+    if existing is not None:
+        return existing
+    found = await db.scalar(
+        select(ViolationAiAssessment)
+        .where(ViolationAiAssessment.violation_id == int(violation_id))
+        .limit(1)
+    )
+    if found is not None:
+        return found
+    created = ViolationAiAssessment(violation_id=int(violation_id))
+    db.add(created)
+    return created
+
+
+async def _apply_insufficient_evidence_false_alarm(
+    db: AsyncSession,
+    row: VehicleViolation,
+    existing: ViolationAiAssessment | None,
+) -> tuple[ViolationAiAssessment, bool]:
+    """证据不足：不调 AI，直接落误报评估并改状态。"""
+    image_urls = _list_image_urls(row)
+    video_url = _first_video_url(row)
+    n_img = len(image_urls)
+    has_video = bool(video_url)
+    zero_len = _has_zero_length_video(row)
+    video_desc = "视频长度为0" if zero_len and not has_video else ("有有效视频" if has_video else "无有效视频")
+    eval_text = (
+        f"证据不足，未调用AI。当前图片 {n_img} 张，{video_desc}。"
+        f"完整证据需 {_AI_REQUIRED_IMAGE_COUNT} 张图片加 1 段有效视频，故按误报处理。"
+    )
+    ticket_info = {
+        "process_type": "误报",
+        "amount": 0.0,
+        "basis": "证据不足",
+        "suggestion_text": _ticket_suggestion_text("误报", 0.0, "证据不足"),
+    }
+    existing = await _ensure_assessment_row(db, int(row.id), existing)
+    auto_false = _persist_assessment_fields(
+        existing,
+        row,
+        session_id=f"insufficient_evidence_{row.id}",
+        evaluation_text=eval_text,
+        ticket_info=ticket_info,
+        video_analysis_text="",
+        raw_response_text=eval_text,
+        company=(row.company_name or "").strip(),
+        image_count=n_img,
+        has_video=has_video,
+        evidence_valid=False,
+        system_ok=None,
+        violated_rules=[],
+    )
+    row.handler_remark = _INSUFFICIENT_EVIDENCE_REMARK
+    await db.flush()
+    await db.refresh(existing)
+    return existing, auto_false
+
+
+async def backfill_insufficient_evidence_false_alarms(
+    db: AsyncSession,
+    *,
+    limit: int = 400,
+    before_id: int | None = None,
+) -> tuple[int, int | None, int]:
+    """把待处理且证据不足的非 OBD 记录按误报落库。
+
+    返回 (本批落库数, 本批最小 id, 本批扫描数)，便于从新到旧翻页。
+    """
+    stmt = select(VehicleViolation).where(VehicleViolation.status == "待处理")
+    if before_id is not None:
+        stmt = stmt.where(VehicleViolation.id < int(before_id))
+    rows = (
+        await db.execute(stmt.order_by(VehicleViolation.id.desc()).limit(max(1, int(limit))))
+    ).scalars().all()
+    n = 0
+    min_id: int | None = before_id
+    for row in rows:
+        min_id = int(row.id)
+        if not _should_false_alarm_for_insufficient_evidence(row):
+            continue
+        existing = await db.scalar(
+            select(ViolationAiAssessment)
+            .where(ViolationAiAssessment.violation_id == int(row.id))
+            .limit(1)
+        )
+        await _apply_insufficient_evidence_false_alarm(db, row, existing)
+        n += 1
+    if n:
+        await db.flush()
+        logger.info("回填证据不足 → 误报：本批 %s 条", n)
+    return n, min_id, len(rows)
+
+
 async def backfill_ai_suggested_false_alarms(db: AsyncSession) -> int:
     """将「AI 已建议误报但仍为待处理」的历史记录一次性落库为误报。"""
     rows = (
@@ -1015,9 +1306,7 @@ async def _save_assessment_from_video(
     image_count: int = 0,
     ticket_info: dict[str, Any] | None = None,
 ) -> tuple[ViolationAiAssessment, bool]:
-    if existing is None:
-        existing = ViolationAiAssessment(violation_id=row.id)
-        db.add(existing)
+    existing = await _ensure_assessment_row(db, int(row.id), existing)
     evaluation_text = _evaluation_from_video_result(v_result)
     if ticket_info is None:
         ticket_info = _ticket_from_video_result(v_result)
@@ -1067,9 +1356,7 @@ async def _save_assessment(
     if not isinstance(violated_rules, list):
         violated_rules = []
 
-    if existing is None:
-        existing = ViolationAiAssessment(violation_id=row.id)
-        db.add(existing)
+    existing = await _ensure_assessment_row(db, int(row.id), existing)
 
     auto_false = _persist_assessment_fields(
         existing,
@@ -1152,23 +1439,25 @@ async def _collect_violation_evidence(
     image_urls: list[str],
     video_url: str | None,
 ) -> dict[str, Any]:
-    """下载视频（可选）和最多 9 张抓拍图；判定时视频走 file，图片走 images。"""
+    """先下视频并校验，无效则不再下图、也不送 AI。"""
     video: dict[str, Any] | None = None
     images: list[dict[str, Any]] = []
     if video_url:
         try:
             data, mime, ext = await _download_video_bytes(video_url)
-            if data:
-                video = {
-                    "kind": "video",
-                    "data": data,
-                    "mime": mime,
-                    "ext": ext,
-                    "filename": f"evidence{ext}",
-                }
+            video = {
+                "kind": "video",
+                "data": data or b"",
+                "mime": mime,
+                "ext": ext,
+                "filename": f"evidence{ext}",
+            }
         except Exception as exc:
-            logger.warning("下载视频失败，将改用抓拍图调用 video/violation: %s", exc)
-    for idx, url in enumerate(image_urls[:9], start=1):
+            logger.warning("下载视频失败，按证据不足处理: %s", exc)
+            return {"video": None, "images": []}
+        if not _video_bytes_usable(video.get("data") if isinstance(video.get("data"), (bytes, bytearray)) else None):
+            return {"video": video, "images": []}
+    for idx, url in enumerate(image_urls[:_AI_REQUIRED_IMAGE_COUNT], start=1):
         try:
             data, mime, ext = await _download_image_file(url)
             images.append(
@@ -1181,6 +1470,14 @@ async def _collect_violation_evidence(
         except Exception as exc:
             logger.warning("下载图片失败 %s: %s", url, exc)
     return {"video": video, "images": images}
+
+
+def _evidence_video_usable(evidence: dict[str, Any] | None, video_url: str | None) -> bool:
+    if not video_url:
+        return True
+    video = (evidence or {}).get("video")
+    raw = video.get("data") if isinstance(video, dict) else None
+    return _video_bytes_usable(raw if isinstance(raw, (bytes, bytearray)) else None)
 
 
 def _violation_attempts(evidence: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -1317,9 +1614,7 @@ async def _run_local_refusal_fallback_assessment(
         f"{refuse_text}\n"
     )
 
-    if existing is None:
-        existing = ViolationAiAssessment(violation_id=row.id)
-        db.add(existing)
+    existing = await _ensure_assessment_row(db, int(row.id), existing)
     auto_false = _persist_assessment_fields(
         existing,
         row,
@@ -1447,69 +1742,168 @@ async def run_violation_ai_assessment(
             "assessment": _assessment_out(existing),
         }
 
+    if _should_false_alarm_for_insufficient_evidence(row):
+        existing, auto_false = await _apply_insufficient_evidence_false_alarm(db, row, existing)
+        return {
+            "ok": True,
+            "cached": False,
+            "ai_queried": True,
+            "source": "insufficient_evidence",
+            "auto_false_alarm": auto_false,
+            "status": (row.status or "").strip(),
+            "assessment": _assessment_out(existing),
+        }
+
     company = await _resolve_company_for_violation(db, row)
     image_urls, video_url = _gather_media_refs(row)
     if not image_urls and not video_url:
         return _skip_response(reason="暂无图片或视频证据，已跳过 AI 分析")
 
     session_id = f"violation_assess_{violation_id}"
-    evidence = await _collect_violation_evidence(image_urls, video_url)
-    attempts = _violation_attempts(evidence)
-    if not attempts:
-        return _skip_response(reason="证据下载失败或全部为空，已跳过 AI 分析")
-
-    last_error = ""
-    for kind, kwargs in attempts:
+    evidence: dict[str, Any] | None = None
+    async with _AI_SLOT:
         try:
-            v_result = await agent_worker_client.analyze_video_violation(
-                user_id=user_id,
-                company=company,
-                session_id=session_id,
-                extra_fields=_alarm_extra_form_fields(row),
-                **kwargs,
-            )
-            if video_complete_failed(v_result) or _video_result_is_refusal(v_result):
-                last_error = "违章判定失败或拒答"
-                logger.warning("video/violation 拒答/失败 kind=%s violation_id=%s", kind, violation_id)
-                continue
-            ticket_info = await _resolve_ticket_after_video(
-                user_id=user_id,
-                company=company,
-                session_id=session_id,
-                row=row,
-                v_result=v_result,
-            )
-            existing, auto_false = await _save_assessment_from_video(
-                db,
-                row,
-                existing,
-                session_id=session_id,
-                v_result=v_result,
-                company=company,
-                image_count=len(image_urls),
-                ticket_info=ticket_info,
-            )
-            return {
-                "ok": True,
-                "cached": False,
-                "ai_queried": True,
-                "source": "video_violation",
-                "auto_false_alarm": auto_false,
-                "status": (row.status or "").strip(),
-                "assessment": _assessment_out(existing),
-            }
-        except AiRefusalError as exc:
-            last_error = str(exc)
-            logger.warning("video/violation 拒答 kind=%s: %s", kind, exc)
-        except Exception as exc:
-            last_error = str(exc)
-            logger.warning("video/violation 失败 kind=%s: %s", kind, exc)
+            try:
+                evidence = await asyncio.wait_for(
+                    _collect_violation_evidence(image_urls, video_url),
+                    timeout=45,
+                )
+            except TimeoutError as exc:
+                raise HTTPException(status_code=504, detail="下载证据超时，已断开连接并释放资源") from exc
 
-    raise HTTPException(status_code=502, detail=f"违章判定失败：{last_error or '未知错误'}")
+            if video_url and not _evidence_video_usable(evidence, video_url):
+                existing, auto_false = await _apply_insufficient_evidence_false_alarm(db, row, existing)
+                return {
+                    "ok": True,
+                    "cached": False,
+                    "ai_queried": True,
+                    "source": "insufficient_evidence",
+                    "auto_false_alarm": auto_false,
+                    "status": (row.status or "").strip(),
+                    "assessment": _assessment_out(existing),
+                }
+
+            evidence = _drop_unreadable_evidence(evidence)
+            if video_url and not _evidence_video_usable(evidence, video_url):
+                existing, auto_false = await _apply_insufficient_evidence_false_alarm(db, row, existing)
+                return {
+                    "ok": True,
+                    "cached": False,
+                    "ai_queried": True,
+                    "source": "insufficient_evidence",
+                    "auto_false_alarm": auto_false,
+                    "status": (row.status or "").strip(),
+                    "assessment": _assessment_out(existing),
+                }
+
+            attempts = _violation_attempts(evidence)
+            if not attempts:
+                existing, auto_false = await _apply_insufficient_evidence_false_alarm(db, row, existing)
+                return {
+                    "ok": True,
+                    "cached": False,
+                    "ai_queried": True,
+                    "source": "insufficient_evidence",
+                    "auto_false_alarm": auto_false,
+                    "status": (row.status or "").strip(),
+                    "assessment": _assessment_out(existing),
+                }
+
+            last_error = ""
+            deadline = agent_worker_client.video_call_deadline_sec()
+            for kind, kwargs in attempts:
+                try:
+                    v_result = await asyncio.wait_for(
+                        agent_worker_client.analyze_video_violation(
+                            user_id=user_id,
+                            company=company,
+                            session_id=session_id,
+                            extra_fields=_alarm_extra_form_fields(row),
+                            **kwargs,
+                        ),
+                        timeout=deadline,
+                    )
+                    if video_complete_failed(v_result) or _video_result_is_refusal(v_result):
+                        last_error = "违章判定失败或拒答"
+                        logger.warning("video/violation 拒答/失败 kind=%s violation_id=%s", kind, violation_id)
+                        continue
+                    ticket_info = await _resolve_ticket_after_video(
+                        user_id=user_id,
+                        company=company,
+                        session_id=session_id,
+                        row=row,
+                        v_result=v_result,
+                    )
+                    existing, auto_false = await _save_assessment_from_video(
+                        db,
+                        row,
+                        existing,
+                        session_id=session_id,
+                        v_result=v_result,
+                        company=company,
+                        image_count=len(image_urls),
+                        ticket_info=ticket_info,
+                    )
+                    return {
+                        "ok": True,
+                        "cached": False,
+                        "ai_queried": True,
+                        "source": "video_violation",
+                        "auto_false_alarm": auto_false,
+                        "status": (row.status or "").strip(),
+                        "assessment": _assessment_out(existing),
+                    }
+                except TimeoutError:
+                    last_error = "AI 判定超时，已断开连接并释放资源"
+                    logger.warning("video/violation 超时 kind=%s violation_id=%s", kind, violation_id)
+                except AiRefusalError as exc:
+                    last_error = str(exc)
+                    logger.warning("video/violation 拒答 kind=%s: %s", kind, exc)
+                except Exception as exc:
+                    last_error = str(exc)
+                    logger.warning("video/violation 失败 kind=%s: %s", kind, exc)
+
+            if is_unreadable_evidence_error(last_error):
+                existing, auto_false = await _apply_insufficient_evidence_false_alarm(db, row, existing)
+                return {
+                    "ok": True,
+                    "cached": False,
+                    "ai_queried": True,
+                    "source": "insufficient_evidence",
+                    "auto_false_alarm": auto_false,
+                    "status": (row.status or "").strip(),
+                    "assessment": _assessment_out(existing),
+                }
+            raise HTTPException(status_code=502, detail=f"违章判定失败：{last_error or '未知错误'}")
+        finally:
+            _release_evidence(evidence)
 
 
 def _sse(payload: dict[str, Any]) -> bytes:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+async def _iterate_with_deadline(agen: AsyncIterator[dict[str, Any]], deadline_sec: float):
+    """超时取消 Worker 流，确保 httpx 连接被关掉。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(5.0, float(deadline_sec))
+    try:
+        while True:
+            remain = deadline - loop.time()
+            if remain <= 0:
+                raise TimeoutError("AI 判定超时")
+            try:
+                ev = await asyncio.wait_for(agen.__anext__(), timeout=remain)
+            except StopAsyncIteration:
+                return
+            yield ev
+    finally:
+        closer = getattr(agen, "aclose", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception:
+                pass
 
 
 async def stream_violation_ai_assessment(
@@ -1557,6 +1951,22 @@ async def stream_violation_ai_assessment(
                 )
                 return
 
+            if _should_false_alarm_for_insufficient_evidence(row):
+                existing, auto_false = await _apply_insufficient_evidence_false_alarm(db, row, existing)
+                await db.commit()
+                yield _sse(
+                    {
+                        "object": "assessment",
+                        "cached": False,
+                        "ai_queried": True,
+                        "source": "insufficient_evidence",
+                        "auto_false_alarm": auto_false,
+                        "status": (row.status or "").strip(),
+                        "assessment": _assessment_out(existing),
+                    }
+                )
+                return
+
             company = await _resolve_company_for_violation(db, row)
             yield _sse(
                 {
@@ -1580,143 +1990,214 @@ async def stream_violation_ai_assessment(
                     "message": "正在下载证据（视频优先，无视频则用抓拍图）…",
                 }
             )
-            evidence = await _collect_violation_evidence(image_urls, video_url)
-            attempts = _violation_attempts(evidence)
-            if not attempts:
-                yield _sse({"object": "skip", "reason": "证据下载失败或全部为空，已跳过 AI 分析"})
-                return
-
-            last_error = ""
-            for kind, kwargs in attempts:
-                kind_label = "视频" if kind == "video" else "抓拍图"
-                yield _sse(
-                    {
-                        "object": "status",
-                        "stage": "video",
-                        "message": f"正在调用违章判定接口（{kind_label}）…",
-                    }
-                )
-                text_parts: list[str] = []
-                v_result: dict[str, Any] | None = None
+            evidence: dict[str, Any] | None = None
+            async with _AI_SLOT:
                 try:
-                    async for ev in agent_worker_client.analyze_video_violation_stream(
-                        user_id=user_id,
-                        company=company,
-                        session_id=session_id,
-                        extra_fields=_alarm_extra_form_fields(row),
-                        **kwargs,
-                    ):
-                        obj = str(ev.get("object") or "")
-                        if obj == "delta":
-                            if ev.get("type") == "text" and ev.get("text"):
-                                text_parts.append(str(ev["text"]))
-                                yield _sse(
-                                    {
-                                        "object": "content",
-                                        "type": "text",
-                                        "delta": True,
-                                        "text": ev["text"],
-                                    }
-                                )
-                            elif ev.get("type") == "tool_call":
-                                name = str(ev.get("name") or "tool")
-                                status = str(ev.get("status") or "")
-                                tip = f"[{name} {status}]".strip()
-                                yield _sse(
-                                    {
-                                        "object": "status",
-                                        "stage": "video",
-                                        "message": tip,
-                                    }
-                                )
-                        elif obj == "complete":
-                            if video_complete_failed(ev):
-                                raise AgentWorkerError(
-                                    str(ev.get("analysis") or ev.get("conclusion") or "违章判定分析失败")
-                                )
-                            v_result = dict(ev)
-                            v_result.pop("object", None)
-                        elif obj == "error":
-                            raise AgentWorkerError(
-                                str(ev.get("detail") or ev.get("message") or "违章判定失败")
+                    try:
+                        evidence = await asyncio.wait_for(
+                            _collect_violation_evidence(image_urls, video_url),
+                            timeout=45,
+                        )
+                    except TimeoutError:
+                        yield _sse({"object": "error", "message": "下载证据超时，已断开连接并释放资源"})
+                        return
+
+                    if video_url and not _evidence_video_usable(evidence, video_url):
+                        existing, auto_false = await _apply_insufficient_evidence_false_alarm(db, row, existing)
+                        await db.commit()
+                        yield _sse(
+                            {
+                                "object": "assessment",
+                                "cached": False,
+                                "ai_queried": True,
+                                "source": "insufficient_evidence",
+                                "auto_false_alarm": auto_false,
+                                "status": (row.status or "").strip(),
+                                "assessment": _assessment_out(existing),
+                            }
+                        )
+                        return
+
+                    evidence = _drop_unreadable_evidence(evidence)
+                    if video_url and not _evidence_video_usable(evidence, video_url):
+                        existing, auto_false = await _apply_insufficient_evidence_false_alarm(db, row, existing)
+                        await db.commit()
+                        yield _sse(
+                            {
+                                "object": "assessment",
+                                "cached": False,
+                                "ai_queried": True,
+                                "source": "insufficient_evidence",
+                                "auto_false_alarm": auto_false,
+                                "status": (row.status or "").strip(),
+                                "assessment": _assessment_out(existing),
+                            }
+                        )
+                        return
+
+                    attempts = _violation_attempts(evidence)
+                    if not attempts:
+                        existing, auto_false = await _apply_insufficient_evidence_false_alarm(db, row, existing)
+                        await db.commit()
+                        yield _sse(
+                            {
+                                "object": "assessment",
+                                "cached": False,
+                                "ai_queried": True,
+                                "source": "insufficient_evidence",
+                                "auto_false_alarm": auto_false,
+                                "status": (row.status or "").strip(),
+                                "assessment": _assessment_out(existing),
+                            }
+                        )
+                        return
+
+                    last_error = ""
+                    deadline = agent_worker_client.video_call_deadline_sec()
+                    for kind, kwargs in attempts:
+                        kind_label = "视频" if kind == "video" else "抓拍图"
+                        yield _sse(
+                            {
+                                "object": "status",
+                                "stage": "video",
+                                "message": f"正在调用违章判定接口（{kind_label}）…",
+                            }
+                        )
+                        text_parts: list[str] = []
+                        v_result: dict[str, Any] | None = None
+                        agen = agent_worker_client.analyze_video_violation_stream(
+                            user_id=user_id,
+                            company=company,
+                            session_id=session_id,
+                            extra_fields=_alarm_extra_form_fields(row),
+                            **kwargs,
+                        )
+                        try:
+                            async for ev in _iterate_with_deadline(agen, deadline):
+                                obj = str(ev.get("object") or "")
+                                if obj == "delta":
+                                    if ev.get("type") == "text" and ev.get("text"):
+                                        text_parts.append(str(ev["text"]))
+                                        yield _sse(
+                                            {
+                                                "object": "content",
+                                                "type": "text",
+                                                "delta": True,
+                                                "text": ev["text"],
+                                            }
+                                        )
+                                    elif ev.get("type") == "tool_call":
+                                        name = str(ev.get("name") or "tool")
+                                        status = str(ev.get("status") or "")
+                                        tip = f"[{name} {status}]".strip()
+                                        yield _sse(
+                                            {
+                                                "object": "status",
+                                                "stage": "video",
+                                                "message": tip,
+                                            }
+                                        )
+                                elif obj == "complete":
+                                    if video_complete_failed(ev):
+                                        raise AgentWorkerError(
+                                            str(ev.get("analysis") or ev.get("conclusion") or "违章判定分析失败")
+                                        )
+                                    v_result = dict(ev)
+                                    v_result.pop("object", None)
+                                elif obj == "error":
+                                    raise AgentWorkerError(
+                                        str(ev.get("detail") or ev.get("message") or "违章判定失败")
+                                    )
+                        except TimeoutError:
+                            last_error = "AI 判定超时，已断开连接并释放资源"
+                            logger.warning("video/violation SSE 超时 kind=%s", kind)
+                            v_result = None
+                            yield _sse(
+                                {
+                                    "object": "status",
+                                    "stage": "video",
+                                    "message": last_error,
+                                }
                             )
-                except AgentWorkerError as exc:
-                    last_error = str(exc)
-                    logger.warning("video/violation SSE 失败 kind=%s: %s", kind, exc)
-                    v_result = None
-                    yield _sse(
-                        {
-                            "object": "status",
-                            "stage": "video",
-                            "message": f"{kind_label}判定失败：{exc}",
-                        }
-                    )
+                        except AgentWorkerError as exc:
+                            last_error = str(exc)
+                            logger.warning("video/violation SSE 失败 kind=%s: %s", kind, exc)
+                            v_result = None
+                            yield _sse(
+                                {
+                                    "object": "status",
+                                    "stage": "video",
+                                    "message": f"{kind_label}判定失败：{exc}",
+                                }
+                            )
 
-                if v_result is not None and _video_result_is_refusal(v_result):
-                    last_error = "违章判定返回拒答文案"
-                    logger.warning("流式 video/violation 拒答 kind=%s", kind)
-                    v_result = None
-                    yield _sse(
-                        {
-                            "object": "status",
-                            "stage": "video",
-                            "message": f"{kind_label}判定被拒答",
-                        }
-                    )
+                        if v_result is not None and _video_result_is_refusal(v_result):
+                            last_error = "违章判定返回拒答文案"
+                            logger.warning("流式 video/violation 拒答 kind=%s", kind)
+                            v_result = None
+                            yield _sse(
+                                {
+                                    "object": "status",
+                                    "stage": "video",
+                                    "message": f"{kind_label}判定被拒答",
+                                }
+                            )
 
-                if v_result is None:
-                    continue
+                        if v_result is None:
+                            continue
 
-                eval_text = _evaluation_from_video_result(v_result)
-                if not text_parts and eval_text:
-                    yield _sse(
-                        {
-                            "object": "content",
-                            "type": "text",
-                            "delta": True,
-                            "text": eval_text,
-                        }
-                    )
-                if _video_has_violation(v_result) is not False:
-                    yield _sse(
-                        {
-                            "object": "status",
-                            "stage": "disposition",
-                            "message": "正在判定处罚建议（罚款 / 警告 / 误报）…",
-                        }
-                    )
-                ticket_info = await _resolve_ticket_after_video(
-                    user_id=user_id,
-                    company=company,
-                    session_id=session_id,
-                    row=row,
-                    v_result=v_result,
-                )
-                existing, auto_false = await _save_assessment_from_video(
-                    db,
-                    row,
-                    existing,
-                    session_id=session_id,
-                    v_result=v_result,
-                    company=company,
-                    image_count=len(image_urls),
-                    ticket_info=ticket_info,
-                )
-                await db.commit()
-                yield _sse(
-                    {
-                        "object": "assessment",
-                        "cached": False,
-                        "ai_queried": True,
-                        "source": "video_violation",
-                        "auto_false_alarm": auto_false,
-                        "status": (row.status or "").strip(),
-                        "assessment": _assessment_out(existing),
-                    }
-                )
-                return
+                        eval_text = _evaluation_from_video_result(v_result)
+                        if not text_parts and eval_text:
+                            yield _sse(
+                                {
+                                    "object": "content",
+                                    "type": "text",
+                                    "delta": True,
+                                    "text": eval_text,
+                                }
+                            )
+                        if _video_has_violation(v_result) is not False:
+                            yield _sse(
+                                {
+                                    "object": "status",
+                                    "stage": "disposition",
+                                    "message": "正在判定处罚建议（罚款 / 警告 / 误报）…",
+                                }
+                            )
+                        ticket_info = await _resolve_ticket_after_video(
+                            user_id=user_id,
+                            company=company,
+                            session_id=session_id,
+                            row=row,
+                            v_result=v_result,
+                        )
+                        existing, auto_false = await _save_assessment_from_video(
+                            db,
+                            row,
+                            existing,
+                            session_id=session_id,
+                            v_result=v_result,
+                            company=company,
+                            image_count=len(image_urls),
+                            ticket_info=ticket_info,
+                        )
+                        await db.commit()
+                        yield _sse(
+                            {
+                                "object": "assessment",
+                                "cached": False,
+                                "ai_queried": True,
+                                "source": "video_violation",
+                                "auto_false_alarm": auto_false,
+                                "status": (row.status or "").strip(),
+                                "assessment": _assessment_out(existing),
+                            }
+                        )
+                        return
 
-            yield _sse({"object": "error", "message": f"违章判定失败：{last_error or '未知错误'}"})
+                    yield _sse({"object": "error", "message": f"违章判定失败：{last_error or '未知错误'}"})
+                finally:
+                    _release_evidence(evidence)
         except Exception as exc:  # noqa: BLE001
             logger.exception("流式 AI 评估失败 violation_id=%s", violation_id)
             await db.rollback()

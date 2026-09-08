@@ -25,6 +25,7 @@ from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from app.agent_worker_client import agent_worker_client
 from app.agent_worker_config import cached_runtime
@@ -36,6 +37,7 @@ from app.violation_ai_assessment import (
     AiRefusalError,
     backfill_ai_suggested_false_alarms,
     backfill_reset_refused_assessments,
+    is_unreadable_evidence_error,
     run_violation_ai_assessment,
 )
 from app.violation_filters import (
@@ -48,9 +50,10 @@ logger = logging.getLogger(__name__)
 # 固定参数：不读配置文件
 _USER_ID = "cesg_ai_scheduler"
 _BATCH_SIZE = 1
-_IDLE_SLEEP_WHEN_EMPTY_SEC = 10  # 仅「没有候选」时歇一下，有活干则连续跑
+_IDLE_SLEEP_WHEN_EMPTY_SEC = 10  # 仅「没有候选」时歇一下
+_ITEM_GAP_SEC = 2.0  # 两条之间让出事件循环，避免拖死选车/菜单接口
 _DEFER_NO_EVIDENCE_SEC = 1800
-_DEFER_ERROR_SEC = 300
+_DEFER_ERROR_SEC = 1800
 _DEFER_REFUSAL_SEC = 90  # 拒答后稍后再捞，避免一直占着最新队列
 _REFUSAL_OUTER_ATTEMPTS = 2  # 定时器侧整单再问几轮（每轮内部 chat 还会自重试）
 _REFUSAL_OUTER_DELAY_SEC = 2
@@ -245,7 +248,9 @@ async def run_violation_ai_assess_once() -> AiAssessRoundResult:
                     result.skipped_no_evidence += 1
                 else:
                     result.skipped_other += 1
-                violation_ai_assessment_scheduler.defer(vid, seconds=_DEFER_NO_EVIDENCE_SEC)
+                # 损坏证据已落 ai_queried，不再进队列；其余无证据再延后
+                if not out.get("ai_queried"):
+                    violation_ai_assessment_scheduler.defer(vid, seconds=_DEFER_NO_EVIDENCE_SEC)
             else:
                 result.assessed += 1
                 item["result"] = "assessed"
@@ -253,11 +258,33 @@ async def run_violation_ai_assess_once() -> AiAssessRoundResult:
                 if out.get("auto_false_alarm"):
                     item["auto_false_alarm"] = True
                     result.auto_false_alarm += 1
+        except IntegrityError as exc:
+            result.cached += 1
+            item["result"] = "exists"
+            item["reason"] = "评估记录已存在"
+            logger.info("自动 AI 评估已有记录 id=%s，跳过: %s", vid, exc)
         except HTTPException as exc:
             result.errors += 1
             item["result"] = "error"
             item["reason"] = str(exc.detail)
-            violation_ai_assessment_scheduler.defer(vid, seconds=_DEFER_ERROR_SEC)
+            if is_unreadable_evidence_error(str(exc.detail)):
+                try:
+                    async with AsyncSessionLocal() as db:
+                        broken = await db.scalar(
+                            select(VehicleViolation).where(VehicleViolation.id == vid).limit(1)
+                        )
+                        if broken is not None:
+                            broken.ai_queried = True
+                            await db.commit()
+                    item["result"] = "skipped"
+                    item["reason"] = "证据损坏，已跳过"
+                    result.skipped_no_evidence += 1
+                    result.errors -= 1
+                except Exception as mark_exc:  # noqa: BLE001
+                    logger.warning("标记损坏证据失败 id=%s: %s", vid, mark_exc)
+                    violation_ai_assessment_scheduler.defer(vid, seconds=_DEFER_ERROR_SEC)
+            else:
+                violation_ai_assessment_scheduler.defer(vid, seconds=_DEFER_ERROR_SEC)
             logger.warning("自动 AI 评估 HTTP 失败 id=%s: %s", vid, exc.detail)
         except Exception as exc:  # noqa: BLE001
             result.errors += 1
@@ -391,9 +418,11 @@ class ViolationAiAssessmentScheduler:
                 # 异常时稍歇，避免死循环刷日志
                 await asyncio.sleep(2)
                 continue
-            # 有候选并已处理完：立刻下一条；没有候选才歇一下
+            # 有候选：两条之间让出事件循环，避免拖死选车/切菜单
             if result.scanned <= 0:
                 await asyncio.sleep(_IDLE_SLEEP_WHEN_EMPTY_SEC)
+            else:
+                await asyncio.sleep(_ITEM_GAP_SEC)
 
 
 violation_ai_assessment_scheduler = ViolationAiAssessmentScheduler()

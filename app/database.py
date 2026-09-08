@@ -150,6 +150,10 @@ async def init_models() -> None:
                 await conn.exec_driver_sql(
                     "ALTER TABLE private_map_rule ADD COLUMN park_stop_limit_minutes INTEGER DEFAULT 0"
                 )
+            if "road_type_name" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE private_map_rule ADD COLUMN road_type_name VARCHAR(64) DEFAULT '高速公路'"
+                )
             cols = await conn.exec_driver_sql("PRAGMA table_info(vehicle_violation)")
             names = {row[1] for row in cols.fetchall()}
             if names:
@@ -227,9 +231,18 @@ async def init_models() -> None:
                     ("dpf_pressure_high_threshold", "NUMERIC(10, 2)"),
                     ("scr_downstream_abnormal_threshold", "NUMERIC(10, 2)"),
                     ("nox_abnormal_threshold", "NUMERIC(10, 2)"),
+                    ("jt808_sync_status", "VARCHAR(16) DEFAULT 'pending'"),
+                    ("jt808_sync_old_device_no", "VARCHAR(64)"),
+                    ("jt808_sync_error", "VARCHAR(256)"),
+                    ("jt808_sync_try_count", "INTEGER DEFAULT 0"),
+                    ("jt808_sync_at", "DATETIME"),
                 ):
                     if col_name not in names:
                         await conn.exec_driver_sql(f"ALTER TABLE vehicle ADD COLUMN {col_name} {col_type}")
+                await conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_vehicle_jt808_sync_status "
+                    "ON vehicle(jt808_sync_status)"
+                )
             cols = await conn.exec_driver_sql("PRAGMA table_info(vehicle_device)")
             names = {row[1] for row in cols.fetchall()}
             if names and "channels" not in names:
@@ -393,6 +406,7 @@ async def init_models() -> None:
                 ("company_name", "VARCHAR(128) NULL"),
                 ("fleet_name", "VARCHAR(128) NULL"),
                 ("park_stop_limit_minutes", "INTEGER NOT NULL DEFAULT 0"),
+                ("road_type_name", "VARCHAR(64) NOT NULL DEFAULT '高速公路'"),
             ):
                 try:
                     exists = await conn.exec_driver_sql(

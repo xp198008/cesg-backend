@@ -1,4 +1,4 @@
-"""本地验证：车辆批量导入模板 → 落库 → 触发 jt808 upsert_now。
+"""本地验证：车辆批量导入模板 → 落库 → 标 jt808_sync_status=pending。
 
 用法（在 backend 目录）：
   python scripts/verify_vehicle_import.py
@@ -109,13 +109,13 @@ async def main() -> int:
         assert result["imported"] == 1, result
         assert result["updated"] == 0, result
         assert result["skipped"] == 0, result
-        assert result["jt808_sync_ok"] == 1, result
-        assert len(sync_calls) == 1 and sync_calls[0][0] > 0
-        print("[ok] import + 808 upsert called:", sync_calls[0])
+        assert result.get("jt808_queued") == 1, result
+        print("[ok] import queued for 808 sync")
 
         async with Session() as db:
             v = await db.scalar(select(Vehicle).where(Vehicle.plate_no == plate).limit(1))
             assert v is not None
+            assert (v.jt808_sync_status or "") == "pending"
             assert v.company_id == company_id
             assert v.fleet_id is not None
             assert v.vin == "LSVTESTVIN0000001"

@@ -240,6 +240,12 @@ class Vehicle(Base):
     created_by = Column(Integer)
     created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
+    # 808 档案同步：有改动立刻标 pending，定时器只扫非 success；808 成功后改 success
+    jt808_sync_status = Column(String(16), default="pending", server_default="pending", index=True)
+    jt808_sync_old_device_no = Column(String(64), nullable=True)
+    jt808_sync_error = Column(String(256), nullable=True)
+    jt808_sync_try_count = Column(Integer, default=0, server_default="0")
+    jt808_sync_at = Column(DateTime, nullable=True)
 
     company = relationship("OrgCompany", backref="vehicles")
     fleet = relationship("Fleet", backref="vehicles")
@@ -389,6 +395,19 @@ class FaultTypeDict(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
 
+class RoadTypeDict(Base):
+    """基础数据：道路类型字典，供公用限速等业务选用。"""
+
+    __tablename__ = "road_type_dict"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    type_code = Column(String(32), nullable=False, unique=True, index=True)
+    type_name = Column(String(64), nullable=False, unique=True, index=True)
+    description = Column(Text, nullable=True)
+    sort_order = Column(Integer, nullable=False, server_default="0", default=0)
+    created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
+
+
 class VehicleLocation(Base):
     """车辆实时位置快照，供主动安全处理弹窗地图定位等场景使用。"""
 
@@ -520,6 +539,7 @@ class PrivateMapRule(Base):
     # 所属公司/车队名称快照（与车辆列表同一套组织树解析；无值时列表显示 -）
     company_name = Column(String(128), nullable=True)
     fleet_name = Column(String(128), nullable=True)
+    road_type_name = Column(String(64), nullable=False, server_default="高速公路", default="高速公路")
     remark = Column(String(255))
     created_by = Column(Integer, nullable=True, index=True)
     created_by_name = Column(String(64), nullable=True)

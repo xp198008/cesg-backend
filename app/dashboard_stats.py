@@ -181,7 +181,9 @@ async def build_home_stats(db: AsyncSession, x_org_id: str | None) -> dict:
 # ---------------------------------------------------------------------------
 
 _FAULT_LEVEL_MAP = {"高": "一级故障", "中": "二级故障", "低": "三级故障"}
-_HANDLED_VIOLATION_STATUSES = ("已处理", "误报")
+# 看板「已处理」只计正式办结；误报不展示、不参与分类与今日汇总
+_HANDLED_VIOLATION_STATUSES = ("已处理",)
+_FALSE_ALARM_STATUS = "误报"
 
 
 def _fmt_dt(value, fmt: str = "%H:%M:%S") -> str:
@@ -220,7 +222,7 @@ async def _board_warnings(db: AsyncSession, scope, now: datetime, filter_rules) 
     visibility = violation_list_visibility(filter_rules)
 
     def scoped(q):
-        q = q.where(visibility)
+        q = q.where(visibility, VehicleViolation.status != _FALSE_ALARM_STATUS)
         if scope is not None:
             q = q.where(scope)
         return q
@@ -479,8 +481,8 @@ async def _board_energy(db: AsyncSession, scoped_company_ids: set[int] | None) -
     """油/电耗统计（OBD 队列落库部分）。
 
     oil.fuel：OBD fdjrlll(L/h) 积分估算的当日累计油耗；前端优先用 808 1253/1169。
-    oil.mileage：各车最新 bclc（本次点火行程）之和，仅供参考，不可作百公里油耗分母；
-    百公里油耗由前端用 808 日里程(1121) 计算。
+    oil.mileage：OBD 当日累计行驶（bclc 按点火段累加）。现网 1253 未实现、1121 常只有少数车上数，
+    前端在 808 油耗缺失时用这组油/里程算百公里，禁止 OBD 全队油 ÷ 残缺的 1121 里程。
     """
     today = china_now_naive().strftime("%Y%m%d")
     days_7: list[str] = []
@@ -502,7 +504,7 @@ async def _board_energy(db: AsyncSession, scoped_company_ids: set[int] | None) -
         except Exception:  # noqa: BLE001
             today_rows = []
         today_fuel = sum(float(r[0] or 0) for r in today_rows)
-        # bclc 为本次点火行程，多车相加不等于今日行驶里程；不据此算 per100
+        # mileage 已按日累加点火增量（跨日从 0 起），可作 OBD 兜底分母
         today_mileage = sum(float(r[1] or 0) for r in today_rows)
 
         # 近 7 日走势：每日 sum(fuel)

@@ -38,6 +38,7 @@ from app.jt808_alarm_sync import (
 from app.obd_speed_monitor import obd_speed_scheduler
 from app.park_alarm_scheduler import park_alarm_scheduler
 from app.redis_queue_consumer import redis_queue_scheduler
+from app.vehicle_jt808_sync import vehicle_jt808_sync_scheduler
 from app.violation_ai_assessment_scheduler import violation_ai_assessment_scheduler
 from app.routers import (
     api_ai,
@@ -59,6 +60,7 @@ from app.routers import (
     api_permission_menu,
     api_repair,
     api_risk_profile,
+    api_road_type,
     api_role,
     api_route_plan,
     api_shortcut,
@@ -132,6 +134,7 @@ app.include_router(api_vehicle_type.router)
 app.include_router(api_driver.router)
 app.include_router(api_alarm_type.router)
 app.include_router(api_fault_type.router)
+app.include_router(api_road_type.router)
 app.include_router(api_jt808_alarm_sync.router)
 app.include_router(api_map_rules.router)
 app.include_router(api_map_grasp.router)
@@ -270,6 +273,8 @@ async def _background_startup_backfill() -> None:
     await asyncio.sleep(1)
     from app.database import AsyncSessionLocal
     from app.user_online_daily import backfill_login_log_org_names, rebuild_daily_from_login_logs
+    from app.obd_speed_monitor import backfill_abnormal_obd_speed_false_alarms
+    from app.violation_ai_assessment import backfill_insufficient_evidence_false_alarms
     from app.violation_risk_backfill import backfill_violation_risk_levels
 
     try:
@@ -284,6 +289,50 @@ async def _background_startup_backfill() -> None:
                 logger.info("已重建 %s 条登录会话的用户按日在线记录", rebuilt)
     except Exception as exc:  # noqa: BLE001
         logger.warning("启动后台回填失败: %s", exc)
+
+    try:
+        total = 0
+        before_id = None
+        for _ in range(80):
+            async with AsyncSessionLocal() as s:
+                n, before_id, scanned = await backfill_insufficient_evidence_false_alarms(
+                    s, limit=400, before_id=before_id
+                )
+                await s.commit()
+            total += n
+            if scanned <= 0:
+                break
+            await asyncio.sleep(0.2)
+        if total:
+            logger.info("启动回填：证据不足已按误报处理 %s 条", total)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("启动回填证据不足误报失败: %s", exc)
+
+    try:
+        total = 0
+        before_id = None
+        for _ in range(80):
+            async with AsyncSessionLocal() as s:
+                n, before_id, scanned = await backfill_abnormal_obd_speed_false_alarms(
+                    s, limit=400, before_id=before_id
+                )
+                await s.commit()
+            total += n
+            if scanned <= 0:
+                break
+            await asyncio.sleep(0.2)
+        if total:
+            logger.info("启动回填：OBD 时速异常已按误报处理 %s 条", total)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("启动回填 OBD 时速异常误报失败: %s", exc)
+
+    if settings.violation_ai_assess_auto_enabled:
+        try:
+            violation_ai_assessment_scheduler.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("安全报警自动 AI 评估未启用: %s", exc)
+    else:
+        logger.info("安全报警自动 AI 评估未启动（violation_ai_assess_auto_enabled=0）")
 
 
 @app.on_event("startup")
@@ -326,12 +375,15 @@ async def _startup() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("启动同步 Web 服务 Key 失败: %s", exc)
     await api_vehicle_type.ensure_default_vehicle_types()
+    await api_road_type.ensure_default_road_types()
+    try:
+        from app.permission_bootstrap import grant_road_type_permission
+
+        await grant_road_type_permission()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("补发道路类型维护权限失败: %s", exc)
     jt808_alarm_scheduler.start()
     obd_speed_scheduler.start()
-    try:
-        violation_ai_assessment_scheduler.start()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("安全报警自动 AI 评估未启用: %s", exc)
     try:
         from app.address_backfill_scheduler import address_backfill_scheduler
 
@@ -343,6 +395,10 @@ async def _startup() -> None:
         park_alarm_scheduler.start()
     except Exception as exc:  # noqa: BLE001
         logger.warning("停车超限报警调度未启用: %s", exc)
+    try:
+        vehicle_jt808_sync_scheduler.start()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("车辆 808 同步调度未启用: %s", exc)
     try:
         from app.amap_web_service_key import get_stored_web_service_key
         from app.database import AsyncSessionLocal
@@ -382,6 +438,10 @@ async def _shutdown() -> None:
     await redis_queue_scheduler.stop()
     try:
         await park_alarm_scheduler.stop()
+    except Exception:
+        pass
+    try:
+        await vehicle_jt808_sync_scheduler.stop()
     except Exception:
         pass
 

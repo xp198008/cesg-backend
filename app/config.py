@@ -70,6 +70,8 @@ class Settings(BaseSettings):
     obd_redis_key_pattern: str = "*_OBD"
     # 时速低于该值（km/h）不处理
     obd_min_speed_kmh: float = 10.0
+    # 时速高于该值（km/h）视为 OBD/GPS 毛刺，按误报处理、不进待处理
+    obd_max_speed_kmh: float = 120.0
     # OBD 读数 / 坐标快照超过该秒数视为过期，跳过判定
     obd_stale_seconds: int = 300
     # 限速折线的命中缓冲带（米）：车距折线多远内算"在该路段上"
@@ -98,6 +100,9 @@ class Settings(BaseSettings):
     # 故障记录保留时长（小时），超时自动清理
     redis_queue_fault_ttl_hours: int = 72
 
+    # 自动 AI 评估与网页同进程：只评「3张图+1段有效视频」，超时会释放连接
+    violation_ai_assess_auto_enabled: bool = True
+
     # ---- Agent Worker AI（docs/AI.PDF）----
     agent_worker_base_url: str = "http://113.207.68.94:5002"
     agent_worker_api_key: str = ""
@@ -108,6 +113,11 @@ class Settings(BaseSettings):
     # ---- 车辆风险画像（docs/2.pdf，周报；月报官方不可用时由周报拼接）----
     risk_api_base_url: str = "http://113.207.68.94:8000"
     risk_api_timeout: float = 20.0
+
+    # ---- 车辆档案 → 808：改车辆只标 pending，定时器扫非 success 再调 1251 ----
+    vehicle_jt808_sync_enabled: bool = True
+    vehicle_jt808_sync_interval_seconds: int = 10
+    vehicle_jt808_sync_batch_size: int = 20
 
     # ---- 通天星 CMS（queryUserVehicle：同步车牌 / 设备号）----
     tongtianxing_base_url: str = ""

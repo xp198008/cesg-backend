@@ -19,6 +19,8 @@ from app.models import (
     SysUser,
     Vehicle,
 )
+from app.jt808_alarm_sync import _vehicle_by_plate, _vehicle_by_terminal
+from app.obd_speed_monitor import resolve_vehicle_rule_speed
 from app.vehicle_alloc_scope import parse_user_id_header
 
 router = APIRouter(prefix="/api", tags=["map-rules"])
@@ -315,6 +317,14 @@ async def public_map_rule_delete(rid: int, db: AsyncSession = Depends(get_db)):
     return {"ok": True}
 
 
+DEFAULT_ROAD_TYPE_NAME = "高速公路"
+
+
+def _normalize_road_type_name(raw: str | None) -> str:
+    text = (raw or "").strip()
+    return text[:64] if text else DEFAULT_ROAD_TYPE_NAME
+
+
 class PrivateMapRuleCreateBody(BaseModel):
     rule_code: str = Field(..., min_length=1, max_length=64)
     rule_name: str = Field(..., min_length=1, max_length=200)
@@ -324,6 +334,7 @@ class PrivateMapRuleCreateBody(BaseModel):
     speed_limit_kmh: int = Field(0, ge=0, le=500)
     ref_public_rule_id: int | None = None
     fleet_name: str | None = Field(None, max_length=128)
+    road_type_name: str | None = Field(None, max_length=64)
     remark: str | None = Field(None, max_length=255)
 
 
@@ -334,6 +345,7 @@ class PrivateMapRuleUpdateBody(BaseModel):
     speed_limit_kmh: int | None = Field(None, ge=0, le=500)
     ref_public_rule_id: int | None = None
     fleet_name: str | None = Field(None, max_length=128)
+    road_type_name: str | None = Field(None, max_length=64)
     remark: str | None = Field(None, max_length=255)
 
 
@@ -359,6 +371,7 @@ def _private_rule_out(row: PrivateMapRule) -> dict:
         ),
         "company_name": (getattr(row, "company_name", None) or "").strip() or None,
         "fleet_name": (getattr(row, "fleet_name", None) or "").strip() or None,
+        "road_type_name": _normalize_road_type_name(getattr(row, "road_type_name", None)),
         "remark": row.remark,
         "created_by": row.created_by,
         "created_by_name": row.created_by_name,
@@ -420,6 +433,43 @@ async def private_map_rules_list(
 @router.get("/private-map-rules/weather-type-options")
 async def private_map_rule_weather_type_options():
     return {"ok": True, "items": WEATHER_TYPE_OPTIONS}
+
+
+@router.get("/private-map-rules/resolve-at")
+async def private_map_rules_resolve_at(
+    lng: float = Query(..., description="经度"),
+    lat: float = Query(..., description="纬度"),
+    plate_no: str | None = Query(None),
+    device_no: str | None = Query(None),
+    vehicle_id: int | None = Query(None),
+    weather: str | None = Query(None, description="实况天气文案，可选"),
+    coord: str | None = Query("wgs84"),
+    db: AsyncSession = Depends(get_db),
+):
+    """实时监控气泡：按车辆当前位置命中已分配地图规则，重叠走优先级。"""
+    vehicle = None
+    if vehicle_id:
+        vehicle = await db.scalar(select(Vehicle).where(Vehicle.id == int(vehicle_id)).limit(1))
+    if vehicle is None and (device_no or "").strip():
+        vehicle = await _vehicle_by_terminal(db, device_no)
+    if vehicle is None and (plate_no or "").strip():
+        vehicle = await _vehicle_by_plate(db, plate_no)
+    if vehicle is None:
+        return {
+            "ok": True,
+            "hit": False,
+            "speed_limit_kmh": None,
+            "message": "未匹配到车辆档案",
+        }
+    data = await resolve_vehicle_rule_speed(
+        db,
+        vehicle=vehicle,
+        lng=float(lng),
+        lat=float(lat),
+        coord_is_wgs84=str(coord or "wgs84").strip().lower() != "gcj02",
+        weather_text=weather,
+    )
+    return {"ok": True, "vehicle_id": vehicle.id, "plate_no": vehicle.plate_no, **data}
 
 
 class MapRuleCategoryCreateBody(BaseModel):
@@ -990,6 +1040,7 @@ async def private_map_rule_create(
         ref_public_rule_id=body.ref_public_rule_id,
         company_name=company_name,
         fleet_name=fleet_name,
+        road_type_name=_normalize_road_type_name(body.road_type_name),
         remark=(body.remark or "").strip() or None,
         created_by=creator_id,
         created_by_name=await _resolve_creator_name(db, creator_id),
@@ -1029,6 +1080,8 @@ async def private_map_rule_update(
         # 改车队时同步按当前组织重算所属公司（与车辆列表一致）
         company_name, _ = await _resolve_company_fleet_names(db, cid)
         row.company_name = company_name
+    if "road_type_name" in data:
+        row.road_type_name = _normalize_road_type_name(body.road_type_name)
     if "remark" in data:
         row.remark = (body.remark or "").strip() or None
     await db.flush()
@@ -1097,6 +1150,7 @@ async def private_map_rules_batch_from_public(
                 category_ids=[],
                 company_name=company_name,
                 fleet_name=fleet_name,
+                road_type_name=DEFAULT_ROAD_TYPE_NAME,
                 remark=pub.remark,
                 created_by=creator_id,
                 created_by_name=creator_name,

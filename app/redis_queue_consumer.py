@@ -213,6 +213,78 @@ def _flow_from_raw(raw: str | None) -> float | None:
         return None
 
 
+def _last_bclc(existing: ObdEnergySnapshot | None) -> float | None:
+    if existing is None or not existing.raw:
+        return None
+    try:
+        return _to_float(json.loads(existing.raw).get("bclc"))
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return None
+
+
+def _accumulate_day_km(
+    existing: ObdEnergySnapshot | None,
+    new_bclc: float | None,
+) -> float | None:
+    """把 OBD「本次点火里程」累成当日行驶公里。
+
+    bclc 是本次点火累计，跨日不会自己清零。新的一天必须从 0 起，只加今天的增量；
+    否则会把昨天的行程带进今日分母，看板里程偏大、百公里油耗偏低。
+    """
+    if new_bclc is None:
+        return float(existing.mileage) if existing and existing.mileage is not None else None
+    if existing is None:
+        return 0.0
+    acc = float(existing.mileage or 0)
+    last = _last_bclc(existing)
+    if last is None:
+        return round(acc, 3)
+    if new_bclc + 0.01 >= last:
+        return round(acc + (new_bclc - last), 3)
+    return round(acc + new_bclc, 3)
+
+
+async def repair_obd_cross_day_mileage(db: AsyncSession) -> int:
+    """扣掉已写入今日快照的昨天点火里程（只修 leftover 被整段带进来的车）。"""
+    today = china_now_naive().strftime("%Y%m%d")
+    yest = (china_now_naive() - timedelta(days=1)).strftime("%Y%m%d")
+    rows = (
+        await db.execute(select(ObdEnergySnapshot).where(ObdEnergySnapshot.day == today))
+    ).scalars().all()
+    n = 0
+    for row in rows:
+        if not row.device_no:
+            continue
+        yest_row = await db.scalar(
+            select(ObdEnergySnapshot).where(
+                ObdEnergySnapshot.device_no == row.device_no,
+                ObdEnergySnapshot.day == yest,
+                ObdEnergySnapshot.energy_type == row.energy_type,
+            )
+        )
+        leftover = _last_bclc(yest_row)
+        acc = float(row.mileage or 0)
+        if leftover is None or leftover < 30:
+            continue
+        if acc + 0.01 < leftover:
+            continue
+        new_acc = round(max(0.0, acc - leftover), 3)
+        if abs(new_acc - acc) < 0.05:
+            continue
+        logger.info(
+            "跨日里程去重 device=%s %s→%s（扣除昨天点火里程 %s）",
+            row.device_no,
+            acc,
+            new_acc,
+            leftover,
+        )
+        row.mileage = new_acc
+        n += 1
+    if n:
+        await db.flush()
+    return n
+
+
 def _accumulate_oil_fuel(
     existing: ObdEnergySnapshot | None,
     new_flow: float | None,
@@ -255,7 +327,7 @@ async def _handle_obd(db: AsyncSession, data: dict, raw_text: str, energy_type: 
         fuel = explicit if explicit is not None else _accumulate_oil_fuel(existing, flow, report_time)
     else:
         fuel = _to_float(_pick(data, _POWER_KEYS))
-    mileage = _to_float(_pick(data, _MILEAGE_KEYS))
+    mileage = _accumulate_day_km(existing, _to_float(_pick(data, _MILEAGE_KEYS)))
 
     # 同设备同日同类型 upsert（SQLite ON CONFLICT）
     values = {
@@ -478,6 +550,14 @@ class RedisQueueScheduler:
 
     async def _loop(self) -> None:
         logger.info("Redis 队列消费调度已启动")
+        try:
+            async with AsyncSessionLocal() as db:
+                n = await repair_obd_cross_day_mileage(db)
+                await db.commit()
+            if n:
+                logger.info("启动已扣除 %s 条跨日未清零的今日里程", n)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("启动回修跨日里程失败: %s", exc)
         while self._running:
             try:
                 await self.run_once()

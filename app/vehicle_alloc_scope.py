@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -126,7 +127,7 @@ async def _build_monitor_scope_payload(
     for dev in device_rows:
         device_nos.update(_normalize_device_no(str(dev) if dev is not None else ""))
     device_list = sorted(device_nos)
-    car_ids = _lookup_jt808_car_ids(plates, device_list)
+    car_ids = await asyncio.to_thread(_lookup_jt808_car_ids, plates, device_list)
     return {
         "scoped": not unrestricted,
         "plates": plates,

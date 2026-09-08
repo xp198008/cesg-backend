@@ -2,7 +2,8 @@
 
 数据链路：
 1. 车辆 OBD 上报 → Redis Key ``{设备号}_OBD``（JSON：时速/总里程/时间戳）
-2. 定时器 SCAN 读取全部 OBD Key，只处理时速 > 阈值（默认 10 km/h）的车辆
+2. 定时器 SCAN 读取全部 OBD Key，只处理时速 > 下限（默认 10 km/h）且 ≤ 上限（默认 120 km/h）的车辆
+   超过上限视为终端毛刺，不按超速落待处理，已入库的待处理记录回填为误报
 3. 设备号 → CESG 车辆（复用 JT808 同步的设备号变体匹配）
 4. 车辆坐标：与实时监控页同源——JT808 OpenAPI 1201 定位接口（WGS84），
    失败时兜底 vehicle_location 快照
@@ -78,6 +79,121 @@ SOURCE_OBD_SPEED = "obd_speed"
 OBD_VIOLATION_TYPE_NAME = "OBD超速"
 # 改名前旧类型名，间隔闸门一并计入，避免 5 分钟内再出一条
 OBD_VIOLATION_TYPE_ALIASES = ("OBD超速", "OBD限速路段超速", "OBD区域超速")
+_ABNORMAL_SPEED_HANDLER = "系统自动判定"
+_PREVIEW_SPEED_KEYS = ("obd_speed_kmh", "start_speed_kmh", "end_speed_kmh", "peak_speed_kmh")
+
+
+def abnormal_obd_speed_limit_kmh() -> float:
+    return float(getattr(settings, "obd_max_speed_kmh", 120.0) or 120.0)
+
+
+def is_abnormal_obd_speed(speed: float | int | None) -> bool:
+    if speed is None or speed == "":
+        return False
+    try:
+        return float(speed) > abnormal_obd_speed_limit_kmh()
+    except (TypeError, ValueError):
+        return False
+
+
+def _speed_text(speed: float) -> str:
+    return str(int(speed)) if float(speed).is_integer() else str(round(float(speed), 1))
+
+
+def _abnormal_speed_remark(speed: float) -> str:
+    limit = int(abnormal_obd_speed_limit_kmh())
+    return f"OBD 时速异常（{_speed_text(speed)} km/h > {limit}），系统自动判定为误报"
+
+
+def _session_peak_speed(session: Any) -> float:
+    values = []
+    for raw in (
+        getattr(session, "peak_speed", None),
+        getattr(session, "start_speed", None),
+        getattr(session, "end_speed", None),
+    ):
+        try:
+            if raw is not None and raw != "":
+                values.append(float(raw))
+        except (TypeError, ValueError):
+            continue
+    return max(values) if values else 0.0
+
+
+def _session_has_abnormal_speed(session: Any) -> bool:
+    return is_abnormal_obd_speed(_session_peak_speed(session))
+
+
+def _preview_speed_values(raw: str | None) -> list[float]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    out: list[float] = []
+    for key in _PREVIEW_SPEED_KEYS:
+        try:
+            value = data.get(key)
+            if value is not None and value != "":
+                out.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    snap = data.get("obd_snapshot")
+    if isinstance(snap, dict):
+        try:
+            value = snap.get("speed")
+            if value is not None and value != "":
+                out.append(float(value))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _mark_abnormal_speed_false_alarm(row: VehicleViolation, speed: float) -> None:
+    row.status = "误报"
+    row.pre_audit_kind = "false_alarm"
+    row.handler_name = _ABNORMAL_SPEED_HANDLER
+    row.handler_remark = _abnormal_speed_remark(speed)
+    row.handled_at = china_now_naive()
+
+
+async def backfill_abnormal_obd_speed_false_alarms(
+    db: AsyncSession,
+    *,
+    limit: int = 400,
+    before_id: int | None = None,
+) -> tuple[int, int | None, int]:
+    """把待处理且 OBD 时速 > 120 的记录按误报落库。"""
+    stmt = select(VehicleViolation).where(
+        VehicleViolation.status == "待处理",
+        VehicleViolation.source == SOURCE_OBD_SPEED,
+    )
+    if before_id is not None:
+        stmt = stmt.where(VehicleViolation.id < int(before_id))
+    rows = (
+        await db.execute(stmt.order_by(VehicleViolation.id.desc()).limit(max(1, int(limit))))
+    ).scalars().all()
+    n = 0
+    min_id: int | None = before_id
+    for row in rows:
+        min_id = int(row.id)
+        speeds = _preview_speed_values(row.raw_preview)
+        if not speeds:
+            continue
+        peak = max(speeds)
+        if not is_abnormal_obd_speed(peak):
+            continue
+        _mark_abnormal_speed_false_alarm(row, peak)
+        n += 1
+    if n:
+        await db.flush()
+        logger.info("回填 OBD 时速异常 → 误报：本批 %s 条", n)
+    return n, min_id, len(rows)
+
+
 _WEATHER_CODE_LABEL = {str(x["code"]): str(x["label"]) for x in WEATHER_TYPE_OPTIONS}
 
 # 即时通知冷却：同车两次语音下发至少间隔（秒），避免临界限速抖动刷屏
@@ -395,18 +511,127 @@ def rule_priority_rank(h: RuleHit) -> int:
     return 1 if h.is_speed_rule else 3
 
 
-def arbitrate(hits: list[RuleHit]) -> RuleHit | None:
+def arbitrate(hits: list[RuleHit], *, stable: bool = False) -> RuleHit | None:
     """重叠命中时挑一条生效规则：
 
     1. 四档线性：纯私有折线 > 继承集团折线 > 纯私有范围 > 继承集团范围
        （圆/矩形/多边形同属范围档）
-    2. 同档多条命中时随机取一条
+    2. 同档多条命中：监测随机取一条；界面展示按规则 id 稳定取一条，避免气泡闪烁
     """
     if not hits:
         return None
     best_rank = min(rule_priority_rank(h) for h in hits)
     top = [h for h in hits if rule_priority_rank(h) == best_rank]
+    if stable:
+        return min(top, key=lambda h: (int(h.rule.id or 0), int(h.category.id or 0)))
     return random.choice(top)
+
+
+async def _load_candidates_for_vehicle(db: AsyncSession, vehicle_id: int) -> list[RuleHit]:
+    """只加载已分配给该车的类别及其绑定规则（与监测同一套分配关系）。"""
+    categories = (await db.execute(select(MapRuleCategory))).scalars().all()
+    matched_cats: list[MapRuleCategory] = []
+    for cat in categories:
+        ids = cat.assigned_vehicle_ids if isinstance(cat.assigned_vehicle_ids, list) else []
+        for vid in ids:
+            try:
+                if int(vid) == int(vehicle_id):
+                    matched_cats.append(cat)
+                    break
+            except (TypeError, ValueError):
+                continue
+    if not matched_cats:
+        return []
+    cat_ids = {int(c.id) for c in matched_cats}
+    cat_by_id = {int(c.id): c for c in matched_cats}
+    rules = (await db.execute(select(PrivateMapRule))).scalars().all()
+    weather_rows = (await db.execute(select(PrivateMapRuleWeather))).scalars().all()
+    weather_by_id = {int(wr.id): wr for wr in weather_rows}
+    out: list[RuleHit] = []
+    for rule in rules:
+        rule_cat_ids: set[int] = set()
+        raw_ids = rule.category_ids if isinstance(rule.category_ids, list) else []
+        for cid in raw_ids:
+            try:
+                rule_cat_ids.add(int(cid))
+            except (TypeError, ValueError):
+                continue
+        matched = rule_cat_ids & cat_ids
+        if not matched:
+            continue
+        cat = cat_by_id.get(next(iter(matched)))
+        if cat is None:
+            continue
+        weather_rule_row = weather_by_id.get(int(cat.weather_rule_id)) if cat.weather_rule_id else None
+        limit = effective_limit_kmh(rule, cat, "sunny", weather_rule_row=weather_rule_row)
+        if limit <= 0:
+            continue
+        out.append(RuleHit(rule=rule, category=cat, limit_kmh=limit, weather_rule_row=weather_rule_row))
+    return out
+
+
+async def resolve_vehicle_rule_speed(
+    db: AsyncSession,
+    *,
+    vehicle: Vehicle,
+    lng: float,
+    lat: float,
+    coord_is_wgs84: bool = True,
+    weather_text: str | None = None,
+    weather_type_code: str | None = None,
+) -> dict[str, Any]:
+    """按车辆当前位置命中用户已分配的地图规则，重叠时走同一套优先级。"""
+    candidates = await _load_candidates_for_vehicle(db, int(vehicle.id))
+    empty = {
+        "hit": False,
+        "speed_limit_kmh": None,
+        "rule_id": None,
+        "rule_name": None,
+        "category_name": None,
+        "priority_rank": None,
+        "hit_count": 0,
+        "weather_type_code": None,
+    }
+    if not candidates:
+        return empty
+    if coord_is_wgs84:
+        lng_gcj, lat_gcj = wgs84_to_gcj02(float(lng), float(lat))
+    else:
+        lng_gcj, lat_gcj = float(lng), float(lat)
+    weather_code = (weather_type_code or "").strip().lower()
+    if not weather_code and (weather_text or "").strip():
+        weather_code = weather_text_to_type_code(weather_text)
+    if not weather_code:
+        weather_code = await _weather_code_at(float(lat), float(lng))
+    buffer_m = float(settings.obd_polyline_buffer_m)
+    hits: list[RuleHit] = []
+    for h in candidates:
+        if not geometry_hit(lng_gcj, lat_gcj, h.rule.draw_shape_type, h.rule.geometry_json, buffer_m):
+            continue
+        limit = h.limit_at_weather(weather_code)
+        if limit <= 0:
+            continue
+        hits.append(
+            RuleHit(
+                rule=h.rule,
+                category=h.category,
+                limit_kmh=limit,
+                weather_rule_row=h.weather_rule_row,
+            )
+        )
+    winner = arbitrate(hits, stable=True)
+    if winner is None:
+        return {**empty, "weather_type_code": weather_code, "hit_count": 0}
+    return {
+        "hit": True,
+        "speed_limit_kmh": int(winner.limit_kmh),
+        "rule_id": int(winner.rule.id) if winner.rule.id is not None else None,
+        "rule_name": (winner.rule.rule_name or "").strip() or None,
+        "category_name": (winner.category.type_name or "").strip() or None,
+        "priority_rank": rule_priority_rank(winner),
+        "hit_count": len(hits),
+        "weather_type_code": weather_code,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +643,7 @@ class ObdSyncResult:
     scanned_keys: int = 0
     parsed: int = 0
     skipped_low_speed: int = 0
+    skipped_abnormal_speed: int = 0
     skipped_stale: int = 0
     skipped_no_vehicle: int = 0
     skipped_no_position: int = 0
@@ -739,6 +965,10 @@ async def run_obd_speed_check_once() -> ObdSyncResult:
         if reading.speed_kmh <= min_speed:
             result.skipped_low_speed += 1
             continue
+        # 用户约定：时速 > 120 km/h 视为毛刺，不按超速处理
+        if is_abnormal_obd_speed(reading.speed_kmh):
+            result.skipped_abnormal_speed += 1
+            continue
         if reading.report_at is not None and now - reading.report_at > stale_after:
             result.skipped_stale += 1
             continue
@@ -936,6 +1166,8 @@ async def _persist_session_pair(session: OverspeedSession, *, reason: str) -> di
                 or derive_risk_level(OBD_VIOLATION_TYPE_NAME)
             )
             company_name = await lookup_company_name(db, session.company_id)
+            auto_false = _session_has_abnormal_speed(session)
+            peak_speed = _session_peak_speed(session)
             row = VehicleViolation(
                 biz_no=_stable_biz_no(ext_id, session.start_at),
                 external_alarm_id=ext_id,
@@ -986,17 +1218,29 @@ async def _persist_session_pair(session: OverspeedSession, *, reason: str) -> di
                     },
                     ensure_ascii=False,
                 ),
-                status="待处理",
+                status="误报" if auto_false else "待处理",
+                pre_audit_kind="false_alarm" if auto_false else None,
+                handler_name=_ABNORMAL_SPEED_HANDLER if auto_false else None,
+                handler_remark=_abnormal_speed_remark(peak_speed) if auto_false else None,
+                handled_at=china_now_naive() if auto_false else None,
             )
             db.add(row)
             await db.flush()
+            if auto_false:
+                logger.info(
+                    "OBD 时速异常自动误报: plate=%s peak=%s limit=%s ext_id=%s",
+                    session.plate_no,
+                    peak_speed,
+                    abnormal_obd_speed_limit_kmh(),
+                    ext_id,
+                )
             await notify_violation_created(db, row)
             await db.commit()
             out["local"] = True
         else:
             await db.rollback()
 
-    if schedule_flush_1303(session, reason=reason):
+    if not _session_has_abnormal_speed(session) and schedule_flush_1303(session, reason=reason):
         out["alarm_1303"] = True
     return out
 
@@ -1255,6 +1499,8 @@ async def _apply_session_pair_flush(
         result.session_closed = int(session_stats.get("closed") or 0)
         result.session_split = int(session_stats.get("split") or 0)
         for opened in just_opened:
+            if _session_has_abnormal_speed(opened):
+                continue
             schedule_instant_notify(opened)
         pushed = 0
         for session, reason in flushes:
@@ -1407,6 +1653,7 @@ class ObdSpeedScheduler:
             "interval_seconds": settings.obd_speed_check_interval_seconds,
             "redis": f"{settings.obd_redis_host}:{settings.obd_redis_port}/{settings.obd_redis_db}",
             "min_speed_kmh": settings.obd_min_speed_kmh,
+            "max_speed_kmh": abnormal_obd_speed_limit_kmh(),
             "push_1303_enabled": bool(getattr(settings, "obd_speed_push_1303_enabled", True)),
             "session_max_seconds": int(getattr(settings, "obd_speed_session_max_seconds", 900) or 900),
             "open_overspeed_sessions": open_session_count(),

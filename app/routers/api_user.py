@@ -161,6 +161,7 @@ class UserResetPasswordPayload(BaseModel):
 class UserSetPasswordPayload(BaseModel):
     user_id: int = Field(..., ge=1)
     password: str = Field(..., min_length=6, max_length=128)
+    old_password: str | None = Field(default=None, max_length=128)
 
 
 def _fmt_dt(dt: datetime | None) -> str:
@@ -487,15 +488,42 @@ async def user_credential(user_id: int, db: AsyncSession = Depends(get_db)):
     return {"ok": True, "text": f"{user.username}/{pwd_plain}"}
 
 
+def _password_matches(user: SysUser, password: str) -> bool:
+    pwd = (password or "").strip()
+    if not pwd:
+        return False
+    saved_hash = user.password_hash or ""
+    try:
+        if saved_hash and bcrypt.checkpw(pwd.encode("utf-8"), saved_hash.encode("utf-8")):
+            return True
+    except Exception:
+        pass
+    if saved_hash and not saved_hash.startswith("$2") and pwd == saved_hash:
+        return True
+    return bool((getattr(user, "password_plain", None) or "").strip() == pwd)
+
+
 @router.post("/set-password")
 async def user_set_password(
     payload: UserSetPasswordPayload,
     db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     user = await db.scalar(select(SysUser).where(SysUser.id == payload.user_id).limit(1))
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
+    actor_id = parse_user_id_header(x_user_id)
+    # 自己改自己（或请求未带操作人）必须校验旧密码；管理员给别人改密不要求。
+    admin_reset = actor_id is not None and int(actor_id) != int(payload.user_id)
+    old_pwd = (payload.old_password or "").strip()
     new_pwd = (payload.password or "").strip()
+    if not admin_reset:
+        if not old_pwd:
+            raise HTTPException(status_code=400, detail="请输入旧密码")
+        if not _password_matches(user, old_pwd):
+            raise HTTPException(status_code=400, detail="旧密码不正确")
+        if new_pwd == old_pwd:
+            raise HTTPException(status_code=400, detail="新密码不能与旧密码相同")
     if len(new_pwd) < 6:
         raise HTTPException(status_code=400, detail="密码至少6位")
     try:
@@ -597,12 +625,12 @@ async def user_logout(payload: UserLogoutPayload, request: Request, db: AsyncSes
             .limit(1)
         )
     if login_row is not None and login_row.logout_at is None:
-        await sync_login_session_to_daily(db, login_row)
+        await sync_login_session_to_daily(db, login_row, recompute=True)
         login_row.logout_at = logout_at
         _apply_online_seconds(login_row, payload.online_seconds)
         username = username or (login_row.username or "")
     elif login_row is not None:
-        await sync_login_session_to_daily(db, login_row)
+        await sync_login_session_to_daily(db, login_row, recompute=True)
         _apply_online_seconds(login_row, payload.online_seconds)
 
     # 单点：主动退出才注销 808；未退出则页内靠 8005 一直有效
@@ -638,7 +666,7 @@ async def user_session_heartbeat(payload: UserSessionHeartbeatPayload, db: Async
     # 非 finalize 心跳：若此前被 pagehide/visibility 误关闭，重新打开会话
     if login_row.logout_at is not None and not payload.finalize:
         login_row.logout_at = None
-    await sync_login_session_to_daily(db, login_row)
+    await sync_login_session_to_daily(db, login_row, recompute=bool(payload.finalize))
     _apply_online_seconds(login_row, payload.online_seconds)
     if payload.finalize and login_row.logout_at is None:
         login_row.logout_at = china_now_naive()

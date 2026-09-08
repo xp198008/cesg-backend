@@ -17,6 +17,9 @@ from app.agent_worker_config import cached_runtime, refresh_ai_worker_cache
 
 logger = logging.getLogger(__name__)
 
+# 不复用长连接，超时/取消后立刻把套接字还回去，避免 FD 堆死网页进程
+_HTTP_LIMITS = httpx.Limits(max_connections=4, max_keepalive_connections=0)
+
 
 class AgentWorkerError(RuntimeError):
     """Agent Worker 调用失败。"""
@@ -77,11 +80,23 @@ class AgentWorkerClient:
 
     def _timeout(self, runtime: dict[str, Any] | None = None) -> httpx.Timeout:
         sec = float((runtime or cached_runtime()).get("timeout_seconds") or 60)
-        return httpx.Timeout(sec, connect=min(10.0, sec))
+        return httpx.Timeout(sec, connect=min(10.0, sec), pool=10.0)
 
     def _video_timeout(self, runtime: dict[str, Any] | None = None) -> httpx.Timeout:
-        sec = float((runtime or cached_runtime()).get("video_timeout_seconds") or 600)
-        return httpx.Timeout(sec, connect=min(15.0, sec))
+        sec = float((runtime or cached_runtime()).get("video_timeout_seconds") or 180)
+        sec = max(30.0, min(sec, 180.0))
+        return httpx.Timeout(
+            sec,
+            connect=min(15.0, sec),
+            read=min(90.0, sec),
+            write=min(60.0, sec),
+            pool=10.0,
+        )
+
+    def video_call_deadline_sec(self, runtime: dict[str, Any] | None = None) -> float:
+        """单次判定硬超时：到点取消请求并释放连接，避免模型挂死拖垮本进程。"""
+        sec = float((runtime or cached_runtime()).get("video_timeout_seconds") or 180)
+        return max(30.0, min(sec, 180.0))
 
     async def _ensure_ready(self) -> dict[str, Any]:
         rt = await _runtime()
@@ -462,45 +477,56 @@ class AgentWorkerClient:
             raise AgentWorkerError("违章判定必须提供视频 file 或图片 images")
 
         headers = _auth_headers(user_id, company)
-        async with httpx.AsyncClient(timeout=self._video_timeout()) as client:
-            async with client.stream("POST", url, files=files, data=data, headers=headers) as resp:
-                if resp.status_code >= 400:
-                    body = await resp.aread()
-                    detail = body.decode("utf-8", "replace")
-                    try:
-                        j = json.loads(detail)
-                        if isinstance(j, dict) and j.get("detail") is not None:
-                            detail = str(j.get("detail"))
-                    except Exception:
-                        pass
-                    raise AgentWorkerError(detail or f"HTTP {resp.status_code}")
-
-                buffer = ""
-                async for chunk in resp.aiter_text():
-                    if not chunk:
-                        continue
-                    buffer += chunk
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.strip()
-                        if not line or line.startswith(":"):
-                            continue
-                        if line.startswith("data:"):
-                            payload = line[5:].strip()
-                        else:
-                            payload = line
-                        if not payload or payload == "[DONE]":
-                            continue
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._video_timeout(),
+                limits=_HTTP_LIMITS,
+                trust_env=False,
+            ) as client:
+                async with client.stream("POST", url, files=files, data=data, headers=headers) as resp:
+                    if resp.status_code >= 400:
+                        body = await resp.aread()
+                        detail = body.decode("utf-8", "replace")
                         try:
-                            ev = json.loads(payload)
-                        except json.JSONDecodeError:
+                            j = json.loads(detail)
+                            if isinstance(j, dict) and j.get("detail") is not None:
+                                detail = str(j.get("detail"))
+                        except Exception:
+                            pass
+                        raise AgentWorkerError(detail or f"HTTP {resp.status_code}")
+
+                    buffer = ""
+                    async for chunk in resp.aiter_text():
+                        if not chunk:
                             continue
-                        if not isinstance(ev, dict):
-                            continue
-                        yield ev
-                        obj = str(ev.get("object") or "")
-                        if obj in ("complete", "error"):
-                            return
+                        buffer += chunk
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if not line or line.startswith(":"):
+                                continue
+                            if line.startswith("data:"):
+                                payload = line[5:].strip()
+                            else:
+                                payload = line
+                            if not payload or payload == "[DONE]":
+                                continue
+                            try:
+                                ev = json.loads(payload)
+                            except json.JSONDecodeError:
+                                continue
+                            if not isinstance(ev, dict):
+                                continue
+                            yield ev
+                            obj = str(ev.get("object") or "")
+                            if obj in ("complete", "error"):
+                                return
+        except httpx.TimeoutException as exc:
+            raise AgentWorkerError("AI 判定超时，已断开连接并释放资源") from exc
+        finally:
+            files = None
+            content = None
+            image_items = None
 
     async def analyze_video_violation(
         self,

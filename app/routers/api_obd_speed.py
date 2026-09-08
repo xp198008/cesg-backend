@@ -22,6 +22,7 @@ from app.jt808_obd_fuel_sync import (
 from app.jt808_violation_sync import TABLE_NAME, jt808_violation_sync_status
 from app.obd_speed_monitor import backfill_obd_speed_violation_limits, obd_speed_scheduler, ping_redis
 from app.park_alarm_scheduler import park_alarm_scheduler
+from app.vehicle_jt808_sync import queue_snapshot, vehicle_jt808_sync_scheduler
 
 router = APIRouter(tags=["obd-speed-check"])
 
@@ -49,6 +50,16 @@ async def obd_speed_check_status():
                     "mysql_ok": False,
                 },
             }
+    try:
+        vehicle_sync_info = await queue_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        vehicle_sync_info = {
+            "total": None,
+            "pending": None,
+            "success": None,
+            "scheduler": vehicle_jt808_sync_scheduler.status(),
+            "error": str(exc),
+        }
     return {
         "ok": True,
         "scheduler": obd_speed_scheduler.status(),
@@ -56,6 +67,7 @@ async def obd_speed_check_status():
         "violation_sync": sync_info,
         "obd_fuel_sync": fuel_sync_info,
         "park_alarm_scheduler": park_alarm_scheduler.status(),
+        "vehicle_jt808_sync": vehicle_sync_info,
     }
 
 
@@ -110,6 +122,17 @@ async def obd_speed_check_stop():
     """停止定时调度（服务重启后会再次自动启动）。"""
     await obd_speed_scheduler.stop()
     return {"ok": True, "scheduler": obd_speed_scheduler.status()}
+
+
+@router.post("/api/obd-speed-check/vehicle-sync/run-once")
+async def vehicle_jt808_sync_run_once():
+    """立即扫一轮待同步车辆（pending → 808，成功后标 success）。"""
+    try:
+        result = await vehicle_jt808_sync_scheduler.run_once()
+        snap = await queue_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "result": result, **snap}
 
 
 @router.post("/api/obd-speed-check/park-alarm/run-once")
@@ -320,6 +343,14 @@ _STATUS_PAGE = """<!DOCTYPE html>
         <button id="btnFuelSync" class="success">立即全量同步到 808</button>
       </div>
       <table id="tblFuelSync"><tr><td colspan="2">加载中…</td></tr></table>
+    </div>
+    <div class="card">
+      <h2><span class="dot" id="dotVehicleSync"></span>车辆档案 808 同步</h2>
+      <p class="muted" style="margin-bottom:10px">车辆有改动只标 <code>pending</code>，定时器每 10 秒扫非 <code>success</code> 的车推到 808；成功后停扫。</p>
+      <div class="btns" style="margin:0 0 10px">
+        <button id="btnVehicleSyncRun" class="success">立即同步一轮</button>
+      </div>
+      <table id="tblVehicleSync"><tr><td colspan="2">加载中…</td></tr></table>
     </div>
     <div class="card">
       <h2><span class="dot" id="dotParkAlarm"></span>停车超限报警调度</h2>
@@ -611,13 +642,44 @@ function renderStatus(data) {
     row("检测间隔", esc(s.interval_seconds) + " 秒") +
     row("Redis 目标", esc(s.redis)) +
     row("最低处理时速", esc(s.min_speed_kmh) + " km/h") +
+    row("最高处理时速", esc(s.max_speed_kmh) + " km/h（超过按误报）") +
     row("轨迹纠偏", '<span class="okc">已启用（高德 GraspRoad）</span>') +
     row("JT808 定位接口", data.jt808_openapi_configured ? '<span class="okc">已配置</span>' : '<span class="err">未配置（无法取车辆坐标）</span>') +
     row("最近执行时间", esc(s.last_run_at || "从未执行"));
   renderSync(data.violation_sync || {});
   renderFuelSync(data.obd_fuel_sync || {});
   renderParkAlarm(data.park_alarm_scheduler || {});
+  renderVehicleSync(data.vehicle_jt808_sync || {});
   renderRun(s.last_result, s.last_error);
+}
+
+function renderVehicleSync(vs) {
+  const sch = vs.scheduler || {};
+  const pending = vs.pending;
+  const success = vs.success;
+  const total = vs.total;
+  let dot = "bad";
+  if (sch.running && (pending === 0 || pending == null)) dot = "ok";
+  else if (sch.running) dot = "warn";
+  $("dotVehicleSync").className = "dot " + dot;
+  const lr = sch.last_result || {};
+  let html =
+    row("车辆总数", `<b>${esc(total == null ? "—" : total)}</b> 台`) +
+    row("尚未同步", `<b>${esc(pending == null ? "—" : pending)}</b> 台（pending，定时器还在扫）`) +
+    row("已同步成功", `<b>${esc(success == null ? "—" : success)}</b> 台（success，不再扫）`) +
+    row("调度启用", sch.enabled ? '<span class="okc">已启用</span>' : '<span class="err">已关闭</span>') +
+    row("循环运行中", sch.running ? '<span class="okc">运行中</span>' : '<span class="err">已停止</span>') +
+    row("扫描间隔", esc(sch.interval_seconds) + " 秒") +
+    row("每轮最多", esc(sch.batch_size) + " 台") +
+    row("最近执行时间", esc(sch.last_run_at || "从未执行")) +
+    row("最近一轮", `扫 ${esc(lr.scanned ?? "—")} / 成功 ${esc(lr.success ?? "—")} / 失败 ${esc(lr.failed ?? "—")} / 剩余约 ${esc(lr.pending_left ?? "—")}`);
+  if (sch.last_error || vs.error) {
+    html += row("说明", `<span class="err">${esc(sch.last_error || vs.error)}</span>`);
+  }
+  if (lr.errors && lr.errors.length) {
+    html += row("最近失败样例", `<pre>${esc(lr.errors.join("\\n"))}</pre>`);
+  }
+  $("tblVehicleSync").innerHTML = html;
 }
 
 function renderParkAlarm(ps) {
@@ -796,6 +858,25 @@ $("btnFuelSync").onclick = async () => {
     alert("同步失败：" + e);
   }
   btn.disabled = false; btn.textContent = "立即全量同步到 808";
+  loadStatus();
+};
+
+$("btnVehicleSyncRun").onclick = async () => {
+  const btn = $("btnVehicleSyncRun");
+  btn.disabled = true; btn.textContent = "同步中…";
+  try {
+    const data = await apiJson("/api/obd-speed-check/vehicle-sync/run-once", { method: "POST" });
+    const r = data.result || {};
+    alert(
+      "本轮完成：扫 " + (r.scanned ?? 0) +
+      "，成功 " + (r.success ?? 0) +
+      "，失败 " + (r.failed ?? 0) +
+      "，还剩 " + (data.pending ?? r.pending_left ?? "—") + " 台未同步"
+    );
+  } catch (e) {
+    alert("同步失败：" + e);
+  }
+  btn.disabled = false; btn.textContent = "立即同步一轮";
   loadStatus();
 };
 

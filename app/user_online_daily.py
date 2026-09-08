@@ -386,21 +386,42 @@ async def close_open_sessions_for_user(
         stmt = stmt.where(UserLoginLog.id != exclude_id)
     open_rows = (await db.execute(stmt.order_by(UserLoginLog.login_at.asc()))).scalars().all()
     for row in open_rows:
-        start = row.login_at or now
-        start_naive = start.replace(tzinfo=None) if getattr(start, "tzinfo", None) else start
-        # 先落库退出时间，再重算日汇总，避免仍按「未退出」口径估算
         row.logout_at = now
         row.last_heartbeat_at = now
-        if now > start_naive:
-            await recompute_user_daily_for_date(db, row.username, start_naive.date())
-            if now.date() != start_naive.date():
-                await recompute_user_daily_for_date(db, row.username, now.date())
 
 
 async def record_login_daily(db: AsyncSession, login_row: UserLoginLog) -> None:
+    """登录时只记一条日汇总增量，避免扫全量登录日志把 SQLite 锁死。"""
+    uname = (login_row.username or "").strip()
+    if not uname:
+        return
     login_at = login_row.login_at or china_now_naive()
     login_date = login_at.date() if hasattr(login_at, "date") else login_at
-    await recompute_user_daily_for_date(db, login_row.username, login_date)
+    existing = await db.scalar(
+        select(UserOnlineDaily)
+        .where(UserOnlineDaily.username == uname[:64], UserOnlineDaily.stat_date == login_date)
+        .limit(1)
+    )
+    if existing is None:
+        existing = await get_or_create_daily_row(
+            db,
+            username=uname,
+            stat_date=login_date,
+            user_id=login_row.user_id,
+            real_name=login_row.real_name,
+            org_id=login_row.org_id,
+            org_name=login_row.org_name,
+        )
+    existing.login_count = int(existing.login_count or 0) + 1
+    if login_row.user_id is not None:
+        existing.user_id = login_row.user_id
+    if login_row.real_name:
+        existing.real_name = str(login_row.real_name)[:64]
+    if login_row.org_id is not None:
+        existing.org_id = login_row.org_id
+    if login_row.org_name:
+        existing.org_name = str(login_row.org_name)[:128]
+    await db.flush()
 
 
 async def sync_login_session_to_daily(
@@ -408,15 +429,17 @@ async def sync_login_session_to_daily(
     login_row: UserLoginLog,
     *,
     until: datetime | None = None,
+    recompute: bool = False,
 ) -> None:
     now = until or china_now_naive()
     login_row.last_heartbeat_at = now
-    if login_row.login_at is not None:
-        login_at = login_row.login_at
-        login_naive = login_at.replace(tzinfo=None) if getattr(login_at, "tzinfo", None) else login_at
-        await recompute_user_daily_for_date(db, login_row.username, login_naive.date())
-        if now.date() != login_naive.date():
-            await recompute_user_daily_for_date(db, login_row.username, now.date())
+    if not recompute or login_row.login_at is None:
+        return
+    login_at = login_row.login_at
+    login_naive = login_at.replace(tzinfo=None) if getattr(login_at, "tzinfo", None) else login_at
+    await recompute_user_daily_for_date(db, login_row.username, login_naive.date())
+    if now.date() != login_naive.date():
+        await recompute_user_daily_for_date(db, login_row.username, now.date())
 
 
 async def finalize_stale_open_sessions(db: AsyncSession, *, now: datetime | None = None) -> int:

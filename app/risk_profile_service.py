@@ -1,6 +1,7 @@
 """车辆风险画像：对接外部周报 API，月报优先官方接口，否则由周报拼出。"""
 from __future__ import annotations
 
+import asyncio
 import logging
 from calendar import monthrange
 from collections import defaultdict
@@ -1158,7 +1159,7 @@ async def query_risk_profile(
     if filter_plates:
         from app.vehicle_alloc_scope import _lookup_jt808_plate_car_id_map
 
-        resolved = _lookup_jt808_plate_car_id_map(sorted(filter_plates))
+        resolved = await asyncio.to_thread(_lookup_jt808_plate_car_id_map, sorted(filter_plates))
         if resolved:
             plate_by_car_id = {cid: plate for plate, cid in resolved.items()}
 
@@ -1218,8 +1219,9 @@ async def query_risk_profile(
     if not plate_by_car_id and raw_items:
         from app.vehicle_alloc_scope import _lookup_jt808_car_id_plate_map
 
-        plate_by_car_id = _lookup_jt808_car_id_plate_map(
-            [_as_int(x.get("car_id")) for x in raw_items]
+        plate_by_car_id = await asyncio.to_thread(
+            _lookup_jt808_car_id_plate_map,
+            [_as_int(x.get("car_id")) for x in raw_items],
         )
 
     # 公司/司机/车队一律来自本地 vehicle；car_id→车牌仅作对齐键

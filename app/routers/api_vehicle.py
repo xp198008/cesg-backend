@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import jt808_vehicle
 from app.database import get_db
+from app.vehicle_jt808_sync import mark_pending, vehicle_jt808_sync_scheduler
 from app.jt808_openapi_client import jt808_openapi_client
 from app.tongtianxing_client import list_plate_device_pairs
 from app.models import (
@@ -707,9 +708,9 @@ async def vehicle_create(
         plate_color=_norm(payload.plate_color),
         device_no=_norm(payload.device_no),
     )
+    mark_pending(v)
     await db.commit()
-    jt808_result = await jt808_vehicle.upsert_now(v.id)
-    return {"ok": True, "message": "已创建", "data": {"id": v.id}, "jt808_sync": _jt808_sync_status(jt808_result)}
+    return {"ok": True, "message": "已创建", "data": {"id": v.id}, "jt808_sync": "queued"}
 
 
 @router.post("/update")
@@ -760,9 +761,9 @@ async def vehicle_update(
             plate_color=_norm(payload.plate_color) or _norm(v.plate_color),
             device_no=_norm(payload.device_no) or _norm(old_dev),
         )
+    mark_pending(v, _norm(old_dev) or None)
     await db.commit()
-    jt808_result = await jt808_vehicle.upsert_now(vid, old_dev)
-    return {"ok": True, "message": "已更新", "data": {"id": vid}, "jt808_sync": _jt808_sync_status(jt808_result)}
+    return {"ok": True, "message": "已更新", "data": {"id": vid}, "jt808_sync": "queued"}
 
 
 async def _upsert_device_no_only(db: AsyncSession, vehicle_id: int, store_no: str) -> None:
@@ -816,7 +817,6 @@ async def vehicle_sync_from_ttx(db: AsyncSession = Depends(get_db)):
     skipped_conflict = 0
     skipped_no_device = 0
     errors: list[str] = []
-    sync_queue: list[tuple[int, str | None]] = []
 
     def note_error(msg: str) -> None:
         if len(errors) < 40:
@@ -885,24 +885,10 @@ async def vehicle_sync_from_ttx(db: AsyncSession = Depends(get_db)):
                     by_bare_dev[new_bare].append(vid)
 
         updated += 1
-        sync_queue.append((vid, old_dev or None))
+        mark_pending(v, old_dev or None)
 
     await db.flush()
     await db.commit()
-
-    jt808_ok = 0
-    jt808_fail = 0
-    for vid, old_dev in sync_queue:
-        try:
-            result = await jt808_vehicle.upsert_now(vid, old_dev)
-        except Exception:  # noqa: BLE001
-            jt808_fail += 1
-            continue
-        status = _jt808_sync_status(result)
-        if status == "success":
-            jt808_ok += 1
-        elif status == "fail":
-            jt808_fail += 1
 
     msg = (
         f"通天星 {int(payload.get('ttxVehicleCount') or len(items))} 台，"
@@ -911,8 +897,8 @@ async def vehicle_sync_from_ttx(db: AsyncSession = Depends(get_db)):
         f"本库无此车 {skipped_not_in_cesg}，"
         f"冲突跳过 {skipped_conflict}"
     )
-    if jt808_ok or jt808_fail:
-        msg += f"；808 同步成功 {jt808_ok}、失败 {jt808_fail}"
+    if updated:
+        msg += f"；已入队待同步 808 {updated} 台"
     return {
         "ok": True,
         "message": msg,
@@ -922,8 +908,7 @@ async def vehicle_sync_from_ttx(db: AsyncSession = Depends(get_db)):
         "skippedConflict": skipped_conflict,
         "skippedNoDevice": skipped_no_device,
         "ttxCount": int(payload.get("ttxVehicleCount") or len(items)),
-        "jt808_ok": jt808_ok,
-        "jt808_fail": jt808_fail,
+        "jt808_queued": updated,
         "errors": errors,
     }
 
@@ -1282,8 +1267,6 @@ async def import_vehicle_from_carinfos(
     skipped_rows: list[tuple[int, str]] = []
     imported = 0
     updated = 0
-    # (vehicle_id, old_device_no|None)
-    sync_queue: list[tuple[int, str | None]] = []
     seen_plates: set[str] = set()
     seen_devices: set[str] = set()
 
@@ -1412,7 +1395,7 @@ async def import_vehicle_from_carinfos(
 
         seen_plates.add(plate)
         seen_devices.add(store_no)
-        sync_queue.append((int(v.id), _norm(old_dev) or None))
+        mark_pending(v, _norm(old_dev) or None)
         if is_new:
             imported += 1
         else:
@@ -1429,23 +1412,6 @@ async def import_vehicle_from_carinfos(
             content=f"批量导入车辆信息：新增{imported}台，更新{updated}台，跳过{len(skipped_rows)}行",
         )
     await db.commit()
-
-    jt808_ok = 0
-    jt808_fail = 0
-    jt808_skip = 0
-    for vid, old_dev in sync_queue:
-        try:
-            result = await jt808_vehicle.upsert_now(vid, old_dev)
-        except Exception:  # noqa: BLE001
-            jt808_fail += 1
-            continue
-        status = _jt808_sync_status(result)
-        if status == "success":
-            jt808_ok += 1
-        elif status == "failed":
-            jt808_fail += 1
-        else:
-            jt808_skip += 1
 
     annotated_file_base64: str | None = None
     annotated_file_name: str | None = None
@@ -1472,9 +1438,7 @@ async def import_vehicle_from_carinfos(
         "updated": updated,
         "skipped": len(skipped_rows),
         "skipped_preview": errors[:20],
-        "jt808_sync_ok": jt808_ok,
-        "jt808_sync_fail": jt808_fail,
-        "jt808_sync_skip": jt808_skip,
+        "jt808_queued": imported + updated,
         "annotated_file_name": annotated_file_name,
         "annotated_file_base64": annotated_file_base64,
     }
@@ -1821,6 +1785,21 @@ async def vehicle_delete(
     await db.commit()
     jt808_result = await jt808_vehicle.delete_now(main_dev, plate_no) if (main_dev or plate_no) else None
     return {"ok": True, "jt808_sync": _jt808_sync_status(jt808_result)}
+
+
+@router.get("/jt808-sync/status")
+async def vehicle_jt808_sync_status():
+    """车辆 → 808 定时同步状态：pending 会被扫，success 不再扫。"""
+    from app.vehicle_jt808_sync import queue_snapshot
+
+    snap = await queue_snapshot()
+    return {"ok": True, **snap}
+
+
+@router.post("/jt808-sync/run-once")
+async def vehicle_jt808_sync_run_once():
+    result = await vehicle_jt808_sync_scheduler.run_once()
+    return {"ok": True, **result}
 
 
 @router.get("/companies")
