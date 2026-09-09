@@ -22,7 +22,15 @@ from app.alarm_type_gate import load_alarm_type_risk_map
 from app.amap_regeo import resolve_address_wgs84
 from app.database import get_db
 from app.jt808_violation_sync import lookup_company_name, notify_violation_created
-from app.models import OrgCompany, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTypeDict
+from app.models import (
+    OrgCompany,
+    SysUser,
+    Vehicle,
+    VehicleDevice,
+    VehicleLocation,
+    VehicleViolation,
+    ViolationTypeDict,
+)
 from app.org_scope import collect_org_company_subtree_ids, require_x_org_id_header
 from app.plate_util import norm_plate
 from app.routers.api_violation import _row_out_enriched
@@ -118,6 +126,7 @@ class ManualCreateIn(BaseModel):
     terminal_id: str | None = Field(None, max_length=32)
     vehicle_id: int | None = Field(None, ge=1)
     remark: str | None = Field(None, max_length=2000)
+    handler_name: str | None = Field(None, max_length=64)
 
 
 class AuditIn(BaseModel):
@@ -138,6 +147,21 @@ def _gen_biz_no() -> str:
 
 def _now() -> datetime:
     return china_now_naive()
+
+
+async def _resolve_user_display_name(db: AsyncSession, x_user_id: str | None) -> str | None:
+    uid = parse_user_id_header(x_user_id)
+    if not uid:
+        return None
+    pair = (
+        await db.execute(
+            select(SysUser.real_name, SysUser.username).where(SysUser.id == int(uid)).limit(1)
+        )
+    ).first()
+    if not pair:
+        return None
+    real_name, username = pair
+    return (real_name or "").strip() or (username or "").strip() or None
 
 
 async def _read_main_terminal_id(db: AsyncSession, vehicle_id: int) -> str:
@@ -189,6 +213,7 @@ async def list_manual_violations(
     violation_type_dict_id: int | None = Query(None, ge=1),
     start_time: str | None = Query(None),
     end_time: str | None = Query(None),
+    handler_name: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
@@ -197,7 +222,7 @@ async def list_manual_violations(
 ):
     q = await _scoped_manual_query(db, x_org_id=x_org_id, x_user_id=x_user_id)
     if status:
-        # 查询页语义：完结/驳回最终都落在 status=已处理，靠 audit_reject_remark 区分
+        # 查询页只收完结/驳回（status=已处理）；审核通过落在待处理，进手动处理页
         st = status.strip()
         reject_nonempty = and_(
             VehicleViolation.audit_reject_remark.isnot(None),
@@ -209,6 +234,8 @@ async def list_manual_violations(
         )
         if st in ("查询可见", "已审核"):
             q = q.where(VehicleViolation.status == "已处理")
+        elif st in ("审核通过", "已通过"):
+            q = q.where(VehicleViolation.status == "待处理")
         elif st in ("完结", "已完结"):
             q = q.where(VehicleViolation.status == "已处理", reject_empty)
         elif st in ("驳回", "审核驳回"):
@@ -239,6 +266,9 @@ async def list_manual_violations(
             q = q.where(VehicleViolation.violation_time <= datetime.fromisoformat(end_time.replace("T", " ")))
         except ValueError:
             pass
+    handler = (handler_name or "").strip()
+    if handler:
+        q = q.where(VehicleViolation.handler_name == handler)
 
     total = await db.scalar(select(func.count()).select_from(q.subquery())) or 0
     rows = (
@@ -252,6 +282,36 @@ async def list_manual_violations(
     for row in rows:
         items.append(await _row_out_enriched(db, row))
     return {"ok": True, "total": int(total), "items": items, "page": page, "page_size": page_size}
+
+
+@router.get("/handlers")
+async def list_manual_handlers(
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """处理人下拉：只返回违章记录里出现过的名字，避免拉全量用户。"""
+    q = await _scoped_manual_query(db, x_org_id=x_org_id, x_user_id=x_user_id)
+    subq = q.subquery()
+    stmt = (
+        select(subq.c.handler_name)
+        .where(
+            subq.c.handler_name.isnot(None),
+            func.trim(subq.c.handler_name) != "",
+        )
+        .distinct()
+        .order_by(subq.c.handler_name)
+        .limit(100)
+    )
+    names: list[str] = []
+    seen: set[str] = set()
+    for (raw,) in (await db.execute(stmt)).all():
+        name = str(raw or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return {"ok": True, "items": names}
 
 
 @router.post("/manual/ocr")
@@ -274,6 +334,7 @@ async def manual_ocr(
 async def manual_create(
     body: ManualCreateIn,
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
     root = require_x_org_id_header(x_org_id)
@@ -334,6 +395,7 @@ async def manual_create(
             if not addr_out and lat_out is not None and lng_out is not None:
                 addr_out = await resolve_address_wgs84(db, lat_out, lng_out) or None
 
+    handler = (body.handler_name or "").strip() or await _resolve_user_display_name(db, x_user_id)
     risk_map = await load_alarm_type_risk_map(db)
     row = VehicleViolation(
         biz_no=_gen_biz_no(),
@@ -354,6 +416,7 @@ async def manual_create(
         raw_preview=(body.remark or "").strip() or None,
         status="待审核",
         pre_audit_kind=KIND_MANUAL_ENTRY,
+        handler_name=(handler[:64] if handler else None),
     )
     db.add(row)
     await db.commit()

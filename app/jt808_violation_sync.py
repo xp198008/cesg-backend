@@ -19,6 +19,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.alarm_type_gate import alarm_type_name_is_enabled, load_enabled_alarm_type_names
 from app.models import OrgCompany, VehicleViolation
 from app.violation_alert_cache import push_violation_alert, violation_alert_payload
 
@@ -343,8 +344,24 @@ async def notify_violation_created(db: AsyncSession, row: VehicleViolation) -> N
         logger.debug("回填 company_name 失败: %s", exc)
 
     try:
+        from app.violation_ai_assessment import maybe_apply_insufficient_evidence_on_create
+
+        await maybe_apply_insufficient_evidence_on_create(db, row)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("入库证据不足即误报失败: %s", exc)
+
+    try:
         if (getattr(row, "status", None) or "").strip() in ("", "待处理"):
-            push_violation_alert(violation_alert_payload(row))
+            enabled_names = await load_enabled_alarm_type_names(db)
+            type_name = (getattr(row, "violation_type_name", None) or "").strip()
+            if alarm_type_name_is_enabled(type_name, enabled_names):
+                push_violation_alert(violation_alert_payload(row))
+            else:
+                logger.info(
+                    "跳过报警弹窗/声音: 类型不在系统字典 type=%s plate=%s",
+                    type_name or "-",
+                    (getattr(row, "plate_no", None) or "-"),
+                )
     except Exception as exc:  # noqa: BLE001
         logger.debug("push_violation_alert 失败: %s", exc)
 

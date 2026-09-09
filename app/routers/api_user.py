@@ -35,7 +35,7 @@ from app.org_scope import (
     org_scope_row_clause,
     require_user_company_subtree_ids,
 )
-from app.session_auth import attach_session_cookie, clear_session_cookie
+from app.session_auth import attach_session_cookie, clear_session_cookie, extract_session_token, invalidate_session_token
 from app.vehicle_alloc_scope import parse_user_id_header, resolve_monitor_scope
 
 router = APIRouter(prefix="/api/user", tags=["user"])
@@ -299,6 +299,7 @@ async def user_list(
                 "org_id": u.org_id,
                 "org_name": org_name,
                 "username": u.username,
+                "real_name": (u.real_name or u.username or "").strip() or u.username,
                 "role_id": u.role_id,
                 "role_name": role_name,
                 "role_perm": role_perm,
@@ -652,6 +653,9 @@ async def user_logout(payload: UserLogoutPayload, request: Request, db: AsyncSes
         user.login_session_token = None
 
     await db.flush()
+    invalidate_session_token(extract_session_token({k.lower(): v for k, v in request.headers.items()}))
+    if user is not None:
+        invalidate_session_token(getattr(user, "login_session_token", None))
     resp = JSONResponse(content={"ok": True, "message": "已退出登录"})
     if user is not None and getattr(user, "single_login", False):
         clear_session_cookie(resp)

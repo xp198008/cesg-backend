@@ -845,6 +845,204 @@ def period_datetime_range(mode: str, period: str | None) -> tuple[datetime, date
     return start, end
 
 
+def local_alarm_period_range(
+    *,
+    mode: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    weekly_end_date: str | None = None,
+    report_month: str | None = None,
+) -> tuple[datetime, datetime] | None:
+    """司机画像本地报警区间：优先用页面起止日期，不对齐到上周三。"""
+    start_text = str(start_date or "").strip()
+    end_text = str(end_date or "").strip()
+    if start_text or end_text:
+        if start_text and end_text:
+            start_day = _parse_ymd(start_text)
+            end_day = _parse_ymd(end_text)
+        elif end_text:
+            end_day = _parse_ymd(end_text)
+            start_day = end_day - timedelta(days=6)
+        else:
+            start_day = _parse_ymd(start_text)
+            end_day = start_day + timedelta(days=6)
+        if end_day < start_day:
+            start_day, end_day = end_day, start_day
+        return (
+            datetime(start_day.year, start_day.month, start_day.day),
+            datetime(end_day.year, end_day.month, end_day.day) + timedelta(days=1),
+        )
+    if mode == "monthly":
+        return period_datetime_range("monthly", report_month)
+    return period_datetime_range("weekly", weekly_end_date)
+
+
+def classify_local_alarm_field(type_name: str) -> str:
+    text = str(type_name or "").strip()
+    if not text:
+        return "behavior_alarm_count"
+    if any(key in text for key in ("疲劳", "分神")):
+        return "mental_alarm_count"
+    if any(key in text for key in ("路线偏移", "路线偏离", "偏离路线")):
+        return "route_alarm_count"
+    if "天气" in text:
+        return "weather_alarm_count"
+    if any(key in text for key in ("超6小时", "超时6", "超过6小时")):
+        return "over_6h_count"
+    if any(key in text for key in ("超4小时", "超时4", "超过4小时")):
+        return "over_4h_count"
+    if any(key in text for key in ("超3小时", "超时3", "超过3小时")):
+        return "over_3h_count"
+    return "behavior_alarm_count"
+
+
+async def load_driver_brief(
+    db: AsyncSession,
+    *,
+    driver_id: int | None = None,
+    driver_name: str | None = None,
+) -> dict[str, Any] | None:
+    stmt = select(Driver).options(selectinload(Driver.company))
+    if driver_id is not None and _as_int(driver_id) > 0:
+        stmt = stmt.where(Driver.id == int(driver_id))
+    elif str(driver_name or "").strip():
+        stmt = stmt.where(Driver.name == str(driver_name).strip())
+    else:
+        return None
+    driver = (await db.execute(stmt.limit(1))).scalar_one_or_none()
+    if driver is None:
+        return None
+    return {
+        "driver_id": int(driver.id),
+        "driver_name": (driver.name or "").strip() or "—",
+        "company_id": int(driver.company_id) if driver.company_id is not None else None,
+        "company_name": (driver.company.name if driver.company else None) or "",
+    }
+
+
+async def query_driver_local_alarm_counts(
+    db: AsyncSession,
+    *,
+    plates: list[str],
+    vehicle_ids: list[int],
+    start_at: datetime,
+    end_at: datetime,
+) -> dict[str, int]:
+    counts = _empty_counts()
+    if not plates and not vehicle_ids:
+        return counts
+    scope_conds = []
+    if plates:
+        scope_conds.append(VehicleViolation.plate_no.in_(plates))
+    if vehicle_ids:
+        scope_conds.append(VehicleViolation.vehicle_id.in_(vehicle_ids))
+    disabled = await load_disabled_alarm_type_names(db)
+    rows = (
+        await db.execute(
+            select(VehicleViolation.violation_type_name, func.count().label("cnt"))
+            .where(
+                violation_list_visibility(disabled),
+                VehicleViolation.violation_time >= start_at,
+                VehicleViolation.violation_time < end_at,
+                or_(*scope_conds),
+            )
+            .group_by(VehicleViolation.violation_type_name)
+        )
+    ).all()
+    for name, cnt in rows:
+        counts[classify_local_alarm_field(str(name or ""))] += int(cnt or 0)
+    return counts
+
+
+def overlay_driver_local_profile(
+    payload: dict[str, Any],
+    *,
+    brief: dict[str, Any] | None,
+    plates: list[str],
+    vehicle_ids: list[int],
+    counts: dict[str, int],
+    ranking: list[dict[str, Any]],
+    start_at: datetime,
+    end_at: datetime,
+) -> dict[str, Any]:
+    """用安全监控本地报警覆盖司机画像汇总，避免外部周报对不上。"""
+    focus = dict(payload.get("focus") or {})
+    if brief:
+        focus["driver_id"] = brief.get("driver_id") or focus.get("driver_id")
+        focus["driver_name"] = brief.get("driver_name") or focus.get("driver_name") or "—"
+        if brief.get("company_id") is not None:
+            focus["company_id"] = brief.get("company_id")
+        if brief.get("company_name"):
+            focus["company_name"] = brief.get("company_name")
+    if plates:
+        focus["plates"] = plates
+        if not focus.get("plate_no"):
+            focus["plate_no"] = plates[0]
+    if vehicle_ids:
+        focus["vehicle_ids"] = vehicle_ids
+        focus["vehicle_count"] = len(vehicle_ids)
+        if focus.get("vehicle_id") is None:
+            focus["vehicle_id"] = vehicle_ids[0]
+    elif plates:
+        focus["vehicle_count"] = len(plates)
+    for key in COUNT_FIELDS:
+        focus[key] = int(counts.get(key) or 0)
+    total = total_alarm_count(focus)
+    focus["total_alarm_count"] = total
+    score = risk_score_from_counts(focus)
+    focus["risk_score"] = score
+    focus["risk_level"] = risk_level_from_score(score)
+    focus["radar"] = radar_values(focus)
+
+    payload["focus"] = focus
+    payload["profile_name"] = focus.get("driver_name") or payload.get("profile_name") or "—"
+    payload["ranking"] = ranking
+    payload["radar"] = focus.get("radar") or [0, 0, 0, 0, 0, 0]
+    payload["source"] = "local_violation"
+    payload["alarm_rank_period"] = {
+        "start_at": start_at.isoformat(sep=" "),
+        "end_at": (end_at - timedelta(seconds=1)).isoformat(sep=" "),
+    }
+    payload["metrics"] = [
+        {"value": focus.get("vehicle_count") or 0, "label": "绑定车辆数", "tone": "orange"},
+        {"value": total, "label": "报警次数", "tone": "red"},
+        {"value": focus.get("mental_alarm_count") or 0, "label": "精神疲劳报警", "tone": "orange"},
+        {"value": score, "label": "安全风险分", "tone": "green"},
+    ]
+    payload["risk_overview"] = [
+        {"label": "综合风险分", "value": str(score)},
+        {
+            "label": "风险等级",
+            "value": focus.get("risk_level") or "—",
+            "tone": "red" if score >= 70 else "dark",
+        },
+        {"label": "报警合计", "value": str(total), "tone": "dark"},
+    ]
+    payload["risk_side"] = [
+        {"label": "绑定车辆数", "value": str(focus.get("vehicle_count") or 0)},
+        {"label": "精神疲劳报警", "value": str(focus.get("mental_alarm_count") or 0)},
+        {"label": "驾驶行为报警", "value": str(focus.get("behavior_alarm_count") or 0)},
+    ]
+    bubbles = []
+    mapping = [
+        ("mental_alarm_count", "精神疲劳", "data"),
+        ("behavior_alarm_count", "驾驶行为", "speed"),
+        ("route_alarm_count", "路线偏移", "idle"),
+        ("weather_alarm_count", "天气预警", "oil-high"),
+        ("over_3h_count", "超3小时驾驶", "fuel-theft"),
+        ("over_4h_count", "超4小时驾驶", "scr"),
+        ("over_6h_count", "超6小时驾驶", "nox"),
+    ]
+    for key, label, class_name in mapping:
+        if _as_int(focus.get(key)) > 0:
+            bubbles.append({"label": f"{label}×{_as_int(focus.get(key))}", "className": class_name})
+    payload["risk_bubbles"] = bubbles
+    if not payload.get("items"):
+        payload["items"] = [focus]
+        payload["total"] = 1
+    return payload
+
+
 async def resolve_driver_vehicle_keys(
     db: AsyncSession,
     *,
@@ -1129,6 +1327,8 @@ async def query_risk_profile(
     company_ids: list[int] | None = None,
     driver_id: int | None = None,
     driver_name: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
     x_org_id: str | None = None,
     x_user_id: str | None = None,
 ) -> dict[str, Any]:
@@ -1172,7 +1372,7 @@ async def query_risk_profile(
         if mapped:
             filter_car_id = int(mapped)
 
-    meta: dict[str, Any] = {"source": "weekly", "period": None, "week_ends": []}
+    meta: dict[str, Any] = {"source": "weekly", "period": None, "week_ends": [], "requested_period": None}
 
     if mode == "monthly":
         if not report_month:
@@ -1182,6 +1382,7 @@ async def query_risk_profile(
             y, m = _parse_month(report_month)
             report_month = f"{y:04d}{m:02d}"
         meta["period"] = report_month
+        meta["requested_period"] = report_month
         official = await client.fetch_monthly_official(report_month, car_id=filter_car_id)
         if official is not None:
             raw_items = official
@@ -1195,11 +1396,13 @@ async def query_risk_profile(
     else:
         if not weekly_end_date:
             weekly_end_date = default_weekly_end_date()
-        else:
+        requested_weekly_end = weekly_end_date
+        if weekly_end_date:
             # 任意日期对齐到不超过该日的最近周三（风险周报按周三周末）
             day = _parse_ymd(weekly_end_date)
             delta = (day.weekday() - 2) % 7
             weekly_end_date = _ymd(day - timedelta(days=delta))
+        meta["requested_period"] = requested_weekly_end
         meta["period"] = weekly_end_date
         meta["source"] = "weekly"
         raw_items = await client.fetch_weekly_all(weekly_end_date, car_id=filter_car_id)
@@ -1379,9 +1582,15 @@ async def query_risk_profile(
             db, payload, plates=filter_plates or None
         )
     elif dimension == "driver":
-        # 「报警行为排名」= 当前司机各报警类型条数降序（非司机间总报警排名）
+        # 司机画像以安全监控本地报警为准（外部周报常对不上绑定司机/所选日期）
         focus = payload.get("focus") if isinstance(payload.get("focus"), dict) else None
-        dt_range = period_datetime_range(mode, meta.get("period"))
+        dt_range = local_alarm_period_range(
+            mode=mode,
+            start_date=start_date,
+            end_date=end_date,
+            weekly_end_date=meta.get("requested_period") or weekly_end_date or meta.get("period"),
+            report_month=report_month or meta.get("period"),
+        )
         if dt_range is None:
             payload["ranking"] = []
         else:
@@ -1392,17 +1601,33 @@ async def query_risk_profile(
                 driver_name=driver_name,
                 focus=focus,
             )
-            payload["ranking"] = await query_driver_alarm_behavior_ranking(
+            ranking = await query_driver_alarm_behavior_ranking(
                 db,
                 plates=driver_plates,
                 vehicle_ids=driver_vehicle_ids,
                 start_at=start_at,
                 end_at=end_at,
             )
-            payload["alarm_rank_period"] = {
-                "start_at": start_at.isoformat(sep=" "),
-                "end_at": (end_at - timedelta(seconds=1)).isoformat(sep=" "),
-            }
+            counts = await query_driver_local_alarm_counts(
+                db,
+                plates=driver_plates,
+                vehicle_ids=driver_vehicle_ids,
+                start_at=start_at,
+                end_at=end_at,
+            )
+            brief = await load_driver_brief(
+                db, driver_id=driver_id, driver_name=driver_name
+            )
+            payload = overlay_driver_local_profile(
+                payload,
+                brief=brief,
+                plates=driver_plates,
+                vehicle_ids=driver_vehicle_ids,
+                counts=counts,
+                ranking=ranking,
+                start_at=start_at,
+                end_at=end_at,
+            )
     return payload
 
 

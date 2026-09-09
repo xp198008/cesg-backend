@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete, select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from app.db_upsert import upsert_stmt
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -144,6 +144,9 @@ def _normalize_fault_level(raw: Any) -> str | None:
 # Redis 客户端（复用 obd_redis_* 连接参数）
 # ---------------------------------------------------------------------------
 
+_redis_client = None
+
+
 def _new_redis():
     from redis import asyncio as aioredis
     from redis.backoff import NoBackoff
@@ -154,11 +157,30 @@ def _new_redis():
         port=settings.obd_redis_port,
         password=settings.obd_redis_password or None,
         db=settings.obd_redis_db,
-        socket_timeout=8,
-        socket_connect_timeout=5,
+        socket_timeout=15,
+        socket_connect_timeout=8,
         decode_responses=True,
-        retry=Retry(NoBackoff(), 0),
+        retry=Retry(NoBackoff(), 1),
+        health_check_interval=30,
     )
+
+
+async def _get_redis():
+    """复用连接，避免每 3 秒握手一次把 Redis 打到超时。"""
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = _new_redis()
+    try:
+        await _redis_client.ping()
+        return _redis_client
+    except Exception:
+        try:
+            await _redis_client.aclose()
+        except Exception:
+            pass
+        _redis_client = _new_redis()
+        await _redis_client.ping()
+        return _redis_client
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +244,10 @@ def _last_bclc(existing: ObdEnergySnapshot | None) -> float | None:
         return None
 
 
+_MAX_OBD_STEP_KM = 20.0
+_MAX_OBD_DAY_KM = 250.0
+
+
 def _accumulate_day_km(
     existing: ObdEnergySnapshot | None,
     new_bclc: float | None,
@@ -229,7 +255,7 @@ def _accumulate_day_km(
     """把 OBD「本次点火里程」累成当日行驶公里。
 
     bclc 是本次点火累计，跨日不会自己清零。新的一天必须从 0 起，只加今天的增量；
-    否则会把昨天的行程带进今日分母，看板里程偏大、百公里油耗偏低。
+    单次采样跳变（>20km）视为毛刺，单车当日封顶 250km，避免一辆加出一千多公里。
     """
     if new_bclc is None:
         return float(existing.mileage) if existing and existing.mileage is not None else None
@@ -238,10 +264,16 @@ def _accumulate_day_km(
     acc = float(existing.mileage or 0)
     last = _last_bclc(existing)
     if last is None:
-        return round(acc, 3)
+        return round(min(_MAX_OBD_DAY_KM, acc), 3)
     if new_bclc + 0.01 >= last:
-        return round(acc + (new_bclc - last), 3)
-    return round(acc + new_bclc, 3)
+        delta = new_bclc - last
+    else:
+        delta = new_bclc
+    if delta < 0:
+        delta = 0.0
+    if delta > _MAX_OBD_STEP_KM:
+        delta = 0.0
+    return round(min(_MAX_OBD_DAY_KM, acc + delta), 3)
 
 
 async def repair_obd_cross_day_mileage(db: AsyncSession) -> int:
@@ -266,7 +298,9 @@ async def repair_obd_cross_day_mileage(db: AsyncSession) -> int:
         acc = float(row.mileage or 0)
         if leftover is None or leftover < 30:
             continue
-        if acc + 0.01 < leftover:
+        # 只修「今日累计几乎就是昨天点火里程」的整段误带入；禁止每次重启都再扣一遍 leftover
+        band = max(15.0, leftover * 0.08)
+        if abs(acc - leftover) > band:
             continue
         new_acc = round(max(0.0, acc - leftover), 3)
         if abs(new_acc - acc) < 0.05:
@@ -304,7 +338,7 @@ def _accumulate_oil_fuel(
     return round(acc, 3)
 
 
-async def _handle_obd(db: AsyncSession, data: dict, raw_text: str, energy_type: str) -> None:
+async def _handle_obd(db: AsyncSession, data: dict, raw_text: str, energy_type: str) -> tuple[str, str] | None:
     device_no = _pick(data, _DEVICE_KEYS)
     report_time = _parse_ts(_pick(data, _TS_KEYS)) or china_now_naive()
     day = report_time.strftime("%Y%m%d")
@@ -329,7 +363,7 @@ async def _handle_obd(db: AsyncSession, data: dict, raw_text: str, energy_type: 
         fuel = _to_float(_pick(data, _POWER_KEYS))
     mileage = _accumulate_day_km(existing, _to_float(_pick(data, _MILEAGE_KEYS)))
 
-    # 同设备同日同类型 upsert（SQLite ON CONFLICT）
+    # 同设备同日同类型 upsert（SQLite ON CONFLICT / MySQL ON DUPLICATE KEY）
     values = {
         "device_no": str(device_no) if device_no is not None else None,
         "energy_type": energy_type,
@@ -340,16 +374,11 @@ async def _handle_obd(db: AsyncSession, data: dict, raw_text: str, energy_type: 
         "raw": raw_text[:2000],
         "created_at": china_now_naive(),
     }
-    stmt = sqlite_insert(ObdEnergySnapshot).values(**values)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["device_no", "day", "energy_type"],
-        set_={
-            "fuel": stmt.excluded.fuel,
-            "mileage": stmt.excluded.mileage,
-            "report_time": stmt.excluded.report_time,
-            "raw": stmt.excluded.raw,
-            "created_at": stmt.excluded.created_at,
-        },
+    stmt = upsert_stmt(
+        ObdEnergySnapshot,
+        values,
+        ["device_no", "day", "energy_type"],
+        ["fuel", "mileage", "report_time", "raw", "created_at"],
     )
     await db.execute(stmt)
     await db.flush()
@@ -376,25 +405,16 @@ async def _handle_obd(db: AsyncSession, data: dict, raw_text: str, energy_type: 
             "updated_at": now,
             "created_at": now,
         }
-        fuel_stmt = sqlite_insert(ObdFuelDaily).values(**fuel_values)
-        fuel_stmt = fuel_stmt.on_conflict_do_update(
-            index_elements=["device_no", "day"],
-            set_={
-                "plate_no": fuel_stmt.excluded.plate_no,
-                "vehicle_id": fuel_stmt.excluded.vehicle_id,
-                "company_id": fuel_stmt.excluded.company_id,
-                "fuel_l": fuel_stmt.excluded.fuel_l,
-                "source": fuel_stmt.excluded.source,
-                "report_time": fuel_stmt.excluded.report_time,
-                "updated_at": fuel_stmt.excluded.updated_at,
-            },
+        fuel_stmt = upsert_stmt(
+            ObdFuelDaily,
+            fuel_values,
+            ["device_no", "day"],
+            ["plate_no", "vehicle_id", "company_id", "fuel_l", "source", "report_time", "updated_at"],
         )
         await db.execute(fuel_stmt)
         await db.flush()
-        try:
-            await notify_obd_fuel_daily_by_keys(db, device_no=str(device_no), day=day)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("日油耗同步 808 跳过: %s", exc)
+        return str(device_no), day
+    return None
 
 
 async def _purge_old_faults(db: AsyncSession) -> int:
@@ -415,16 +435,11 @@ async def _purge_old_faults(db: AsyncSession) -> int:
 async def consume_once() -> dict[str, Any]:
     """LPOP 三个队列各最多 redis_queue_batch_size 条，落库后返回统计。"""
     stats = {"gzm": 0, "obd_yc": 0, "obd_dc": 0, "errors": 0, "purged": 0, "error": None}
-    redis = _new_redis()
     try:
-        await redis.ping()
+        redis = await _get_redis()
     except Exception as exc:  # noqa: BLE001
         stats["error"] = f"redis connect failed: {exc}"
         logger.warning("Redis 队列消费器连接失败: %s", exc)
-        try:
-            await redis.aclose()
-        except Exception:  # noqa: BLE001
-            pass
         return stats
 
     queues = (
@@ -434,37 +449,42 @@ async def consume_once() -> dict[str, Any]:
     )
     batch = max(1, int(settings.redis_queue_batch_size))
 
+    pending: list[tuple[str, str | None, dict, str]] = []
+    for qname, stat_key, etype in queues:
+        for _ in range(batch):
+            try:
+                raw = await redis.lpop(qname)
+            except Exception as exc:  # noqa: BLE001
+                stats["errors"] += 1
+                logger.warning("LPOP %s 失败: %s", qname, exc)
+                break
+            if raw is None:
+                break
+            text = raw if isinstance(raw, str) else raw.decode("utf-8", "ignore")
+            try:
+                data = json.loads(text)
+            except (TypeError, ValueError):
+                stats["errors"] += 1
+                continue
+            if not isinstance(data, dict):
+                stats["errors"] += 1
+                continue
+            pending.append((stat_key, etype, data, text))
+
+    fuel_notifies: list[tuple[str, str]] = []
     async with AsyncSessionLocal() as db:
-        for qname, stat_key, etype in queues:
-            count = 0
-            for _ in range(batch):
-                try:
-                    raw = await redis.lpop(qname)
-                except Exception as exc:  # noqa: BLE001
-                    stats["errors"] += 1
-                    logger.warning("LPOP %s 失败: %s", qname, exc)
-                    break
-                if raw is None:
-                    break
-                text = raw if isinstance(raw, str) else raw.decode("utf-8", "ignore")
-                try:
-                    data = json.loads(text)
-                except (TypeError, ValueError):
-                    stats["errors"] += 1
-                    continue
-                if not isinstance(data, dict):
-                    stats["errors"] += 1
-                    continue
-                try:
-                    if etype is None:
-                        await _handle_fault(db, data, text)
-                    else:
-                        await _handle_obd(db, data, text, etype)
-                    count += 1
-                except Exception as exc:  # noqa: BLE001
-                    stats["errors"] += 1
-                    logger.warning("处理 %s 队列消息失败: %s", qname, exc)
-            stats[stat_key] = count
+        for stat_key, etype, data, text in pending:
+            try:
+                if etype is None:
+                    await _handle_fault(db, data, text)
+                else:
+                    fuel_key = await _handle_obd(db, data, text, etype)
+                    if fuel_key:
+                        fuel_notifies.append(fuel_key)
+                stats[stat_key] += 1
+            except Exception as exc:  # noqa: BLE001
+                stats["errors"] += 1
+                logger.warning("处理 %s 队列消息失败: %s", stat_key, exc)
         try:
             await db.commit()
         except Exception as exc:  # noqa: BLE001
@@ -474,10 +494,14 @@ async def consume_once() -> dict[str, Any]:
         else:
             stats["purged"] = await _purge_old_faults(db)
 
-    try:
-        await redis.aclose()
-    except Exception:  # noqa: BLE001
-        pass
+    for device_no, day in fuel_notifies:
+        try:
+            async with AsyncSessionLocal() as db:
+                await notify_obd_fuel_daily_by_keys(db, device_no=device_no, day=day)
+                await db.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("日油耗同步 808 跳过: %s", exc)
+
     return stats
 
 

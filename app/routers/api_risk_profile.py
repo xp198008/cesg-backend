@@ -51,6 +51,8 @@ async def risk_profile_summary(
     company_ids: str | None = Query(None, description="公司 id 列表，逗号分隔（与组织树 gids 一致）"),
     driver_id: int | None = Query(None, description="本地司机 id（司机风险画像优先）"),
     driver_name: str | None = Query(None),
+    start_date: str | None = Query(None, description="本地报警开始日 yyyy-MM-dd / yyyyMMdd"),
+    end_date: str | None = Query(None, description="本地报警结束日 yyyy-MM-dd / yyyyMMdd"),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
@@ -72,6 +74,8 @@ async def risk_profile_summary(
             company_ids=_parse_car_ids(company_ids),
             driver_id=driver_id,
             driver_name=driver_name,
+            start_date=start_date,
+            end_date=end_date,
             x_org_id=x_org_id,
             x_user_id=x_user_id,
         )

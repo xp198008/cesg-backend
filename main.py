@@ -245,9 +245,8 @@ async def _ensure_default_admin() -> None:
 
 
 async def _background_address_backfill() -> None:
-    """启动后连续多批补地址，尽快清空历史空地址。"""
-    await asyncio.sleep(5)
-    from app.database import AsyncSessionLocal
+    """启动后连续多批补地址；错开高峰，避免和登录/列表抢写锁。"""
+    await asyncio.sleep(60)
     from app.violation_address_backfill import (
         backfill_vehicle_location_addresses,
         backfill_violation_addresses,
@@ -255,54 +254,57 @@ async def _background_address_backfill() -> None:
 
     try:
         for round_no in range(1, 26):
-            async with AsyncSessionLocal() as s:
-                v = await backfill_violation_addresses(s, limit=40)
-                l = await backfill_vehicle_location_addresses(s, limit=20)
-                await s.commit()
+            v = await backfill_violation_addresses(limit=40)
+            l = await backfill_vehicle_location_addresses(limit=20)
             if v == 0 and l == 0:
                 logger.info("报警地址启动回填已完成（第 %s 轮无待补记录）", round_no)
                 break
             logger.info("报警地址启动回填第 %s 轮：违章 %s 条，位置 %s 条", round_no, v, l)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(2.0)
     except Exception as exc:  # noqa: BLE001
         logger.warning("报警地址启动回填失败: %s", exc)
 
 
 async def _background_startup_backfill() -> None:
-    """只补登录统计等轻量字段；公司名全表回填已完成，不再每次启动扫 1.4 万行。"""
-    await asyncio.sleep(1)
+    """启动只做轻量补齐。全量重建日汇总会长时间占 SQLite 写锁，导致登录和基础数据列表卡住。"""
+    await asyncio.sleep(3)
     from app.database import AsyncSessionLocal
-    from app.user_online_daily import backfill_login_log_org_names, rebuild_daily_from_login_logs
+    from app.user_online_daily import backfill_login_log_org_names, finalize_stale_open_sessions
     from app.obd_speed_monitor import backfill_abnormal_obd_speed_false_alarms
     from app.violation_ai_assessment import backfill_insufficient_evidence_false_alarms
     from app.violation_risk_backfill import backfill_violation_risk_levels
+    from app.routers.api_driver import backfill_driver_company_from_vehicles
 
     try:
         async with AsyncSessionLocal() as s:
             filled = await backfill_login_log_org_names(s)
             if filled:
                 logger.info("已补全 %s 条登录明细的所属公司", filled)
-            rebuilt = await rebuild_daily_from_login_logs(s)
+            driver_filled = await backfill_driver_company_from_vehicles(s)
+            if driver_filled:
+                logger.info("已补全 %s 条司机的所属公司", driver_filled)
+            stale = await finalize_stale_open_sessions(s)
             await backfill_violation_risk_levels(s)
             await s.commit()
-            if rebuilt:
-                logger.info("已重建 %s 条登录会话的用户按日在线记录", rebuilt)
+            if stale:
+                logger.info("启动已补全 %s 条过期未退出会话", stale)
     except Exception as exc:  # noqa: BLE001
         logger.warning("启动后台回填失败: %s", exc)
 
+    await asyncio.sleep(15)
     try:
         total = 0
         before_id = None
         for _ in range(80):
             async with AsyncSessionLocal() as s:
                 n, before_id, scanned = await backfill_insufficient_evidence_false_alarms(
-                    s, limit=400, before_id=before_id
+                    s, limit=200, before_id=before_id
                 )
                 await s.commit()
             total += n
             if scanned <= 0:
                 break
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(1.0)
         if total:
             logger.info("启动回填：证据不足已按误报处理 %s 条", total)
     except Exception as exc:  # noqa: BLE001
@@ -314,13 +316,13 @@ async def _background_startup_backfill() -> None:
         for _ in range(80):
             async with AsyncSessionLocal() as s:
                 n, before_id, scanned = await backfill_abnormal_obd_speed_false_alarms(
-                    s, limit=400, before_id=before_id
+                    s, limit=200, before_id=before_id
                 )
                 await s.commit()
             total += n
             if scanned <= 0:
                 break
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(1.0)
         if total:
             logger.info("启动回填：OBD 时速异常已按误报处理 %s 条", total)
     except Exception as exc:  # noqa: BLE001
@@ -442,6 +444,18 @@ async def _shutdown() -> None:
         pass
     try:
         await vehicle_jt808_sync_scheduler.stop()
+    except Exception:
+        pass
+    try:
+        from app.database import DATABASE_URL, engine
+
+        if "sqlite" in (DATABASE_URL or ""):
+            try:
+                async with engine.begin() as conn:
+                    await conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+        await engine.dispose()
     except Exception:
         pass
 

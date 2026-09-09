@@ -8,6 +8,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Float,
     JSON,
@@ -610,6 +611,9 @@ class VehicleViolation(Base):
     """主动安全/违章报警记录，兼容旧项目安全管理页面。"""
 
     __tablename__ = "vehicle_violation"
+    __table_args__ = (
+        Index("ix_vv_status_time_id", "status", "violation_time", "id"),
+    )
     id = Column(Integer, primary_key=True, autoincrement=True)
     biz_no = Column(String(32), nullable=False, unique=True, index=True)
     external_alarm_id = Column(String(128), nullable=True, unique=True, index=True)

@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from app.database import AsyncSessionLocal
 from app.violation_address_backfill import (
     backfill_vehicle_location_addresses,
     backfill_violation_addresses,
@@ -46,10 +45,8 @@ class AddressBackfillScheduler:
                 pass
 
     async def run_once(self) -> dict[str, int]:
-        async with AsyncSessionLocal() as db:
-            v = await backfill_violation_addresses(db, limit=_BATCH_VIOLATIONS)
-            l = await backfill_vehicle_location_addresses(db, limit=_BATCH_LOCATIONS)
-            await db.commit()
+        v = await backfill_violation_addresses(limit=_BATCH_VIOLATIONS)
+        l = await backfill_vehicle_location_addresses(limit=_BATCH_LOCATIONS)
         self._last_violation_updated = v
         self._last_location_updated = l
         self._last_error = None

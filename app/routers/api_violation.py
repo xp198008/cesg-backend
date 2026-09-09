@@ -81,6 +81,11 @@ class ViolationPendingAliveIn(BaseModel):
     ids: list[int] = Field(default_factory=list, max_length=3000)
 
 
+class ViolationOnlineAmongIn(BaseModel):
+    plates: list[str] = Field(default_factory=list, max_length=3000)
+    terminal_ids: list[str] = Field(default_factory=list, max_length=3000)
+
+
 class ViolationManualIn(BaseModel):
     plate_no: str = Field(..., min_length=1, max_length=16)
     violation_type_dict_id: int | None = Field(None, ge=1)
@@ -690,8 +695,8 @@ async def violation_list(
         description="是否按停用报警类型软隐藏历史记录；默认开启",
     ),
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=200),
-    limit: int | None = Query(None, ge=1, le=2000),
+    page_size: int = Query(20, ge=1, le=3000),
+    limit: int | None = Query(None, ge=1, le=3000),
     offset: int | None = Query(None, ge=0),
     min_id: int | None = Query(None, ge=0),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
@@ -751,16 +756,9 @@ async def violation_list(
     if min_id is not None and min_id > 0:
         q = q.where(VehicleViolation.id > min_id)
 
-    # count 只统计 id，避免对整行实体做 subquery
-    total = (
-        await db.scalar(
-            select(func.count()).select_from(
-                q.with_only_columns(VehicleViolation.id, maintain_column_froms=True)
-                .order_by(None)
-                .subquery()
-            )
-        )
-    ) or 0
+    # 直接在原查询上 count，禁止 select(func.count()).select_from(q.subquery())：
+    # 后者会把 vehicle_violation 和子查询叉乘，一周待处理会从毫秒变成十几秒。
+    total = (await db.scalar(q.with_only_columns(func.count()).order_by(None))) or 0
     lim = limit or page_size
     off = offset if offset is not None else (page - 1) * page_size
     order = (
@@ -840,7 +838,7 @@ async def violation_recent_pending(
         for ticket in (await db.execute(select(ViolationTicket).where(ViolationTicket.biz_no.in_(biz)))).scalars().all():
             if ticket.biz_no:
                 ticket_by_biz[ticket.biz_no] = ticket
-    max_id = await db.scalar(select(func.max(VehicleViolation.id)).select_from(q.subquery()))
+    max_id = await db.scalar(q.with_only_columns(func.max(VehicleViolation.id)).order_by(None))
     max_id = int(max_id or after_id)
     return {
         "ok": True,
@@ -854,15 +852,26 @@ async def violation_recent_pending(
 async def violation_alert_cache(
     after_seq: int = Query(-1, ge=-1),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
-    db: AsyncSession = Depends(get_db),
 ):
     """新增报警缓存增量。after_seq=-1 只取当前水位（登录时调用一次），
     之后带上次返回的 max_seq 轮询，有新条目即弹窗。按 X-Org-Id 过滤可见公司。
-    停用报警类型的历史/缓存条目一并隐藏。"""
+    停用报警类型的历史/缓存条目一并隐藏。
+    无新报警时不碰 SQLite，避免启动回填占锁时把看板轮询卡到几十秒。"""
     alerts, max_seq = get_alerts_after(after_seq)
     alerts = [a for a in alerts if (a.get("status") or "待处理").strip() == "待处理"]
-    disabled = set(expand_disabled_alarm_type_names(await load_disabled_alarm_type_names(db)))
-    if alerts and disabled:
+    if not alerts:
+        return {"ok": True, "items": [], "max_seq": max_seq}
+
+    from app.database import AsyncSessionLocal
+    from app.ttl_cache import ttl_get
+
+    cached_disabled = ttl_get("alarm:disabled_type_names", 60)
+    if cached_disabled is not None:
+        disabled = set(expand_disabled_alarm_type_names(cached_disabled))
+    else:
+        async with AsyncSessionLocal() as db:
+            disabled = set(expand_disabled_alarm_type_names(await load_disabled_alarm_type_names(db)))
+    if disabled:
         alerts = [
             a
             for a in alerts
@@ -871,10 +880,11 @@ async def violation_alert_cache(
     if alerts and x_org_id:
         try:
             root = require_x_org_id_header(x_org_id)
-            exists = await db.scalar(select(OrgCompany.id).where(OrgCompany.id == root).limit(1))
-            if exists:
-                subtree = await collect_org_company_subtree_ids(db, root)
-                alerts = [a for a in alerts if a.get("company_id") is None or a.get("company_id") in subtree]
+            async with AsyncSessionLocal() as db:
+                exists = await db.scalar(select(OrgCompany.id).where(OrgCompany.id == root).limit(1))
+                if exists:
+                    subtree = await collect_org_company_subtree_ids(db, root)
+                    alerts = [a for a in alerts if a.get("company_id") is None or a.get("company_id") in subtree]
         except HTTPException:
             pass
     return {"ok": True, "items": alerts, "max_seq": max_seq}
@@ -895,7 +905,7 @@ async def violation_pending_watermark(
             and_(VehicleViolation.status == "待审核", VehicleViolation.pre_audit_kind == "preprocess"),
         )
     )
-    max_id = await db.scalar(select(func.max(VehicleViolation.id)).select_from(q.subquery()))
+    max_id = await db.scalar(q.with_only_columns(func.max(VehicleViolation.id)).order_by(None))
     return {"ok": True, "max_id": int(max_id or 0)}
 
 
@@ -919,8 +929,76 @@ async def violation_pending_alive(
             and_(VehicleViolation.status == "待审核", VehicleViolation.pre_audit_kind == "preprocess"),
         ),
     )
-    alive = list((await db.execute(select(VehicleViolation.id).select_from(q.subquery()))).scalars().all())
+    alive = list((await db.execute(q.with_only_columns(VehicleViolation.id).order_by(None))).scalars().all())
     return {"ok": True, "alive_ids": [int(x) for x in alive]}
+
+
+def _online_plate_key(raw: Any) -> str:
+    text = norm_plate(raw if isinstance(raw, str) else str(raw or ""))
+    return text.replace(" ", "").upper()
+
+
+@router.post("/online-among")
+async def violation_online_among(
+    body: ViolationOnlineAmongIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """当前报警列表里这些车牌/终端，有多少台此刻在线（读 vehicle_location）。"""
+    plate_keys = []
+    seen_plates: set[str] = set()
+    for raw in body.plates or []:
+        key = _online_plate_key(raw)
+        if not key or key in seen_plates:
+            continue
+        seen_plates.add(key)
+        plate_keys.append(key)
+        if len(plate_keys) >= 3000:
+            break
+
+    raw_tids: list[str] = []
+    seen_tids: set[str] = set()
+    for raw in body.terminal_ids or []:
+        text = str(raw or "").strip()
+        if not text or text in seen_tids:
+            continue
+        seen_tids.add(text)
+        raw_tids.append(text)
+        if len(raw_tids) >= 3000:
+            break
+    tid_keys = set(expand_terminal_id_variants(raw_tids)) if raw_tids else set()
+
+    if not plate_keys and not tid_keys:
+        return {"ok": True, "online": 0, "total": 0, "online_plates": []}
+
+    conds = []
+    if plate_keys:
+        conds.append(func.replace(func.upper(VehicleLocation.plate_no), " ", "").in_(plate_keys))
+    if tid_keys:
+        conds.append(VehicleLocation.terminal_id.in_(list(tid_keys)))
+    loc_rows = (
+        await db.execute(
+            select(VehicleLocation.plate_no, VehicleLocation.terminal_id).where(
+                VehicleLocation.is_online.is_(True),
+                or_(*conds),
+            )
+        )
+    ).all()
+    online_plates: list[str] = []
+    seen_online: set[str] = set()
+    for plate, tid in loc_rows:
+        key = _online_plate_key(plate)
+        if not key:
+            key = _online_plate_key(tid)
+        if not key or key in seen_online:
+            continue
+        seen_online.add(key)
+        online_plates.append(key)
+    return {
+        "ok": True,
+        "online": len(online_plates),
+        "total": len(plate_keys) or len(tid_keys),
+        "online_plates": online_plates,
+    }
 
 
 @router.post("/manual/ocr")

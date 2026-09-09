@@ -176,6 +176,29 @@ async def _ensure_company(db: AsyncSession, company_id: int) -> None:
         raise HTTPException(status_code=400, detail="所属公司不存在")
 
 
+def _require_company_id(company_id: int | None) -> int:
+    if company_id is None or int(company_id) < 1:
+        raise HTTPException(status_code=400, detail="所属公司不能为空，请选择所属公司后再保存")
+    return int(company_id)
+
+
+async def backfill_driver_company_from_vehicles(db: AsyncSession) -> int:
+    """无所属公司的司机：若已绑定车辆，用车辆公司回填，避免司机画像按公司对不上。"""
+    rows = (await db.execute(select(Driver).where(Driver.company_id.is_(None)))).scalars().all()
+    filled = 0
+    for driver in rows:
+        company_id = await db.scalar(
+            select(Vehicle.company_id)
+            .where(Vehicle.driver_id == driver.id, Vehicle.company_id.is_not(None))
+            .limit(1)
+        )
+        if company_id is None:
+            continue
+        driver.company_id = int(company_id)
+        filled += 1
+    return filled
+
+
 def _vehicle_control_item(v: Vehicle, main_dev: VehicleDevice | None, fleet_name: str | None) -> dict:
     return {
         "vehicle_id": v.id,
@@ -390,11 +413,12 @@ async def driver_get(did: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("")
 async def driver_create(body: DriverCreateIn, db: AsyncSession = Depends(get_db)):
-    await _ensure_company(db, body.company_id)
+    company_id = _require_company_id(body.company_id)
+    await _ensure_company(db, company_id)
     bd = _parse_date(body.birth_date)
     row = Driver(
         name=body.name.strip(),
-        company_id=body.company_id,
+        company_id=company_id,
         gender=(body.gender.strip() if body.gender else None) or None,
         certificate_code=(body.certificate_code.strip() if body.certificate_code else None) or None,
         id_card=body.id_card,
@@ -426,9 +450,11 @@ async def driver_update(did: int, body: DriverUpdateIn, db: AsyncSession = Depen
     if row is None:
         raise HTTPException(status_code=404, detail="司机不存在")
     patch = body.model_dump(exclude_unset=True)
-    if "company_id" in patch and patch["company_id"] is not None:
-        await _ensure_company(db, patch["company_id"])
-        row.company_id = patch["company_id"]
+    next_company_id = patch["company_id"] if "company_id" in patch else row.company_id
+    company_id = _require_company_id(next_company_id)
+    if row.company_id != company_id:
+        await _ensure_company(db, company_id)
+        row.company_id = company_id
     if "name" in patch and patch["name"] is not None:
         row.name = patch["name"].strip()
     if "gender" in patch:

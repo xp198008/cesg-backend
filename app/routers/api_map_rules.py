@@ -1,12 +1,14 @@
 """地图配置与公用地图规则（公用限速管理）本地接口。"""
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.models import (
@@ -21,6 +23,7 @@ from app.models import (
 )
 from app.jt808_alarm_sync import _vehicle_by_plate, _vehicle_by_terminal
 from app.obd_speed_monitor import resolve_vehicle_rule_speed
+from app.org_scope import require_user_company_subtree_ids
 from app.vehicle_alloc_scope import parse_user_id_header
 
 router = APIRouter(prefix="/api", tags=["map-rules"])
@@ -317,6 +320,87 @@ async def public_map_rule_delete(rid: int, db: AsyncSession = Depends(get_db)):
     return {"ok": True}
 
 
+RULE_CONVERT_PERM = "114"
+
+
+async def _require_rule_convert_permission(db: AsyncSession, x_user_id: str | None) -> None:
+    """虚拟权限「规则转换」(114)。admin 或角色显式勾选 114 可通过，不随地图管理父节点继承。"""
+    uid = parse_user_id_header(x_user_id)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="缺少登录用户")
+    user = await db.scalar(
+        select(SysUser).options(selectinload(SysUser.role)).where(SysUser.id == uid).limit(1)
+    )
+    if user is None:
+        raise HTTPException(status_code=401, detail="用户不存在")
+    username = (user.username or "").strip().lower()
+    role_code = ((user.role.code if user.role else "") or "").strip().lower()
+    if username == "admin" or role_code == "admin":
+        return
+    raw = (user.role.permissions if user.role else "") or "[]"
+    try:
+        ids = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        ids = []
+    owned = {str(x).strip() for x in (ids if isinstance(ids, list) else []) if x is not None}
+    if RULE_CONVERT_PERM in owned:
+        return
+    raise HTTPException(status_code=403, detail="需要「规则转换」权限")
+
+
+class BatchFromPrivateBody(BaseModel):
+    private_rule_ids: list[int] = Field(default_factory=list)
+
+
+@router.post("/public-map-rules/from-private")
+async def public_map_rules_from_private(
+    body: BatchFromPrivateBody,
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """将下级成员单位的私有规则复制为集团公用规则（需虚拟权限「规则转换」）。"""
+    await _require_rule_convert_permission(db, x_user_id)
+    _root, subtree = await require_user_company_subtree_ids(
+        db, x_org_id=x_org_id, x_user_id=x_user_id
+    )
+    created = updated = skipped = 0
+    for pid in list(dict.fromkeys(body.private_rule_ids)):
+        row = await db.scalar(select(PrivateMapRule).where(PrivateMapRule.id == pid).limit(1))
+        if row is None or int(row.company_id) not in subtree:
+            skipped += 1
+            continue
+        if row.ref_public_rule_id:
+            skipped += 1
+            continue
+        code = f"PUB-PRV-{row.id}"
+        existed_id = await db.scalar(
+            select(PublicMapRule.id).where(PublicMapRule.rule_code == code).limit(1)
+        )
+        if existed_id:
+            row.ref_public_rule_id = int(existed_id)
+            updated += 1
+            continue
+        remark = (row.remark or "").strip()
+        source = (row.company_name or "").strip()
+        note = f"由成员单位私有规则转换{('：' + source) if source else ''}"
+        pub = PublicMapRule(
+            rule_code=code,
+            rule_name=row.rule_name,
+            rule_type_code=row.rule_type_code,
+            draw_shape_type=row.draw_shape_type,
+            geometry_json=row.geometry_json,
+            is_public=1,
+            remark=(f"{remark}；{note}" if remark else note)[:255],
+        )
+        db.add(pub)
+        await db.flush()
+        row.ref_public_rule_id = pub.id
+        created += 1
+    await db.flush()
+    return {"ok": True, "created": created, "updated": updated, "skipped": skipped}
+
+
 DEFAULT_ROAD_TYPE_NAME = "高速公路"
 
 
@@ -350,6 +434,12 @@ class PrivateMapRuleUpdateBody(BaseModel):
 
 
 class PrivateRuleCategoryAssignBody(BaseModel):
+    category_ids: list[int] = Field(default_factory=list)
+    park_stop_limit_minutes: int = Field(0, ge=0, le=10000)
+
+
+class BatchAssignCategoriesBody(BaseModel):
+    rule_ids: list[int] = Field(default_factory=list)
     category_ids: list[int] = Field(default_factory=list)
     park_stop_limit_minutes: int = Field(0, ge=0, le=10000)
 
@@ -956,6 +1046,40 @@ async def private_map_rule_categories_get(
     }
 
 
+async def _validate_assign_category_ids(db: AsyncSession, company_id: int, category_ids: list[int]) -> list[int]:
+    ids = _normalize_vehicle_ids(category_ids)
+    if not ids:
+        return []
+    rows = (
+        await db.execute(
+            select(MapRuleCategory.id, MapRuleCategory.type_name, MapRuleCategory.assigned_vehicle_ids)
+            .where(MapRuleCategory.company_id == company_id, MapRuleCategory.id.in_(ids))
+        )
+    ).all()
+    existing = {int(cid) for cid, _, _ in rows}
+    missing = [x for x in ids if x not in existing]
+    if missing:
+        raise HTTPException(status_code=400, detail="包含不存在或不属于本公司的规则类别")
+    no_vehicle = [
+        int(cid)
+        for cid, _, vehicle_ids in rows
+        if not _normalize_vehicle_ids(vehicle_ids if isinstance(vehicle_ids, list) else [])
+    ]
+    if no_vehicle:
+        raise HTTPException(status_code=400, detail="包含未分配车辆的规则类别，不能分配")
+    vehicle_owner: dict[int, str] = {}
+    for cid, type_name, vehicle_ids in rows:
+        label = str(type_name or f"类别#{cid}")
+        for vid in _normalize_vehicle_ids(vehicle_ids if isinstance(vehicle_ids, list) else []):
+            if vid in vehicle_owner:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"规则「{vehicle_owner[vid]}」与规则「{label}」车辆有交集",
+                )
+            vehicle_owner[vid] = label
+    return ids
+
+
 @router.put("/private-map-rules/{rid}/categories")
 async def private_map_rule_categories_put(
     rid: int,
@@ -969,39 +1093,7 @@ async def private_map_rule_categories_put(
     )
     if row is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    ids = _normalize_vehicle_ids(body.category_ids)
-    if ids:
-        rows = (
-            await db.execute(
-                select(MapRuleCategory.id, MapRuleCategory.type_name, MapRuleCategory.assigned_vehicle_ids)
-                .where(MapRuleCategory.company_id == cid, MapRuleCategory.id.in_(ids))
-            )
-        ).all()
-        existing = {int(rid) for rid, _, _ in rows}
-        missing = [x for x in ids if x not in existing]
-        if missing:
-            raise HTTPException(status_code=400, detail="包含不存在或不属于本公司的规则类别")
-        no_vehicle = [
-            int(rid)
-            for rid, _, vehicle_ids in rows
-            if not _normalize_vehicle_ids(vehicle_ids if isinstance(vehicle_ids, list) else [])
-        ]
-        if no_vehicle:
-            raise HTTPException(status_code=400, detail="包含未分配车辆的规则类别，不能分配")
-        vehicle_owner: dict[int, str] = {}
-        conflicts: list[str] = []
-        for rid, type_name, vehicle_ids in rows:
-            label = str(type_name or f"类别#{rid}")
-            for vid in _normalize_vehicle_ids(vehicle_ids if isinstance(vehicle_ids, list) else []):
-                if vid in vehicle_owner:
-                    conflicts.append(f"规则「{vehicle_owner[vid]}」与规则「{label}」车辆有交集")
-                    break
-                else:
-                    vehicle_owner[vid] = label
-            if conflicts:
-                break
-        if conflicts:
-            raise HTTPException(status_code=400, detail=conflicts[0])
+    ids = await _validate_assign_category_ids(db, cid, body.category_ids)
     row.category_ids = ids
     row.park_stop_limit_minutes = max(0, min(10000, int(body.park_stop_limit_minutes or 0)))
     await db.flush()
@@ -1011,6 +1103,45 @@ async def private_map_rule_categories_put(
         "selected_category_ids": ids,
         "park_stop_limit_minutes": int(row.park_stop_limit_minutes or 0),
         "data": _private_rule_out(row),
+    }
+
+
+@router.post("/private-map-rules/batch-assign-categories")
+async def private_map_rules_batch_assign_categories(
+    body: BatchAssignCategoriesBody,
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """把同一组规则类别批量绑定到多条道路规则（覆盖原绑定）。"""
+    cid = await _resolve_company_id(db, x_org_id)
+    rule_ids = list(dict.fromkeys(int(x) for x in (body.rule_ids or []) if x))
+    if not rule_ids:
+        raise HTTPException(status_code=400, detail="请选择要分配的道路规则")
+    if len(rule_ids) > 200:
+        raise HTTPException(status_code=400, detail="单次最多分配 200 条规则")
+    rows = (
+        await db.execute(
+            select(PrivateMapRule).where(
+                PrivateMapRule.company_id == cid,
+                PrivateMapRule.id.in_(rule_ids),
+            )
+        )
+    ).scalars().all()
+    found = {int(r.id) for r in rows}
+    missing = [x for x in rule_ids if x not in found]
+    if missing:
+        raise HTTPException(status_code=400, detail="包含不存在或不属于本公司的道路规则")
+    ids = await _validate_assign_category_ids(db, cid, body.category_ids)
+    park = max(0, min(10000, int(body.park_stop_limit_minutes or 0)))
+    for row in rows:
+        row.category_ids = ids
+        row.park_stop_limit_minutes = park
+    await db.flush()
+    return {
+        "ok": True,
+        "updated": len(rows),
+        "selected_category_ids": ids,
+        "park_stop_limit_minutes": park,
     }
 
 

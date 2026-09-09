@@ -352,6 +352,25 @@ async def _drivers_by_company_from_vehicles(
                 "name": name,
             }
 
+    extra = (
+        await db.execute(
+            select(Driver.id, Driver.name, Driver.company_id).where(Driver.company_id.is_not(None))
+        )
+    ).all()
+    for driver_id, driver_name, company_id in extra:
+        if company_id is None:
+            continue
+        cid = int(company_id)
+        if scoped_company_ids is not None and cid not in scoped_company_ids:
+            continue
+        name = (driver_name or "").strip()
+        if not name:
+            continue
+        key = f"id:{int(driver_id)}"
+        bucket = drivers_raw.setdefault(cid, {})
+        if key not in bucket:
+            bucket[key] = {"id": int(driver_id), "name": name}
+
     drivers_by_company: dict[int, list[dict[str, Any]]] = {}
     for cid, items in drivers_raw.items():
         drivers_by_company[cid] = sorted(items.values(), key=lambda x: x["name"])
@@ -899,6 +918,9 @@ async def company_delete(
     vv = await db.scalar(select(func.count()).select_from(Vehicle).where(Vehicle.company_id.in_(tree_ids)))
     if vv and vv > 0:
         raise HTTPException(400, "该组织或其下级组织下存在车辆，请先将车辆转移到其他组织后再删除")
+    dv = await db.scalar(select(func.count()).select_from(Driver).where(Driver.company_id.in_(tree_ids)))
+    if dv and dv > 0:
+        raise HTTPException(400, "该组织或其下级组织下存在司机，请先将司机转移到其他组织后再删除")
 
     by_parent: dict[int | None, list[int]] = {}
     gid_map: dict[int, int] = {}

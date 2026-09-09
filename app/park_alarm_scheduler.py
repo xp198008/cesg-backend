@@ -16,7 +16,6 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.amap_regeo import resolve_address_wgs84
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.geo_utils import geometry_hit, wgs84_to_gcj02
@@ -380,11 +379,6 @@ async def run_park_alarm_once() -> ParkAlarmRunResult:
 
                 day = end.strftime("%Y%m%d")
                 address = _extract_address(item)
-                if not address:
-                    try:
-                        address = await resolve_address_wgs84(db, lat_wgs, lng_wgs) or ""
-                    except Exception:  # noqa: BLE001
-                        address = ""
 
                 rule_name = str(getattr(matched_rule, "rule_name", None) or "").strip()
                 write = await asyncio.to_thread(

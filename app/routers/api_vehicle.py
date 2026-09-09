@@ -1579,10 +1579,22 @@ async def vehicle_list(
         fleet_map = {}
         for fid, fname in (await db.execute(select(Fleet.id, Fleet.name))).all():
             fleet_map[fid] = fname
+        driver_ids = sorted({int(r.driver_id) for r in rows if r.driver_id})
+        driver_map: dict[int, str] = {}
+        if driver_ids:
+            for did, dname in (
+                await db.execute(select(Driver.id, Driver.name).where(Driver.id.in_(driver_ids)))
+            ).all():
+                name = (dname or "").strip()
+                if name:
+                    driver_map[int(did)] = name
         items = []
         for r in rows:
             display_company_name, display_fleet_name = _vehicle_list_company_fleet_names(
                 r.company_id, r.fleet_id, company_map, parent_map, fleet_map
+            )
+            bound_driver_name = (r.driver_name or "").strip() or (
+                driver_map.get(int(r.driver_id)) if r.driver_id else None
             )
             items.append(
                 {
@@ -1592,6 +1604,8 @@ async def vehicle_list(
                     "company_name": display_company_name,
                     "fleet_id": r.fleet_id,
                     "fleet_name": display_fleet_name,
+                    "driver_id": r.driver_id,
+                    "driver_name": bound_driver_name,
                 }
             )
         return {"total": total, "items": items, "page": page, "page_size": page_size}

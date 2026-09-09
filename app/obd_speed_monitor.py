@@ -42,7 +42,6 @@ from app.alarm_type_gate import (
     risk_level_from_alarm_type,
 )
 from app.amap_grasp_road import GraspTrailPoint, grasp_road_with_keys
-from app.amap_regeo import resolve_address_wgs84
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.geo_utils import geometry_hit, wgs84_to_gcj02
@@ -1031,8 +1030,7 @@ async def run_obd_speed_check_once() -> ObdSyncResult:
                 result.skipped_no_position += 1
                 continue
 
-            if not (address or "").strip():
-                address = await resolve_address_wgs84(db, lng_lat[1], lng_lat[0])
+            # 地址空着留给库外回填，避免开着写事务打高德
 
             lng_gcj, lat_gcj = wgs84_to_gcj02(lng_lat[0], lng_lat[1])
             grasp_applied = False

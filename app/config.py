@@ -13,12 +13,12 @@ _DEFAULT_DB = _BACKEND_DIR / "data" / "cesg.db"
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_BACKEND_DIR / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
 
-    # 数据库（默认本项目 data/cesg.db；可用 DATABASE_URL 覆盖）
+    # 数据库（默认本项目 data/cesg.db；现网用 DATABASE_URL 指向本机 MySQL 的 cesg 库）
     database_url: str = f"sqlite+aiosqlite:///{_DEFAULT_DB.as_posix()}"
 
     # 服务监听端口（与旧 8000 区分，避免混淆）

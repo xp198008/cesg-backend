@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -39,9 +40,30 @@ if "sqlite" in DATABASE_URL:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:  # noqa: BLE001
         logger.warning("SQLite 数据目录创建失败: %s", e)
-    _engine_kw["connect_args"] = {"timeout": 60.0}
+    # timeout 传给 sqlite3.connect；再在 connect 事件里写 PRAGMA，
+    # 避免 aiosqlite 连接实际 busy_timeout 仍是默认 2 秒。
+    _engine_kw["connect_args"] = {"timeout": 30.0}
+else:
+    _engine_kw["pool_pre_ping"] = True
+    _engine_kw["pool_recycle"] = 1800
+    _engine_kw["pool_size"] = 10
+    _engine_kw["max_overflow"] = 20
 
 engine = create_async_engine(DATABASE_URL, echo=False, **_engine_kw)
+
+if "sqlite" in DATABASE_URL:
+    def _sqlite_on_connect(dbapi_connection, _connection_record) -> None:
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA temp_store=MEMORY")
+            cursor.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SQLite PRAGMA 设置失败: %s", exc)
+
+    event.listen(engine.sync_engine, "connect", _sqlite_on_connect)
 
 AsyncSessionLocal = async_sessionmaker(
     engine,
@@ -62,6 +84,13 @@ async def init_models() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        try:
+            await conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_vv_status_time_id "
+                "ON vehicle_violation (status, violation_time, id)"
+            )
+        except Exception:
+            pass
         if "sqlite" in DATABASE_URL:
             cols = await conn.exec_driver_sql("PRAGMA table_info(sys_user)")
             names = {row[1] for row in cols.fetchall()}

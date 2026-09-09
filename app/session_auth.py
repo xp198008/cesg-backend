@@ -8,6 +8,11 @@ from __future__ import annotations
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from app.ttl_cache import ttl_clear, ttl_get, ttl_set
+
+# 轮询接口（alert-cache 每 5s）不能每次都查 SQLite；启动回填占写锁时会卡到 30s+
+_SESSION_OK_TTL = 8.0
+
 COOKIE_NAME = "cesg_session"
 
 _PUBLIC_EXACT = {
@@ -92,6 +97,20 @@ def clear_session_cookie(response) -> None:
     response.delete_cookie(key=COOKIE_NAME, path="/")
 
 
+def _session_cache_key(token: str) -> str:
+    return f"session:tok:{token}"
+
+
+def invalidate_session_token(token: str | None) -> None:
+    raw = (token or "").strip()
+    if raw:
+        ttl_clear(_session_cache_key(raw))
+
+
+def invalidate_all_session_tokens() -> None:
+    ttl_clear("session:tok:")
+
+
 def _headers_from_scope(scope: Scope) -> dict[str, str]:
     out: dict[str, str] = {}
     for key, val in scope.get("headers") or []:
@@ -105,6 +124,12 @@ async def _resolve_user(token: str, x_user_id: str | None):
     from app.database import AsyncSessionLocal
     from app.models import SysUser
     from app.timeutil import china_today
+
+    cached = ttl_get(_session_cache_key(token), _SESSION_OK_TTL)
+    if isinstance(cached, int):
+        if x_user_id and str(x_user_id).strip() and str(cached) != str(x_user_id).strip():
+            return "forbidden", "登录身份与请求用户不一致"
+        return "ok", cached
 
     async with AsyncSessionLocal() as db:
         user = await db.scalar(
@@ -120,6 +145,7 @@ async def _resolve_user(token: str, x_user_id: str | None):
                 return "forbidden", "当前用户已过有效期，请重新登录"
             if x_user_id and str(x_user_id).strip() and str(uid) != str(x_user_id).strip():
                 return "forbidden", "登录身份与请求用户不一致"
+            ttl_set(_session_cache_key(token), uid)
             return "ok", uid
 
         raw_uid = (x_user_id or "").strip()

@@ -287,6 +287,14 @@ async def _board_warnings(db: AsyncSession, scope, now: datetime, filter_rules) 
         key=lambda x: (-int(x.get("count") or 0), str(x.get("name") or "")),
     )
 
+    # 下方明细：当天待处理（不再截最近几小时 / 近7天最新20条）
+    pending_status = or_(
+        VehicleViolation.status == "待处理",
+        and_(
+            VehicleViolation.status == "待审核",
+            VehicleViolation.pre_audit_kind == "preprocess",
+        ),
+    )
     recent_rows = (
         await db.execute(
             scoped(
@@ -298,9 +306,12 @@ async def _board_warnings(db: AsyncSession, scope, now: datetime, filter_rules) 
                     VehicleViolation.violation_type_name,
                     VehicleViolation.status,
                 )
-                .where(VehicleViolation.violation_time >= type_since)
+                .where(
+                    VehicleViolation.violation_time >= day_start,
+                    pending_status,
+                )
                 .order_by(VehicleViolation.violation_time.desc())
-                .limit(20)
+                .limit(300)
             )
         )
     ).all()
@@ -322,6 +333,7 @@ async def _board_warnings(db: AsyncSession, scope, now: datetime, filter_rules) 
         "types": types,
         "types_range": type_range,
         "recent": recent,
+        "recent_range": "today_pending",
     }
 
 
@@ -504,8 +516,13 @@ async def _board_energy(db: AsyncSession, scoped_company_ids: set[int] | None) -
         except Exception:  # noqa: BLE001
             today_rows = []
         today_fuel = sum(float(r[0] or 0) for r in today_rows)
-        # mileage 已按日累加点火增量（跨日从 0 起），可作 OBD 兜底分母
-        today_mileage = sum(float(r[1] or 0) for r in today_rows)
+        # 单车当日超过 250km 视为 OBD 毛刺，封顶后再加总，避免一两台把车队里程顶到四五千
+        today_mileage = 0.0
+        for r in today_rows:
+            km = float(r[1] or 0)
+            if km <= 0:
+                continue
+            today_mileage += min(km, 250.0)
 
         # 近 7 日走势：每日 sum(fuel)
         daily = []
@@ -535,8 +552,21 @@ async def _board_energy(db: AsyncSession, scoped_company_ids: set[int] | None) -
     return {"oil": oil, "ev": ev}
 
 
-async def _board_drivers(db: AsyncSession, scoped_company_ids: set[int] | None) -> dict:
-    def scoped(q):
+# 近 7 日安全分：满分 100，每条有效违章扣 1 分。driver.score 是手工字段，现网全空，不能当来源。
+# 不按安全等级加权：现网报警类型几乎全是「高」，加权后评分榜会塌成全 0。
+_DRIVER_QUALIFY_SCORE = 60
+
+
+async def _board_drivers(
+    db: AsyncSession,
+    scoped_company_ids: set[int] | None,
+    *,
+    now: datetime,
+    filter_rules,
+) -> dict:
+    """合格司机 / 合格率 / 评分榜：用近 7 日违章（不含误报）给每位司机算安全分。"""
+
+    def scoped_driver(q):
         if scoped_company_ids is not None:
             q = q.where(
                 or_(
@@ -546,35 +576,83 @@ async def _board_drivers(db: AsyncSession, scoped_company_ids: set[int] | None) 
             )
         return q
 
-    total = int((await db.scalar(scoped(select(func.count()).select_from(Driver)))) or 0)
-    scored = int(
-        (await db.scalar(scoped(select(func.count()).select_from(Driver).where(Driver.score.isnot(None))))) or 0
-    )
-    qualified = int(
-        (await db.scalar(scoped(select(func.count()).select_from(Driver).where(Driver.score >= 60)))) or 0
-    )
-
-    async def rank(order_clause):
-        rows = (
-            await db.execute(
-                scoped(
-                    select(Driver.name, OrgCompany.short_name, OrgCompany.name, Driver.score)
-                    .join(OrgCompany, OrgCompany.id == Driver.company_id, isouter=True)
-                    .where(Driver.score.isnot(None))
-                    .order_by(order_clause)
-                    .limit(10)
+    driver_rows = (
+        await db.execute(
+            scoped_driver(
+                select(Driver.id, Driver.name, OrgCompany.short_name, OrgCompany.name).join(
+                    OrgCompany, OrgCompany.id == Driver.company_id, isouter=True
                 )
             )
-        ).all()
-        return [
-            {"name": r[0] or "—", "group": r[1] or r[2] or "—", "score": int(r[3] or 0)}
-            for r in rows
-        ]
+        )
+    ).all()
+    drivers = [
+        {
+            "id": int(r[0]),
+            "name": (r[1] or "").strip() or "—",
+            "group": (r[2] or r[3] or "").strip() or "—",
+            "deduct": 0,
+            "alarms": 0,
+        }
+        for r in driver_rows
+    ]
+    by_id = {d["id"]: d for d in drivers}
 
-    best = await rank(Driver.score.desc())
-    worst = await rank(Driver.score.asc())
+    veh_rows = (
+        await db.execute(select(Vehicle.id, Vehicle.driver_id).where(Vehicle.driver_id.isnot(None)))
+    ).all()
+    vehicle_to_driver = {
+        int(vid): int(did)
+        for vid, did in veh_rows
+        if vid and did and int(did) in by_id
+    }
 
+    if vehicle_to_driver:
+        since = now - timedelta(days=7)
+        visibility = violation_list_visibility(filter_rules)
+        q = (
+            select(VehicleViolation.vehicle_id, func.count().label("cnt"))
+            .where(
+                visibility,
+                VehicleViolation.status != _FALSE_ALARM_STATUS,
+                VehicleViolation.violation_time >= since,
+                VehicleViolation.vehicle_id.in_(list(vehicle_to_driver)),
+            )
+            .group_by(VehicleViolation.vehicle_id)
+        )
+        if scoped_company_ids is not None:
+            q = q.where(
+                or_(
+                    VehicleViolation.company_id.in_(scoped_company_ids),
+                    VehicleViolation.company_id.is_(None),
+                )
+            )
+        type_rows = (await db.execute(q)).all()
+        for vid, cnt in type_rows:
+            bucket = by_id.get(vehicle_to_driver.get(int(vid or 0)))
+            if not bucket:
+                continue
+            n = int(cnt or 0)
+            bucket["alarms"] += n
+
+    for d in drivers:
+        d["score"] = max(0, 100 - int(d["alarms"]))
+
+    total = len(drivers)
+    scored = total
+    qualified = sum(1 for d in drivers if d["score"] >= _DRIVER_QUALIFY_SCORE)
     qualify_rate = round(qualified * 100 / scored, 1) if scored else None
+
+    def as_row(item: dict) -> dict:
+        return {"name": item["name"], "group": item["group"], "score": item["score"]}
+
+    best = [
+        as_row(d)
+        for d in sorted(drivers, key=lambda x: (-x["score"], x["alarms"], x["name"]))[:10]
+    ]
+    worst = [
+        as_row(d)
+        for d in sorted(drivers, key=lambda x: (x["score"], -x["alarms"], x["name"]))[:10]
+    ]
     return {
         "total": total,
         "scored": scored,
@@ -595,7 +673,7 @@ async def build_board_stats(db: AsyncSession, x_org_id: str | None) -> dict:
     vehicles = await _board_vehicles(db, scoped_company_ids)
     warnings = await _board_warnings(db, scope, now, filter_rules)
     faults = await _board_faults(db, scoped_company_ids)
-    drivers = await _board_drivers(db, scoped_company_ids)
+    drivers = await _board_drivers(db, scoped_company_ids, now=now, filter_rules=filter_rules)
     energy = await _board_energy(db, scoped_company_ids)
 
     return {

@@ -7,10 +7,13 @@
 
 筛选条件：
 - status = 待处理
-- 非 OBD 超速
+- 非 OBD 超速、非人工录入
 - 报警类型过滤后可见
 - 尚未 AI 评估
 - 有图片或视频证据
+
+证据不足（未满 3 张图 + 1 段有效视频）时 ``run_violation_ai_assessment``
+会立刻按误报落库，不再延后等待。
 
 复用 ``run_violation_ai_assessment``（与处理弹窗同一套规则）。
 """
@@ -93,6 +96,11 @@ def _candidate_where(disabled_names: list[str], defer_ids: list[int]):
         VehicleViolation.status == "待处理",
         or_(VehicleViolation.ai_queried.is_(False), VehicleViolation.ai_queried.is_(None)),
         ViolationAiAssessment.id.is_(None),
+        or_(
+            VehicleViolation.source.is_(None),
+            VehicleViolation.source == "",
+            ~VehicleViolation.source.ilike("manual"),
+        ),
         violation_list_visibility(disabled_names),
         violation_non_obd_has_media_clause(),
     ]

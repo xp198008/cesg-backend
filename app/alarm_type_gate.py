@@ -38,6 +38,35 @@ async def load_disabled_alarm_type_names(db: AsyncSession) -> list[str]:
     return list(await ttl_get_or_set_async("alarm:disabled_type_names", _DISABLED_NAMES_TTL, _load))
 
 
+async def load_enabled_alarm_type_names(db: AsyncSession) -> list[str]:
+    async def _load() -> list[str]:
+        rows = (
+            await db.execute(
+                select(AlarmTypeDict.type_name).where(AlarmTypeDict.status == "启用").order_by(AlarmTypeDict.id.asc())
+            )
+        ).scalars().all()
+        return [str(x).strip() for x in rows if str(x or "").strip()]
+
+    return list(await ttl_get_or_set_async("alarm:enabled_type_names", _DISABLED_NAMES_TTL, _load))
+
+
+def alarm_type_name_is_enabled(type_name: str, enabled_names: list[str] | None) -> bool:
+    """名称是否落在启用中的系统报警类型（含一/二/三级、OBD 超速别名）。"""
+    incoming = (type_name or "").strip()
+    if not incoming:
+        return False
+    catalog: set[str] = set()
+    for name in enabled_names or []:
+        catalog.update(_expand_one_violation_type_query_name(name))
+        catalog.update(disabled_alarm_type_name_aliases(name))
+    keys = {incoming, _strip_type_level_suffix(incoming)}
+    keys.update(_expand_one_violation_type_query_name(incoming))
+    keys.update(disabled_alarm_type_name_aliases(incoming))
+    keys.discard("")
+    catalog.discard("")
+    return bool(keys & catalog)
+
+
 def disabled_alarm_type_name_aliases(name: str) -> list[str]:
     """兼容历史「二级/2级」等写法，使停用软隐藏能盖住旧记录。"""
     text = (name or "").strip()

@@ -3,10 +3,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import and_, or_, select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.db_upsert import insert_ignore_stmt
 from app.jt808_obd_fuel_sync import notify_obd_fuel_daily_by_keys
 from app.models import ObdEnergySnapshot, ObdFuelDaily
 from app.timeutil import china_now_naive
@@ -113,23 +113,26 @@ async def _backfill_from_snapshot(
                 company_id = getattr(vehicle, "company_id", None)
         except Exception:  # noqa: BLE001
             pass
-        stmt = sqlite_insert(ObdFuelDaily).values(
-            device_no=device_no,
-            plate_no=plate_no,
-            vehicle_id=vehicle_id,
-            company_id=company_id,
-            day=day,
-            fuel_l=float(snap.fuel) if snap.fuel is not None else None,
-            drive_km=None,
-            start_mileage=None,
-            end_mileage=None,
-            fuel_per_100km=None,
-            source="obd_energy_snapshot",
-            report_time=snap.report_time,
-            updated_at=now,
-            created_at=now,
+        stmt = insert_ignore_stmt(
+            ObdFuelDaily,
+            {
+                "device_no": device_no,
+                "plate_no": plate_no,
+                "vehicle_id": vehicle_id,
+                "company_id": company_id,
+                "day": day,
+                "fuel_l": float(snap.fuel) if snap.fuel is not None else None,
+                "drive_km": None,
+                "start_mileage": None,
+                "end_mileage": None,
+                "fuel_per_100km": None,
+                "source": "obd_energy_snapshot",
+                "report_time": snap.report_time,
+                "updated_at": now,
+                "created_at": now,
+            },
+            ["device_no", "day"],
         )
-        stmt = stmt.on_conflict_do_nothing(index_elements=["device_no", "day"])
         await db.execute(stmt)
         wrote += 1
         try:

@@ -32,7 +32,11 @@ from app.violation_filters import is_obd_speed_source, violation_row_is_page_vis
 
 _AI_AUTO_FALSE_ALARM_HANDLER = "AI自动评估"
 _AI_AUTO_FALSE_ALARM_REMARK = "AI评估建议为误报，系统自动处理"
-_INSUFFICIENT_EVIDENCE_REMARK = "证据不足（未满3张图片+1段有效视频，或视频长度为0），未调用AI，系统按误报处理"
+_INSUFFICIENT_EVIDENCE_REMARK = (
+    "该违章记录缺少3张照片及1段视频的完整取证资料，可能影响判定准确性，"
+    "不具备AI自动判定条件，建议转交人工裁决，并检查、调整灵眸车联主机的取证功能设置，"
+    "确保后续取证资料完整。"
+)
 _AI_REQUIRED_IMAGE_COUNT = 3
 _MIN_USABLE_VIDEO_BYTES = 2048
 _DOWNLOAD_TIMEOUT = httpx.Timeout(20.0, connect=8.0, read=20.0, write=10.0, pool=5.0)
@@ -435,8 +439,10 @@ def _gather_media_refs(row: VehicleViolation) -> tuple[list[str], str | None]:
 
 
 def _should_false_alarm_for_insufficient_evidence(row: VehicleViolation) -> bool:
-    """非 OBD：必须满 3 张图 + 1 段有效视频才问 AI，否则直接误报。"""
+    """非 OBD、非人工录入：必须满 3 张图 + 1 段有效视频才问 AI，否则直接误报。"""
     if is_obd_speed_source(getattr(row, "source", None)):
+        return False
+    if str(getattr(row, "source", "") or "").strip().lower() == "manual":
         return False
     if len(_list_image_urls(row)) < _AI_REQUIRED_IMAGE_COUNT:
         return True
@@ -1076,8 +1082,13 @@ async def _resolve_ticket_after_video(
 
 
 def _maybe_auto_false_alarm(row: VehicleViolation, process_type: str | None) -> bool:
-    """AI 建议为误报且记录仍为待处理时，自动落库为误报。"""
+    """AI 建议为误报且记录仍为待处理时，自动落库为误报。
+
+    车辆报修人工录入不走这套：审核通过后的「待处理」要留在违章手动处理页。
+    """
     if (process_type or "").strip() != "误报":
+        return False
+    if str(getattr(row, "source", "") or "").strip() == "manual":
         return False
     if (row.status or "").strip() != "待处理":
         return False
@@ -1123,17 +1134,12 @@ async def _apply_insufficient_evidence_false_alarm(
     video_url = _first_video_url(row)
     n_img = len(image_urls)
     has_video = bool(video_url)
-    zero_len = _has_zero_length_video(row)
-    video_desc = "视频长度为0" if zero_len and not has_video else ("有有效视频" if has_video else "无有效视频")
-    eval_text = (
-        f"证据不足，未调用AI。当前图片 {n_img} 张，{video_desc}。"
-        f"完整证据需 {_AI_REQUIRED_IMAGE_COUNT} 张图片加 1 段有效视频，故按误报处理。"
-    )
+    eval_text = _INSUFFICIENT_EVIDENCE_REMARK
     ticket_info = {
         "process_type": "误报",
         "amount": 0.0,
-        "basis": "证据不足",
-        "suggestion_text": _ticket_suggestion_text("误报", 0.0, "证据不足"),
+        "basis": _INSUFFICIENT_EVIDENCE_REMARK,
+        "suggestion_text": _ticket_suggestion_text("误报", 0.0, _INSUFFICIENT_EVIDENCE_REMARK),
     }
     existing = await _ensure_assessment_row(db, int(row.id), existing)
     auto_false = _persist_assessment_fields(
@@ -1155,6 +1161,30 @@ async def _apply_insufficient_evidence_false_alarm(
     await db.flush()
     await db.refresh(existing)
     return existing, auto_false
+
+
+async def maybe_apply_insufficient_evidence_on_create(
+    db: AsyncSession,
+    row: VehicleViolation,
+) -> bool:
+    """入库即判定：证据不齐套则立刻误报，不等 AI 调度。"""
+    if row is None or getattr(row, "id", None) is None:
+        return False
+    if (getattr(row, "status", None) or "").strip() not in ("", "待处理"):
+        return False
+    if not _should_false_alarm_for_insufficient_evidence(row):
+        return False
+    existing = await db.scalar(
+        select(ViolationAiAssessment).where(ViolationAiAssessment.violation_id == int(row.id)).limit(1)
+    )
+    await _apply_insufficient_evidence_false_alarm(db, row, existing)
+    await db.flush()
+    logger.info(
+        "入库证据不足即误报 violation_id=%s plate=%s",
+        row.id,
+        (row.plate_no or "").strip(),
+    )
+    return True
 
 
 async def backfill_insufficient_evidence_false_alarms(
