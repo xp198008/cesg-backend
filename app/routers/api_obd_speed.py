@@ -1,17 +1,15 @@
 """OBD 时速违章监测管理接口 + 独立状态页。"""
 from __future__ import annotations
 
-import secrets
-
 import bcrypt
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.database import AsyncSessionLocal
 from app.models import SysUser
-from app.session_auth import attach_session_cookie
+from app.ops_session import attach_ops_cookie, extract_ops_token, issue_ops_token, ops_token_ok
 
 from app.jt808_openapi_client import jt808_openapi_client
 from app.jt808_obd_fuel_sync import (
@@ -539,7 +537,7 @@ _STATUS_PAGE = """<!DOCTYPE html>
 <div class="modal-mask show" id="opsGate">
   <div class="modal">
     <h3>后台运维登录</h3>
-    <p class="muted" style="margin-bottom:14px">请输入 admin 密码。已有会话则直接沿用，不会把前台 admin 踢下线。</p>
+    <p class="muted" style="margin-bottom:14px">必须输入 admin 密码。前台登录不能代替本页验证。</p>
     <div class="form-grid">
       <label>用户名</label><input value="admin" readonly>
       <label>密码</label><input id="opsPwd" type="password" placeholder="请输入 admin 密码" autocomplete="current-password">
@@ -575,7 +573,7 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const row = (k, v, cls) => `<tr><td>${esc(k)}</td><td class="${cls||""}">${v}</td></tr>`;
 
-let opsToken = sessionStorage.getItem("obd_ops_token") || "";
+let opsToken = sessionStorage.getItem("obd_ops_token_v2") || "";
 let opsReady = false;
 
 function showOpsGate(msg) {
@@ -594,7 +592,7 @@ function hideOpsGate() {
 function authFetch(url, opts) {
   opts = opts || {};
   const headers = Object.assign({}, opts.headers || {});
-  if (opsToken) headers["X-Session-Token"] = opsToken;
+  if (opsToken) headers["X-Ops-Token"] = opsToken;
   return fetch(url, Object.assign({}, opts, { credentials: "include", headers }));
 }
 
@@ -1414,7 +1412,7 @@ function startOpsPage() {
 
 async function hasOpsSession() {
   try {
-    const res = await authFetch("/api/obd-speed-check/ping");
+    const res = await authFetch("/api/obd-status/session");
     return res.ok;
   } catch (e) {
     return false;
@@ -1445,7 +1443,8 @@ async function unlockOps() {
       throw new Error(typeof detail === "string" ? detail : "密码错误");
     }
     opsToken = data.session_token || "";
-    if (opsToken) sessionStorage.setItem("obd_ops_token", opsToken);
+    if (opsToken) sessionStorage.setItem("obd_ops_token_v2", opsToken);
+    sessionStorage.removeItem("obd_ops_token");
     startOpsPage();
   } catch (e) {
     $("opsGateErr").textContent = e.message || "密码错误";
@@ -1488,14 +1487,22 @@ def _admin_password_ok(user: SysUser, password: str) -> bool:
             return True
     except Exception:
         pass
-    if saved_hash and not saved_hash.startswith("$2") and pwd == saved_hash:
-        return True
-    return bool((getattr(user, "password_plain", None) or "").strip() == pwd)
+    return bool(saved_hash and not saved_hash.startswith("$2") and pwd == saved_hash)
+
+
+@router.get("/api/obd-status/session")
+async def obd_status_session(request: Request):
+    """只认运维门禁令牌，前台登录 Cookie 不能过。"""
+    headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in request.scope.get("headers") or []}
+    uid = ops_token_ok(extract_ops_token(headers))
+    if uid is None:
+        raise HTTPException(status_code=401, detail="请输入 admin 密码")
+    return {"ok": True, "username": "admin"}
 
 
 @router.post("/api/obd-status/unlock")
 async def obd_status_unlock(body: ObdStatusUnlockBody):
-    """运维页门禁：校验 admin 密码。已有会话则复用，没有则签发，不踢前台。"""
+    """运维页门禁：校验 admin 密码后签发独立 ops 会话，不复用前台登录。"""
     async with AsyncSessionLocal() as db:
         user = await db.scalar(select(SysUser).where(SysUser.username == "admin").limit(1))
         if user is None:
@@ -1504,21 +1511,15 @@ async def obd_status_unlock(body: ObdStatusUnlockBody):
             raise HTTPException(status_code=403, detail="admin 已禁用")
         if not _admin_password_ok(user, body.password):
             raise HTTPException(status_code=401, detail="密码错误")
-        token = (getattr(user, "login_session_token", None) or "").strip()
-        reused = bool(token)
-        if not token:
-            token = secrets.token_urlsafe(32)
-            user.login_session_token = token
-            await db.commit()
+        token = issue_ops_token(int(user.id))
     resp = JSONResponse(
         {
             "ok": True,
-            "reused": reused,
             "session_token": token,
             "username": "admin",
         }
     )
-    attach_session_cookie(resp, token)
+    attach_ops_cookie(resp, token)
     return resp
 
 

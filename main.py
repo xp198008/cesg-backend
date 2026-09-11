@@ -213,6 +213,7 @@ async def _ensure_default_admin() -> None:
 
     from app.database import AsyncSessionLocal
     from app.models import OrgCompany, SysRole, SysUser
+    from app.secret_box import encrypt_secret
 
     async with AsyncSessionLocal() as s:
         n = await s.scalar(select(func.count()).select_from(SysUser))
@@ -233,7 +234,7 @@ async def _ensure_default_admin() -> None:
             SysUser(
                 username="admin",
                 password_hash=bcrypt.hashpw(b"123456", bcrypt.gensalt()).decode("utf-8"),
-                password_plain="123456",
+                password_plain=encrypt_secret("123456"),
                 real_name="管理员",
                 role_id=role.id,
                 org_id=company.id,
@@ -340,6 +341,14 @@ async def _background_startup_backfill() -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     await init_models()
+    try:
+        from app.secret_box import migrate_legacy_plaintext_passwords
+
+        n = await migrate_legacy_plaintext_passwords()
+        if n:
+            logger.info("已将 %s 条历史明文代登口令加密入库", n)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("历史明文口令加密迁移失败: %s", exc)
     from app.database import AsyncSessionLocal
     from app.agent_worker_config import ensure_ai_worker_config
 

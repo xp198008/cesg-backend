@@ -385,6 +385,19 @@ async def init_models() -> None:
                 pass
             try:
                 exists = await conn.exec_driver_sql(
+                    "SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sys_user' "
+                    "AND COLUMN_NAME = 'password_plain'"
+                )
+                row = exists.fetchone()
+                if row is not None and row[0] is not None and int(row[0]) < 512:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE sys_user MODIFY COLUMN password_plain VARCHAR(512) NULL"
+                    )
+            except Exception:
+                pass
+            try:
+                exists = await conn.exec_driver_sql(
                     "SELECT COUNT(*) FROM information_schema.COLUMNS "
                     "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'driver' "
                     "AND COLUMN_NAME = 'is_key_focus'"

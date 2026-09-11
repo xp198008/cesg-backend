@@ -261,6 +261,29 @@ class AgentWorkerClient:
             data = resp.json()
             return data if isinstance(data, dict) else {"data": data}
 
+    async def get_vehicle_risk_assessment(
+        self,
+        *,
+        plate: str | None = None,
+        car_id: int | None = None,
+    ) -> dict[str, Any]:
+        """GET /api/vehicle/risk-assessment，供风险管控「综合风险」定级。"""
+        if not (plate or "").strip() and car_id is None:
+            raise AgentWorkerError("plate 与 car_id 必须至少提供一个")
+        await self._ensure_ready()
+        url = f"{_base_url()}/api/vehicle/risk-assessment"
+        params: dict[str, Any] = {}
+        if car_id is not None:
+            params["car_id"] = int(car_id)
+        if (plate or "").strip():
+            params["plate"] = plate.strip()
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
+            resp = await client.get(url, params=params, headers=_bearer_headers() or None)
+            if resp.status_code >= 400:
+                self._raise_http(resp)
+            data = resp.json()
+            return data if isinstance(data, dict) else {"data": data}
+
     def _resolve_kb_name(self, *, dataset_id: str | None = None, dataset_name: str | None = None) -> str:
         from app.ai_datasets import resolve_dataset_name
 

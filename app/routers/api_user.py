@@ -35,6 +35,7 @@ from app.org_scope import (
     org_scope_row_clause,
     require_user_company_subtree_ids,
 )
+from app.secret_box import load_proxy_password, store_proxy_password
 from app.session_auth import attach_session_cookie, clear_session_cookie, extract_session_token, invalidate_session_token
 from app.vehicle_alloc_scope import parse_user_id_header, resolve_monitor_scope
 
@@ -90,7 +91,7 @@ class RefreshJt808TokenPayload(BaseModel):
 class EnsureJt808TokenPayload(BaseModel):
     user_id: int = Field(..., ge=1)
     session_token: str | None = Field(default=None, max_length=128)
-    # 首次无 password_plain 时由登录页传入明文密码，仅用于代登 8003
+    # 首次无代登密文时由登录页传入密码，加密后仅用于代登 8003
     password: str | None = Field(default=None, max_length=128)
 
 
@@ -343,7 +344,7 @@ async def user_create(
         user = SysUser(
             username=username,
             password_hash=pwd_hash,
-            password_plain=payload.password,
+            password_plain=None,
             real_name=username,
             identity=identity,
             phone=phone,
@@ -355,6 +356,7 @@ async def user_create(
             single_login=bool(int(payload.single_login)),
             is_outsource=bool(int(payload.is_outsource)),
         )
+        store_proxy_password(user, payload.password)
         db.add(user)
         await db.flush()
         await db.refresh(user)
@@ -466,27 +468,7 @@ async def user_credential(user_id: int, db: AsyncSession = Depends(get_db)):
     user = await db.scalar(select(SysUser).where(SysUser.id == user_id).limit(1))
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
-    pwd_plain = (getattr(user, "password_plain", "") or "").strip()
-    if not pwd_plain:
-        saved_hash = (user.password_hash or "").strip()
-        guessed = ""
-        if saved_hash and not saved_hash.startswith("$2"):
-            guessed = saved_hash
-        else:
-            for cand in ("123456", "admin123"):
-                try:
-                    if bcrypt.checkpw(cand.encode("utf-8"), saved_hash.encode("utf-8")):
-                        guessed = cand
-                        break
-                except Exception:
-                    pass
-        if guessed:
-            user.password_plain = guessed
-            await db.flush()
-            pwd_plain = guessed
-    if not pwd_plain:
-        raise HTTPException(status_code=400, detail="该用户暂无可复制明文密码，请先重置密码后再复制")
-    return {"ok": True, "text": f"{user.username}/{pwd_plain}"}
+    raise HTTPException(status_code=410, detail="系统不再提供明文密码复制，请重置密码并立即告知用户")
 
 
 def _password_matches(user: SysUser, password: str) -> bool:
@@ -499,9 +481,7 @@ def _password_matches(user: SysUser, password: str) -> bool:
             return True
     except Exception:
         pass
-    if saved_hash and not saved_hash.startswith("$2") and pwd == saved_hash:
-        return True
-    return bool((getattr(user, "password_plain", None) or "").strip() == pwd)
+    return bool(saved_hash and not saved_hash.startswith("$2") and pwd == saved_hash)
 
 
 @router.post("/set-password")
@@ -529,7 +509,7 @@ async def user_set_password(
         raise HTTPException(status_code=400, detail="密码至少6位")
     try:
         user.password_hash = bcrypt.hashpw(new_pwd.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-        user.password_plain = new_pwd
+        store_proxy_password(user, new_pwd)
         await db.flush()
         await db.refresh(user)
     except Exception as e:
@@ -562,7 +542,7 @@ async def user_reset_password(
         raise HTTPException(status_code=404, detail="用户不存在")
     new_pwd = _generate_login_password(payload.length)
     user.password_hash = bcrypt.hashpw(new_pwd.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-    user.password_plain = new_pwd
+    store_proxy_password(user, new_pwd)
     await db.flush()
     await db.refresh(user)
     await db.commit()
@@ -571,7 +551,7 @@ async def user_reset_password(
     jt808_sync, jt808_sync_message = _jt808_sync_view(sync_result)
     return {
         "ok": True,
-        "message": "密码已重置并可复制",
+        "message": "密码已重置，请立即告知用户（系统不再保存可查阅明文）",
         "jt808_sync": jt808_sync,
         "jt808_sync_message": jt808_sync_message,
         "text": f"{user.username}/{new_pwd}",
@@ -924,8 +904,8 @@ async def _issue_login_response(
         raise HTTPException(status_code=403, detail="当前用户已过有效期，请联系管理员")
 
     pwd = (password_plain or "").strip()
-    if pwd and (getattr(user, "password_plain", None) or "") != pwd:
-        user.password_plain = pwd
+    if pwd and load_proxy_password(user) != pwd:
+        store_proxy_password(user, pwd)
         invalidate_openapi_token_if_service_user(user.username)
 
     if getattr(user, "single_login", False):
@@ -1227,11 +1207,11 @@ async def _acquire_jt808_session(
     if not allow_8003:
         raise HTTPException(status_code=400, detail="808 会话已失效，请重新登录")
 
-    pwd = (password or getattr(user, "password_plain", "") or "").strip()
+    pwd = (password or load_proxy_password(user) or "").strip()
     got = await _login_jt808_8003(user.username or "", pwd)
     user.jt808_lingxtoken = got["token"]
-    if password and (getattr(user, "password_plain", None) or "") != password:
-        user.password_plain = password
+    if password and load_proxy_password(user) != password:
+        store_proxy_password(user, password)
     return {**got, "via": "8003"}
 
 

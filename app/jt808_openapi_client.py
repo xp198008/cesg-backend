@@ -2,7 +2,7 @@
 
 - 自建 8800：apicode 8003 登录，密码算法与前端/lingx 一致。
 - 公网 OpenAPI（gb35658）：apicode 1200 + apitoken。
-- 登录密码从 CESG 库 sys_user.password_plain 读取（与界面改密一致），不使用 .env 静态密码。
+- 登录密码从 CESG 库加密代登口令解密读取（与界面改密一致），不使用 .env 静态密码。
 """
 from __future__ import annotations
 

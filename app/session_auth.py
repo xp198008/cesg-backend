@@ -20,14 +20,21 @@ _PUBLIC_EXACT = {
     "/api/user/login-by-phone",
     "/api/sms/send-code",
     "/favicon.ico",
-    # 运维页先出密码框；校验接口只收 admin 密码
+    # 运维页先出密码框；门禁接口只认独立 ops 会话，不复用前台登录
     "/obd-status",
     "/api/obd-status/unlock",
+    "/api/obd-status/session",
 }
 
 _PUBLIC_PREFIXES = (
     # 登录页本地下载（若经 8100 提供）
     "/static/downloads/",
+)
+
+# 仅运维页使用：前台登录不能调用
+_OPS_ONLY_PREFIXES = (
+    "/api/obd-speed-check",
+    "/api/violation-ai-assess",
 )
 
 
@@ -40,6 +47,11 @@ def normalize_api_path(path: str) -> str:
     if len(p) > 1 and p.endswith("/"):
         p = p.rstrip("/")
     return p
+
+
+def is_ops_only_path(path: str) -> bool:
+    p = normalize_api_path(path)
+    return any(p == prefix or p.startswith(prefix + "/") for prefix in _OPS_ONLY_PREFIXES)
 
 
 def is_public_path(path: str) -> bool:
@@ -178,6 +190,19 @@ class SessionAuthMiddleware:
             return
 
         headers = _headers_from_scope(scope)
+        from app.ops_session import extract_ops_token, ops_token_ok
+
+        ops_uid = ops_token_ok(extract_ops_token(headers))
+        if ops_uid is not None:
+            state = scope.setdefault("state", {})
+            state["user_id"] = ops_uid
+            state["ops_admin"] = True
+            await self.app(scope, receive, send)
+            return
+        if is_ops_only_path(path):
+            await unauthorized_response("请输入 admin 密码")(scope, receive, send)
+            return
+
         token = extract_session_token(headers)
         if not token:
             await unauthorized_response()(scope, receive, send)

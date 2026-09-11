@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.jt808_alarm_sync import _strip_alarm_level_suffix
 from app.jt808_follow import expand_terminal_id_variants, fetch_followed_device_ids
+from app.secret_box import load_proxy_password
 from app.media_url import normalize_evidence_payload
 from app.models import Driver, Fleet, OrgCompany, SysUser, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTicket, ViolationTypeDict
 from app.org_scope import collect_org_company_subtree_ids, require_x_org_id_header
@@ -647,7 +648,7 @@ async def _apply_followed_only_filter(
         return q.where(VehicleViolation.id == -1)
 
     username = (user.username or "").strip()
-    pwd_plain = (getattr(user, "password_plain", None) or "").strip()
+    pwd_plain = load_proxy_password(user)
     if not username or not pwd_plain:
         raise HTTPException(status_code=400, detail="当前用户未存储808登录凭据，无法筛选关注车辆，请重新登录")
 

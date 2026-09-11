@@ -101,6 +101,7 @@ _SHORTCUT_META: dict[str, dict[str, str]] = {
     "642": {"url": "/main/report/travel-fuel", "icon": "./images/svg/icon-tongji.svg"},
     "651": {"url": "/main/report/alarm-statistics", "icon": "./images/svg/icon-tongji.svg"},
     "652": {"url": "/main/report/alarm-key-query", "icon": "./images/svg/icon-tongji.svg"},
+    "660": {"url": "/main/report/data-speeding-warn-command", "icon": "./images/svg/icon-tongji.svg"},
     "8": {"url": "/main/safety/active-alarm", "icon": "./images/svg/icon-anquan.svg"},
     "81": {"url": "/main/safety/active-alarm", "icon": "./images/svg/icon-anquan.svg"},
     "82": {"url": "/main/safety/alarm-audit", "icon": "./images/svg/icon-anquan.svg"},

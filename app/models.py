@@ -47,7 +47,8 @@ class SysUser(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(64), unique=True, nullable=False, index=True)
     password_hash = Column(String(256), nullable=False)
-    password_plain = Column(String(128), nullable=True)
+    # 808 代登口令的 AES-GCM 密文（enc:v1:…），登录校验不读此列
+    password_plain = Column(String(512), nullable=True)
     real_name = Column(String(64))
     identity = Column(String(64), nullable=True)
     phone = Column(String(32), nullable=True)

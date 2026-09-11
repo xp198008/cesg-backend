@@ -727,6 +727,12 @@ async def vehicle_update(
     v = await db.scalar(select(Vehicle).where(Vehicle.id == vid).limit(1))
     if v is None:
         raise HTTPException(status_code=404, detail="车辆不存在")
+    existing_plate = _norm(v.plate_no)
+    incoming_plate = _norm(payload.plate_no)
+    if existing_plate and incoming_plate and incoming_plate != existing_plate:
+        raise HTTPException(status_code=400, detail="车牌号创建后不可修改")
+    if existing_plate:
+        payload.plate_no = existing_plate
     old_dev = await db.scalar(
         select(VehicleDevice.device_no).where(VehicleDevice.vehicle_id == vid, VehicleDevice.is_main.is_(True)).limit(1)
     )
@@ -852,11 +858,9 @@ async def vehicle_sync_from_ttx(db: AsyncSession = Depends(get_db)):
             continue
 
         if plate_changed:
-            other = by_plate.get(ttx_plate)
-            if other is not None and int(other.id) != vid:
-                skipped_conflict += 1
-                note_error(f"{old_plate}→{ttx_plate}：目标车牌已被其它车辆使用")
-                continue
+            skipped_conflict += 1
+            note_error(f"{old_plate}→{ttx_plate}：车牌号创建后不可修改，已跳过")
+            continue
 
         if device_changed and store_no:
             await db.flush()
@@ -864,12 +868,6 @@ async def vehicle_sync_from_ttx(db: AsyncSession = Depends(get_db)):
                 skipped_conflict += 1
                 note_error(f"{ttx_plate}：设备号 {store_no} 已在其它车辆上使用")
                 continue
-
-        if plate_changed:
-            if old_plate in by_plate and by_plate[old_plate] is v:
-                del by_plate[old_plate]
-            v.plate_no = ttx_plate
-            by_plate[ttx_plate] = v
 
         if device_changed:
             old_bare = _bare_device_no(old_dev)

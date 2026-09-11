@@ -741,6 +741,37 @@ def ensure_company_placeholders(
     return out
 
 
+def aggregate_company_focus(
+    rows: list[dict[str, Any]],
+    *,
+    company_name: str,
+    company_id: Any = None,
+) -> dict[str, Any]:
+    """把子公司分桶汇总成所选公司的摘要（标题/指标用，排名仍用各子公司行）。"""
+    counts = _empty_counts()
+    car_ids: list[Any] = []
+    plates: list[str] = []
+    vehicle_count = 0
+    for row in rows:
+        vehicle_count += _as_int(row.get("vehicle_count"))
+        car_ids.extend(row.get("car_ids") or [])
+        plates.extend([p for p in (row.get("plates") or []) if p])
+        _merge_counts(counts, row)
+    score = risk_score_from_counts(counts)
+    return {
+        "company_id": company_id,
+        "company_name": company_name or "未匹配公司",
+        "vehicle_count": vehicle_count,
+        "car_ids": car_ids,
+        "plates": plates,
+        **counts,
+        "total_alarm_count": total_alarm_count(counts),
+        "risk_score": score,
+        "risk_level": risk_level_from_score(score),
+        "radar": radar_values(counts),
+    }
+
+
 def aggregate_by_company(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[Any, dict[str, Any]] = {}
     for item in items:
@@ -1163,6 +1194,8 @@ def build_profile_payload(
     items: list[dict[str, Any]],
     meta: dict[str, Any],
     company_placeholders: list[tuple[Any, str]] | None = None,
+    selected_company_name: str | None = None,
+    selected_company_id: Any = None,
 ) -> dict[str, Any]:
     if dimension == "company":
         rows = aggregate_by_company(items)
@@ -1173,6 +1206,21 @@ def build_profile_payload(
         rows = sorted(items, key=lambda x: (-x.get("total_alarm_count", 0), x.get("car_id") or 0))
 
     focus = rows[0] if rows else None
+    selected_name = str(selected_company_name or "").strip()
+    # 选中公司下按子公司分桶时：摘要用所选公司，不要用报警最多的那条子公司
+    if dimension == "company" and selected_name:
+        child_breakdown = any(
+            str(row.get("company_name") or "").strip() not in ("", selected_name)
+            for row in rows
+        )
+        if child_breakdown and rows:
+            focus = aggregate_company_focus(
+                rows,
+                company_name=selected_name,
+                company_id=selected_company_id,
+            )
+        elif isinstance(focus, dict):
+            focus = {**focus, "company_name": selected_name}
     ranking = []
     # 司机维度「报警行为排名」由 query_risk_profile 按本地报警类型重算，此处不排司机名单
     if dimension != "driver":
@@ -1220,7 +1268,9 @@ def build_profile_payload(
             ]
 
     profile_name = "—"
-    if focus:
+    if dimension == "company" and selected_name:
+        profile_name = selected_name
+    elif focus:
         if dimension == "company":
             profile_name = focus.get("company_name") or "—"
         elif dimension == "driver":
@@ -1325,6 +1375,7 @@ async def query_risk_profile(
     car_plates: str | None = None,
     company_id: int | None = None,
     company_ids: list[int] | None = None,
+    company_name: str | None = None,
     driver_id: int | None = None,
     driver_name: str | None = None,
     start_date: str | None = None,
@@ -1570,12 +1621,22 @@ async def query_risk_profile(
                         (sid, name_map.get(sid) or f"公司{sid}")
                     )
 
+    selected_company_label = str(company_name or "").strip()
+    if not selected_company_label and local_selected:
+        for sid in sorted(local_selected):
+            selected_company_label = str(name_map.get(sid) or "").strip()
+            if selected_company_label:
+                break
+    selected_company_pk = next(iter(sorted(local_selected)), None) if local_selected else None
+
     payload = build_profile_payload(
         dimension=dimension,
         mode=mode,
         items=enriched,
         meta=meta,
         company_placeholders=company_placeholders if dimension == "company" else None,
+        selected_company_name=selected_company_label or None,
+        selected_company_id=selected_company_pk,
     )
     if dimension == "vehicle":
         payload = await attach_vehicle_obd_indicators(

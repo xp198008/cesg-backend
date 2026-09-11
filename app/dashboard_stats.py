@@ -502,48 +502,76 @@ async def _board_energy(db: AsyncSession, scoped_company_ids: set[int] | None) -
         d = china_now_naive() - timedelta(days=i)
         days_7.append(d.strftime("%Y%m%d"))
 
+    def _roll_day(rows: list, etype: str) -> dict:
+        """按车汇总一日油/电：总量、配对百公里、能耗异常台数。"""
+        fuel_sum = 0.0
+        mile_sum = 0.0
+        paired_fuel = 0.0
+        paired_mile = 0.0
+        abnormal = 0
+        lo, hi = (10.0, 50.0) if etype == "oil" else (8.0, 80.0)
+        for fuel, mileage in rows:
+            f = float(fuel or 0)
+            m = float(mileage or 0)
+            if m > 250:
+                m = 250.0
+            if f > 0:
+                fuel_sum += f
+            if m > 0:
+                mile_sum += m
+            # 里程过短时百公里会飞，不进分子也不判异常
+            if f > 0 and m >= 20:
+                paired_fuel += f
+                paired_mile += m
+                p100 = f / m * 100.0
+                if p100 < lo or p100 > hi:
+                    abnormal += 1
+        return {
+            "fuel": round(fuel_sum, 1) if fuel_sum else 0,
+            "mileage": round(mile_sum, 1) if mile_sum else 0,
+            "per100": round(paired_fuel / paired_mile * 100.0, 1) if paired_mile > 0 else None,
+            "abnormalVehicles": abnormal,
+        }
+
     async def _agg_one(etype: str) -> dict:
-        # 今日：取 today 的快照，按"最新读数"求和（每车当日只留一条 upsert）
         try:
-            today_rows = (
+            week_rows = (
                 await db.execute(
-                    select(ObdEnergySnapshot.fuel, ObdEnergySnapshot.mileage).where(
+                    select(
+                        ObdEnergySnapshot.day,
+                        ObdEnergySnapshot.fuel,
+                        ObdEnergySnapshot.mileage,
+                    ).where(
                         ObdEnergySnapshot.energy_type == etype,
-                        ObdEnergySnapshot.day == today,
+                        ObdEnergySnapshot.day.in_(days_7),
                     )
                 )
             ).all()
         except Exception:  # noqa: BLE001
-            today_rows = []
-        today_fuel = sum(float(r[0] or 0) for r in today_rows)
-        # 单车当日超过 250km 视为 OBD 毛刺，封顶后再加总，避免一两台把车队里程顶到四五千
-        today_mileage = 0.0
-        for r in today_rows:
-            km = float(r[1] or 0)
-            if km <= 0:
-                continue
-            today_mileage += min(km, 250.0)
+            week_rows = []
 
-        # 近 7 日走势：每日 sum(fuel)
+        by_day: dict[str, list] = {d: [] for d in days_7}
+        for day, fuel, mileage in week_rows:
+            key = str(day or "")
+            if key in by_day:
+                by_day[key].append((fuel, mileage))
+
         daily = []
         for d in days_7:
-            try:
-                row = (
-                    await db.execute(
-                        select(func.sum(ObdEnergySnapshot.fuel)).where(
-                            ObdEnergySnapshot.energy_type == etype,
-                            ObdEnergySnapshot.day == d,
-                        )
-                    )
-                ).scalar()
-            except Exception:  # noqa: BLE001
-                row = None
-            label = f"{int(d[4:6])}/{int(d[6:8])}"
-            daily.append({"label": label, "fuel": round(float(row or 0), 1)})
+            stats = _roll_day(by_day.get(d) or [], etype)
+            daily.append({
+                "label": f"{int(d[4:6])}/{int(d[6:8])}",
+                "fuel": stats["fuel"],
+                "mileage": stats["mileage"],
+                "per100": stats["per100"],
+                "abnormalVehicles": stats["abnormalVehicles"],
+            })
+        today_stats = _roll_day(by_day.get(today) or [], etype)
         return {
-            "today": round(today_fuel, 1) if today_fuel else 0,
-            "mileage": round(today_mileage, 1) if today_mileage else 0,
-            "per100": None,
+            "today": today_stats["fuel"],
+            "mileage": today_stats["mileage"],
+            "per100": today_stats["per100"],
+            "abnormalVehicles": today_stats["abnormalVehicles"],
             "daily": daily,
         }
 
@@ -555,6 +583,8 @@ async def _board_energy(db: AsyncSession, scoped_company_ids: set[int] | None) -
 # 近 7 日安全分：满分 100，每条有效违章扣 1 分。driver.score 是手工字段，现网全空，不能当来源。
 # 不按安全等级加权：现网报警类型几乎全是「高」，加权后评分榜会塌成全 0。
 _DRIVER_QUALIFY_SCORE = 60
+# 最好/最差只是排序，不要再截成 10 人：现网司机少，违章最多的人会被「最好」榜裁掉。
+_DRIVER_RANK_LIMIT = 100
 
 
 async def _board_drivers(
@@ -647,11 +677,11 @@ async def _board_drivers(
 
     best = [
         as_row(d)
-        for d in sorted(drivers, key=lambda x: (-x["score"], x["alarms"], x["name"]))[:10]
+        for d in sorted(drivers, key=lambda x: (-x["score"], x["alarms"], x["name"]))[:_DRIVER_RANK_LIMIT]
     ]
     worst = [
         as_row(d)
-        for d in sorted(drivers, key=lambda x: (x["score"], -x["alarms"], x["name"]))[:10]
+        for d in sorted(drivers, key=lambda x: (x["score"], -x["alarms"], x["name"]))[:_DRIVER_RANK_LIMIT]
     ]
     return {
         "total": total,

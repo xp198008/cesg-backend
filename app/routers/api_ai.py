@@ -255,6 +255,29 @@ async def ai_vehicle_summary(
         raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text) from exc
 
 
+@router.get("/vehicle/risk-assessment")
+async def ai_vehicle_risk_assessment(
+    plate: str | None = Query(None),
+    car_id: int | None = Query(None, ge=1),
+):
+    """代理 Agent Worker 车辆风险定级（风险管控-风险智能分析综合风险分）。"""
+    _ensure_configured()
+    if not (plate or "").strip() and car_id is None:
+        raise HTTPException(status_code=400, detail="plate 与 car_id 必须至少提供一个")
+    try:
+        data = await agent_worker_client.get_vehicle_risk_assessment(
+            plate=plate,
+            car_id=car_id,
+        )
+        return {"ok": True, "data": data}
+    except AgentWorkerError as exc:
+        text = str(exc)
+        status = 404 if "未找到" in text else 502
+        raise HTTPException(status_code=status, detail=text) from exc
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text) from exc
+
+
 @router.get("/sessions/{session_id}")
 async def ai_session(session_id: str):
     _ensure_configured()

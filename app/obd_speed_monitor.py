@@ -1,8 +1,10 @@
 """OBD 时速监测：定时读 Redis 车辆 OBD 数据，按私有地图规则判定超速违章。
 
 数据链路：
-1. 车辆 OBD 上报 → Redis Key ``{设备号}_OBD``（JSON：时速/总里程/时间戳）
-2. 定时器 SCAN 读取全部 OBD Key，只处理时速 > 下限（默认 10 km/h）且 ≤ 上限（默认 120 km/h）的车辆
+1. 车速只认 OBD：Redis ``{设备号}_OBD`` 与 QUEUE 落库的
+   ``obd_energy_snapshot.raw.speed``（取更新的一条）。禁止用 1201 / 定位 GPS 时速。
+   现网 ``*_OBD`` 常停在停车后的 0，开车时以能耗队列 OBD 车速为准。
+2. 只处理时速 > 下限（默认 10 km/h）且 ≤ 上限（默认 120 km/h）的车辆
    超过上限视为终端毛刺，不按超速落待处理，已入库的待处理记录回填为误报
 3. 设备号 → CESG 车辆（复用 JT808 同步的设备号变体匹配）
 4. 车辆坐标：与实时监控页同源——JT808 OpenAPI 1201 定位接口（WGS84），
@@ -47,6 +49,7 @@ from app.database import AsyncSessionLocal
 from app.geo_utils import geometry_hit, wgs84_to_gcj02
 from app.header_weather import _fetch_weather_by_coords
 from app.jt808_alarm_sync import _vehicle_by_terminal
+from app.jt808_vehicle import _terminal_variants
 from app.jt808_car_alarm_1303 import (
     OverspeedSession,
     OverspeedTick,
@@ -219,7 +222,19 @@ def _weather_label(code: str | None) -> str:
 # OBD JSON 解析（字段名做多别名兼容）
 # ---------------------------------------------------------------------------
 
-_SPEED_KEYS = ("speed", "velocity", "vehicle_speed", "vehicleSpeed", "sudu", "时速", "车速")
+_SPEED_KEYS = (
+    "speed",
+    "velocity",
+    "vehicle_speed",
+    "vehicleSpeed",
+    "cs",
+    "sd",
+    "clsd",
+    "dqcs",
+    "sudu",
+    "时速",
+    "车速",
+)
 _MILEAGE_KEYS = ("mileage", "total_mileage", "totalMileage", "odometer", "licheng", "总里程", "里程")
 _TS_KEYS = ("ts", "timestamp", "time", "gpstime", "report_time", "reportTime", "时间戳", "时间")
 
@@ -446,6 +461,87 @@ def parse_obd_payload(device_no: str, payload: str) -> ObdReading | None:
         report_at=_parse_ts(_pick(data, _TS_KEYS)),
         raw=payload[:2000],
     )
+
+
+def _device_merge_key(device_no: str) -> str:
+    text = str(device_no or "").strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        return text.lstrip("0") or "0"
+    return text
+
+
+def _merge_readings(*groups: list[ObdReading]) -> dict[str, ObdReading]:
+    """同一设备多源时留更新的一条；同时刻取时速更高的。"""
+    merged: dict[str, ObdReading] = {}
+    for group in groups:
+        for reading in group:
+            key = _device_merge_key(reading.device_no)
+            if not key:
+                continue
+            old = merged.get(key)
+            if old is None:
+                merged[key] = reading
+                continue
+            old_at = old.report_at or datetime.min
+            new_at = reading.report_at or datetime.min
+            if new_at > old_at or (new_at == old_at and reading.speed_kmh > old.speed_kmh):
+                merged[key] = reading
+    return merged
+
+
+async def _load_energy_snapshot_readings(
+    db: AsyncSession,
+    now: datetime,
+    stale_after: timedelta,
+) -> list[ObdReading]:
+    """QUEUE_OBD 落库的当日新鲜快照。现网开车时 speed 在这里，不在 *_OBD。"""
+    day = now.strftime("%Y%m%d")
+    cutoff = now - stale_after
+    rows = (
+        await db.execute(
+            select(
+                ObdEnergySnapshot.device_no,
+                ObdEnergySnapshot.raw,
+                ObdEnergySnapshot.report_time,
+            ).where(
+                ObdEnergySnapshot.day == day,
+                ObdEnergySnapshot.report_time >= cutoff,
+                ObdEnergySnapshot.device_no.is_not(None),
+            )
+        )
+    ).all()
+    out: list[ObdReading] = []
+    for device_no, raw, report_time in rows:
+        if not device_no or not raw:
+            continue
+        reading = parse_obd_payload(str(device_no), raw)
+        if reading is None:
+            continue
+        if reading.report_at is None and report_time is not None:
+            reading = ObdReading(
+                device_no=reading.device_no,
+                speed_kmh=reading.speed_kmh,
+                mileage_km=reading.mileage_km,
+                report_at=report_time,
+                raw=reading.raw,
+            )
+        out.append(reading)
+    return out
+
+
+def _position_for_device(positions: dict[str, dict[str, Any]], device_no: str) -> dict[str, Any] | None:
+    if not device_no:
+        return None
+    hit = positions.get(device_no)
+    if hit:
+        return hit
+    for variant in _terminal_variants(device_no):
+        hit = positions.get(variant)
+        if hit:
+            return hit
+    return positions.get(_device_merge_key(device_no))
 
 
 # ---------------------------------------------------------------------------
@@ -816,9 +912,12 @@ async def _fetch_positions(device_nos: list[str]) -> dict[str, dict[str, Any]]:
         for item in rows:
             if not isinstance(item, dict):
                 continue
-            tid = str(item.get("tid") or item.get("car_id") or "").strip()
-            if tid:
-                result[tid] = item
+            tid = str(item.get("tid") or item.get("deviceId") or item.get("car_id") or "").strip()
+            if not tid:
+                continue
+            for variant in _terminal_variants(tid):
+                result[variant] = item
+            result[tid] = item
     return result
 
 
@@ -954,32 +1053,36 @@ async def run_obd_speed_check_once() -> ObdSyncResult:
     min_speed = float(settings.obd_min_speed_kmh)
     stale_after = timedelta(seconds=max(30, int(settings.obd_stale_seconds)))
 
-    readings: list[ObdReading] = []
+    redis_readings: list[ObdReading] = []
     for device_no, payload in payloads.items():
         reading = parse_obd_payload(device_no, payload)
-        if reading is None:
-            continue
-        result.parsed += 1
-        # 用户约定：时速 <= 10 km/h 不处理
-        if reading.speed_kmh <= min_speed:
-            result.skipped_low_speed += 1
-            continue
-        # 用户约定：时速 > 120 km/h 视为毛刺，不按超速处理
-        if is_abnormal_obd_speed(reading.speed_kmh):
-            result.skipped_abnormal_speed += 1
-            continue
-        if reading.report_at is not None and now - reading.report_at > stale_after:
-            result.skipped_stale += 1
-            continue
-        readings.append(reading)
+        if reading is not None:
+            redis_readings.append(reading)
 
     overspeed_ticks: dict[int, OverspeedTick] = {}
-    if not readings:
-        await _apply_session_pair_flush(result, overspeed_ticks)
-        return result
-
     async with AsyncSessionLocal() as db:
-        # 设备号 → 车辆
+        energy_readings = await _load_energy_snapshot_readings(db, now, stale_after)
+        merged = _merge_readings(redis_readings, energy_readings)
+        result.scanned_keys = max(result.scanned_keys, len(merged))
+        result.parsed = len(merged)
+
+        readings: list[ObdReading] = []
+        for reading in merged.values():
+            if reading.speed_kmh <= min_speed:
+                result.skipped_low_speed += 1
+                continue
+            if is_abnormal_obd_speed(reading.speed_kmh):
+                result.skipped_abnormal_speed += 1
+                continue
+            if reading.report_at is not None and now - reading.report_at > stale_after:
+                result.skipped_stale += 1
+                continue
+            readings.append(reading)
+
+        if not readings:
+            await _apply_session_pair_flush(result, overspeed_ticks)
+            return result
+
         vehicle_by_device: dict[str, Vehicle] = {}
         for reading in readings:
             vehicle = await _vehicle_by_terminal(db, reading.device_no)
@@ -992,7 +1095,7 @@ async def run_obd_speed_check_once() -> ObdSyncResult:
             await _apply_session_pair_flush(result, overspeed_ticks)
             return result
 
-        # 车辆坐标：OpenAPI 1201 优先，vehicle_location 快照兜底
+        # 1201 只用于围栏坐标，不参与时速
         positions = await _fetch_positions(list(vehicle_by_device.keys()))
         rule_index = await _load_rule_index(db)
         await _ensure_obd_alarm_type(db)
@@ -1007,7 +1110,7 @@ async def run_obd_speed_check_once() -> ObdSyncResult:
                 result.skipped_no_rule += 1
                 continue
 
-            pos_item = positions.get(reading.device_no)
+            pos_item = _position_for_device(positions, reading.device_no)
             lng_lat = _position_from_item(pos_item) if pos_item else None
             pos_time: datetime | None = None
             address = ""

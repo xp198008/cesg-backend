@@ -29,15 +29,18 @@ class Settings(BaseSettings):
     # 公司分组同步走 HTTP 8002 API（admin 登录）
     jt808_api_base: str = "http://113.207.68.96:8800/api"
     jt808_admin_account: str = "admin"
-    # 已废弃：808 HTTP 登录密码改从 sys_user.password_plain 读取，勿再依赖本项。
+    # 已废弃：808 HTTP 登录密码改从库内加密代登口令读取，勿再依赖本项。
     jt808_admin_password: str = ""
     jt808_sync_timeout: float = 8.0
     # 用户同步走 SSH 隧道直连 MySQL jt808 库（127.0.0.1:3306）
     jt808_mysql_host: str = "127.0.0.1"
     jt808_mysql_port: int = 3306
     jt808_mysql_user: str = "root"
-    jt808_mysql_password: str = "lgx123"
+    # 必须由环境变量 / .env 提供，源码不写默认口令
+    jt808_mysql_password: str = ""
     jt808_mysql_database: str = "jt808"
+    # 代登口令 AES-256-GCM 密钥；空则读/生成 backend/data/.cesg_secret_key
+    cesg_secret_key: str = ""
 
     # ---- JT808 主动安全报警拉取（1208 等）----
     # 自建平台：http://113.207.68.96:8800/api + apicode 8003 登录（lingxtoken）
@@ -46,7 +49,7 @@ class Settings(BaseSettings):
     # 8003=自建 8800；1200=gb35658。留空则按 base_url / 是否配置 apitoken 自动判断。
     jt808_openapi_auth_mode: str = "8003"
     jt808_openapi_account: str = "admin"
-    # 已废弃：OpenAPI 登录密码改从 sys_user.password_plain 读取，勿再依赖本项。
+    # 已废弃：OpenAPI 登录密码改从库内加密代登口令读取，勿再依赖本项。
     jt808_openapi_password: str = ""
     jt808_openapi_password_hashed: bool = False
     jt808_openapi_apitoken: str = ""
@@ -64,7 +67,7 @@ class Settings(BaseSettings):
     obd_speed_check_interval_seconds: int = 30
     obd_redis_host: str = "127.0.0.1"
     obd_redis_port: int = 6379
-    obd_redis_password: str = "lgx123"
+    obd_redis_password: str = ""
     # JT808 平台 redis.properties 默认 database=1；与 808 共用实例时须读同一库
     obd_redis_db: int = 1
     obd_redis_key_pattern: str = "*_OBD"

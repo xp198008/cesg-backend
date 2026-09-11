@@ -23,6 +23,7 @@ from typing import Any
 import pymysql
 
 from app.config import settings
+from app.secret_box import load_proxy_password
 
 logger = logging.getLogger(__name__)
 
@@ -335,7 +336,7 @@ async def _load_user(user_id: int) -> dict[str, Any] | None:
         return {
             "id": row.id,
             "username": (row.username or "").strip(),
-            "password_plain": (row.password_plain or "").strip(),
+            "password_plain": load_proxy_password(row),
             "jt808_user_id": (row.jt808_user_id or "").strip() or None,
             "is_active": bool(row.is_active),
             "group_id": gid,

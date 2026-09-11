@@ -1,4 +1,4 @@
-"""JT808 OpenAPI 服务账号凭据：密码以 CESG 库 sys_user.password_plain 为准，不读 .env 密码。"""
+"""JT808 OpenAPI 服务账号凭据：密码以 CESG 库加密代登口令为准，不读 .env 密码。"""
 from __future__ import annotations
 
 from sqlalchemy import select
@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models import SysUser
+from app.secret_box import load_proxy_password
 
 
 def service_openapi_username() -> str:
@@ -19,7 +20,7 @@ def is_service_openapi_user(username: str | None) -> bool:
 
 
 async def load_service_password_plain(db: AsyncSession | None = None) -> str:
-    """读取服务账号明文密码；改密/登录后写入库，所有 808 HTTP 接口据此登 808。"""
+    """读取服务账号代登口令（库内加密，此处解密）；改密/登录后写入库。"""
     account = service_openapi_username()
     if not account:
         raise RuntimeError("未配置 JT808 服务账号")
@@ -30,10 +31,10 @@ async def load_service_password_plain(db: AsyncSession | None = None) -> str:
         )
         if user is None:
             raise RuntimeError(f"CESG 未找到 808 服务账号「{account}」")
-        pwd = (getattr(user, "password_plain", None) or "").strip()
+        pwd = load_proxy_password(user)
         if not pwd:
             raise RuntimeError(
-                f"账号「{account}」未存储明文密码，请在用户管理中修改密码或重新登录后再试"
+                f"账号「{account}」未存储代登口令，请在用户管理中修改密码或重新登录后再试"
             )
         return pwd
 
