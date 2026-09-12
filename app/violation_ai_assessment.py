@@ -1097,6 +1097,12 @@ def _maybe_auto_false_alarm(row: VehicleViolation, process_type: str | None) -> 
     row.handler_name = _AI_AUTO_FALSE_ALARM_HANDLER
     row.handler_remark = _AI_AUTO_FALSE_ALARM_REMARK
     row.handled_at = china_now_naive()
+    try:
+        from app.violation_alert_cache import discard_violation_alerts
+
+        discard_violation_alerts([getattr(row, "id", None)])
+    except Exception:
+        pass
     logger.info(
         "AI评估建议误报，自动落库 status=误报 violation_id=%s plate=%s",
         getattr(row, "id", None),
@@ -1179,6 +1185,12 @@ async def maybe_apply_insufficient_evidence_on_create(
     )
     await _apply_insufficient_evidence_false_alarm(db, row, existing)
     await db.flush()
+    try:
+        from app.violation_alert_cache import discard_violation_alerts
+
+        discard_violation_alerts([row.id])
+    except Exception:
+        pass
     logger.info(
         "入库证据不足即误报 violation_id=%s plate=%s",
         row.id,
@@ -1748,7 +1760,7 @@ async def run_violation_ai_assessment(
     force: bool = False,
 ) -> dict[str, Any]:
     """主动安全 AI 评估：一律走 Worker /api/video/violation（无视频则传抓拍图）。"""
-    if not agent_worker_client.configured():
+    if not await agent_worker_client.configured_async():
         raise HTTPException(status_code=503, detail="Agent Worker 未配置")
 
     row = await db.scalar(select(VehicleViolation).where(VehicleViolation.id == violation_id).limit(1))
@@ -1946,7 +1958,7 @@ async def stream_violation_ai_assessment(
 
     一律走 Worker ``POST /api/video/violation``（SSE）：有视频传视频，无视频传抓拍图。
     """
-    if not agent_worker_client.configured():
+    if not await agent_worker_client.configured_async():
         yield _sse({"object": "error", "message": "AI 接口未配置或未启用"})
         return
 

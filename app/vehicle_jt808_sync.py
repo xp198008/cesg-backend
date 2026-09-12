@@ -16,6 +16,7 @@ from sqlalchemy import or_, select
 from app import jt808_vehicle
 from app.config import settings
 from app.database import AsyncSessionLocal
+from app.scheduler_lock import should_run_schedulers
 from app.models import Vehicle
 from app.timeutil import china_now_naive
 
@@ -85,7 +86,7 @@ class VehicleJt808SyncScheduler:
     def status(self) -> dict[str, Any]:
         return {
             "enabled": bool(settings.vehicle_jt808_sync_enabled),
-            "running": self.running,
+            "running": self.running if should_run_schedulers() else bool(settings.vehicle_jt808_sync_enabled),
             "interval_seconds": int(settings.vehicle_jt808_sync_interval_seconds),
             "batch_size": int(settings.vehicle_jt808_sync_batch_size),
             "last_run_at": self._last_run_at.isoformat(sep=" ", timespec="seconds")

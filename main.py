@@ -6,6 +6,7 @@
 """
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -30,12 +31,14 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.database import init_models
+from app.scheduler_lock import should_run_schedulers
 from app.jt808_alarm_sync import (
     cleanup_jt808_violations_unknown_type,
     cleanup_jt808_violations_without_vehicle,
     jt808_alarm_scheduler,
 )
 from app.obd_speed_monitor import obd_speed_scheduler
+from app.shared_scheduler_flag import obd_speed_flag
 from app.park_alarm_scheduler import park_alarm_scheduler
 from app.redis_queue_consumer import redis_queue_scheduler
 from app.vehicle_jt808_sync import vehicle_jt808_sync_scheduler
@@ -81,7 +84,14 @@ from app.routers import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="CESG 业务后端", version="1.0.0")
+_enable_docs = (os.getenv("CESG_ENABLE_DOCS") or "").strip() in {"1", "true", "yes"}
+app = FastAPI(
+    title="CESG 业务后端",
+    version="1.0.0",
+    docs_url="/docs" if _enable_docs else None,
+    redoc_url="/redoc" if _enable_docs else None,
+    openapi_url="/openapi.json" if _enable_docs else None,
+)
 
 # 先加会话校验（内侧），再加 CORS（外侧），这样 401 也能带跨域头；OPTIONS 由 CORS 直接放行。
 app.add_middleware(SessionAuthMiddleware)
@@ -207,12 +217,13 @@ async def _ensure_default_map_config() -> None:
 
 
 async def _ensure_default_admin() -> None:
-    """库中无任何用户时补一条默认 admin（用户名 admin / 密码 123456）。"""
+    """库中无任何用户时补一条默认 admin，口令随机生成，不写死弱口令。"""
     import bcrypt
     from sqlalchemy import func, select
 
     from app.database import AsyncSessionLocal
     from app.models import OrgCompany, SysRole, SysUser
+    from app.password_policy import generate_login_password, require_strong_password
     from app.secret_box import encrypt_secret
 
     async with AsyncSessionLocal() as s:
@@ -230,11 +241,12 @@ async def _ensure_default_admin() -> None:
             role = SysRole(name="系统管理员", code="admin", remark="全部模块", is_global=True, permissions="[]")
             s.add(role)
             await s.flush()
+        bootstrap_pwd = require_strong_password(generate_login_password(12))
         s.add(
             SysUser(
                 username="admin",
-                password_hash=bcrypt.hashpw(b"123456", bcrypt.gensalt()).decode("utf-8"),
-                password_plain=encrypt_secret("123456"),
+                password_hash=bcrypt.hashpw(bootstrap_pwd.encode("utf-8"), bcrypt.gensalt()).decode("utf-8"),
+                password_plain=encrypt_secret(bootstrap_pwd),
                 real_name="管理员",
                 role_id=role.id,
                 org_id=company.id,
@@ -329,18 +341,27 @@ async def _background_startup_backfill() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("启动回填 OBD 时速异常误报失败: %s", exc)
 
-    if settings.violation_ai_assess_auto_enabled:
-        try:
-            violation_ai_assessment_scheduler.start()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("安全报警自动 AI 评估未启用: %s", exc)
-    else:
-        logger.info("安全报警自动 AI 评估未启动（violation_ai_assess_auto_enabled=0）")
-
 
 @app.on_event("startup")
 async def _startup() -> None:
     await init_models()
+    if not should_run_schedulers():
+        try:
+            from app.database import AsyncSessionLocal
+            from app.agent_worker_config import ensure_ai_worker_config
+
+            async with AsyncSessionLocal() as s:
+                ai_row = await ensure_ai_worker_config(s)
+                await s.commit()
+            logger.info(
+                "CESG HTTP worker 已就绪：http://127.0.0.1:%s（不跑后台调度，AI enabled=%s）",
+                settings.app_port,
+                bool(ai_row.enabled),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("HTTP worker 加载 AI 配置失败: %s", exc)
+            logger.info("CESG HTTP worker 已就绪：http://127.0.0.1:%s（不跑后台调度）", settings.app_port)
+        return
     try:
         from app.secret_box import migrate_legacy_plaintext_passwords
 
@@ -394,7 +415,14 @@ async def _startup() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("补发道路类型维护权限失败: %s", exc)
     jt808_alarm_scheduler.start()
-    obd_speed_scheduler.start()
+    try:
+        if obd_speed_flag.get_desired(default=True):
+            obd_speed_scheduler.start()
+        else:
+            logger.info("OBD 时速调度未启动（运维页已停止）")
+        obd_speed_scheduler.start_watch()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("OBD 时速调度未启用: %s", exc)
     try:
         from app.address_backfill_scheduler import address_backfill_scheduler
 
@@ -410,6 +438,17 @@ async def _startup() -> None:
         vehicle_jt808_sync_scheduler.start()
     except Exception as exc:  # noqa: BLE001
         logger.warning("车辆 808 同步调度未启用: %s", exc)
+    try:
+        from app.ai_assess_control import get_desired
+
+        want = get_desired(default=settings.violation_ai_assess_auto_enabled)
+        if want:
+            violation_ai_assessment_scheduler.start()
+        else:
+            logger.info("安全报警自动 AI 评估未启动（运维页已停止或 auto_enabled=0）")
+        violation_ai_assessment_scheduler.start_watch()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("安全报警自动 AI 评估未启用: %s", exc)
     try:
         from app.amap_web_service_key import get_stored_web_service_key
         from app.database import AsyncSessionLocal
@@ -435,9 +474,9 @@ async def _startup() -> None:
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     await jt808_alarm_scheduler.stop()
-    await obd_speed_scheduler.stop()
+    await obd_speed_scheduler.stop_local()
     try:
-        await violation_ai_assessment_scheduler.stop()
+        await violation_ai_assessment_scheduler.stop_local()
     except Exception:
         pass
     try:
@@ -482,11 +521,13 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
 
+    workers = int(os.getenv("CESG_WEB_WORKERS") or ("1" if os.name == "nt" else "3"))
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=settings.app_port,
         reload=False,
+        workers=max(1, workers),
         reload_excludes=["**/data/**", "**/__pycache__/**", "**/*.pyc"],
         log_level="info",
     )

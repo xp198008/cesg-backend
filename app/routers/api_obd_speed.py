@@ -589,11 +589,18 @@ function hideOpsGate() {
   $("opsPwd").value = "";
 }
 
+function opsApiUrl(url) {
+  // 8100 直连走 /api；443 上 /api 是 808，运维接口必须走 /cmapi → CESG
+  if (location.port === "8100") return url;
+  if (url.indexOf("/api/") === 0) return "/cmapi/" + url.slice(5);
+  return url;
+}
+
 function authFetch(url, opts) {
   opts = opts || {};
   const headers = Object.assign({}, opts.headers || {});
   if (opsToken) headers["X-Ops-Token"] = opsToken;
-  return fetch(url, Object.assign({}, opts, { credentials: "include", headers }));
+  return fetch(opsApiUrl(url), Object.assign({}, opts, { credentials: "include", headers }));
 }
 
 let schedRunning = false;
@@ -635,7 +642,7 @@ function renderStatus(data) {
   renderToggleBtn();
   $("dotSched").className = "dot " + (s.running ? "ok" : "bad");
   $("tblSched").innerHTML =
-    row("运行说明", "服务启动后默认自动运行，重启后也会自动恢复") +
+    row("运行说明", "服务启动后默认自动运行；多进程下以共享开关为准，刷新不应再在运行中/已停止之间跳") +
     row("循环运行中", s.running ? '<span class="okc">运行中</span>' : '<span class="err">已停止</span>') +
     row("检测间隔", esc(s.interval_seconds) + " 秒") +
     row("Redis 目标", esc(s.redis)) +
@@ -1365,7 +1372,14 @@ $("btnAiToggle").onclick = async () => {
   btn.disabled = true;
   btn.textContent = aiSchedRunning ? "停止中…" : "启动中…";
   try {
-    await authFetch(aiSchedRunning ? "/api/violation-ai-assess/stop" : "/api/violation-ai-assess/start", { method: "POST" });
+    const res = await authFetch(aiSchedRunning ? "/api/violation-ai-assess/stop" : "/api/violation-ai-assess/start", { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) { showOpsGate("请输入 admin 密码"); return; }
+    if (!res.ok) {
+      alert((data && data.detail) || "操作失败");
+    } else if (data.scheduler) {
+      renderAiStatus(data.scheduler);
+    }
   } catch (e) {
     alert("操作失败：" + e);
   }
@@ -1431,7 +1445,7 @@ async function unlockOps() {
   btn.disabled = true;
   btn.textContent = "校验中…";
   try {
-    const res = await fetch("/api/obd-status/unlock", {
+    const res = await fetch(opsApiUrl("/api/obd-status/unlock"), {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },

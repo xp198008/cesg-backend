@@ -1,6 +1,7 @@
 """用户信息（基础数据管理 - 用户列表 + 登录）"""
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import secrets
@@ -35,6 +36,7 @@ from app.org_scope import (
     org_scope_row_clause,
     require_user_company_subtree_ids,
 )
+from app.password_policy import generate_login_password, require_strong_password
 from app.secret_box import load_proxy_password, store_proxy_password
 from app.session_auth import attach_session_cookie, clear_session_cookie, extract_session_token, invalidate_session_token
 from app.vehicle_alloc_scope import parse_user_id_header, resolve_monitor_scope
@@ -129,7 +131,7 @@ class UserSessionHeartbeatPayload(BaseModel):
 class UserCreatePayload(BaseModel):
     org_id: int = Field(..., ge=1)
     username: str = Field(..., min_length=1, max_length=64)
-    password: str = Field(..., min_length=6, max_length=128)
+    password: str = Field(..., min_length=8, max_length=128)
     allow_pwd_edit: int = Field(default=1)
     role_id: int = Field(..., ge=1)
     user_status: int = Field(default=1)
@@ -156,12 +158,12 @@ class UserUpdatePayload(BaseModel):
 
 class UserResetPasswordPayload(BaseModel):
     user_id: int = Field(..., ge=1)
-    length: int = Field(default=6, ge=6, le=32)
+    length: int = Field(default=10, ge=8, le=32)
 
 
 class UserSetPasswordPayload(BaseModel):
     user_id: int = Field(..., ge=1)
-    password: str = Field(..., min_length=6, max_length=128)
+    password: str = Field(..., min_length=8, max_length=128)
     old_password: str | None = Field(default=None, max_length=128)
 
 
@@ -235,16 +237,8 @@ def _effective_role_code_for_session(role: SysRole | None, username: str) -> str
     return code_raw
 
 
-def _generate_login_password(length: int = 6) -> str:
-    lower = string.ascii_lowercase
-    upper = string.ascii_uppercase
-    digit = string.digits
-    chars = [secrets.choice(lower), secrets.choice(upper), secrets.choice(digit)]
-    pool = lower + upper + digit
-    while len(chars) < length:
-        chars.append(secrets.choice(pool))
-    secrets.SystemRandom().shuffle(chars)
-    return "".join(chars)
+def _generate_login_password(length: int = 10) -> str:
+    return generate_login_password(length)
 
 
 def _jt808_sync_view(sync_result: dict) -> tuple[str, str | None]:
@@ -340,7 +334,11 @@ async def user_create(
     if phone and not re.fullmatch(r"1\d{10}", phone):
         raise HTTPException(status_code=400, detail="手机号格式不正确")
     try:
-        pwd_hash = bcrypt.hashpw(payload.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        new_pwd = require_strong_password(payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        pwd_hash = bcrypt.hashpw(new_pwd.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
         user = SysUser(
             username=username,
             password_hash=pwd_hash,
@@ -356,7 +354,7 @@ async def user_create(
             single_login=bool(int(payload.single_login)),
             is_outsource=bool(int(payload.is_outsource)),
         )
-        store_proxy_password(user, payload.password)
+        store_proxy_password(user, new_pwd)
         db.add(user)
         await db.flush()
         await db.refresh(user)
@@ -505,8 +503,10 @@ async def user_set_password(
             raise HTTPException(status_code=400, detail="旧密码不正确")
         if new_pwd == old_pwd:
             raise HTTPException(status_code=400, detail="新密码不能与旧密码相同")
-    if len(new_pwd) < 6:
-        raise HTTPException(status_code=400, detail="密码至少6位")
+    try:
+        new_pwd = require_strong_password(new_pwd)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         user.password_hash = bcrypt.hashpw(new_pwd.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
         store_proxy_password(user, new_pwd)
@@ -1022,7 +1022,9 @@ async def user_login(payload: UserLoginPayload, request: Request, db: AsyncSessi
 
     saved_hash = user.password_hash or ""
     try:
-        ok = bcrypt.checkpw(password.encode("utf-8"), saved_hash.encode("utf-8"))
+        ok = await asyncio.to_thread(
+            bcrypt.checkpw, password.encode("utf-8"), saved_hash.encode("utf-8")
+        )
     except Exception:
         ok = False
     if not ok and saved_hash and not saved_hash.startswith("$2"):

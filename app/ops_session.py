@@ -1,35 +1,45 @@
 """OBD-STATUS 运维门禁：独立会话，不复用前台 cesg_session。"""
 from __future__ import annotations
 
-import secrets
+import hashlib
+import hmac
 import time
 
 OPS_COOKIE = "cesg_ops_session"
 OPS_HEADER = "x-ops-token"
 OPS_TTL_SECONDS = 4 * 60 * 60
 
-# token -> (admin_user_id, expiry)
-_ops_tokens: dict[str, tuple[int, float]] = {}
+
+def _ops_secret() -> bytes:
+    from app.secret_box import _raw_secret
+
+    return hashlib.sha256(("cesg-ops|" + _raw_secret()).encode("utf-8")).digest()
 
 
 def issue_ops_token(admin_user_id: int) -> str:
-    token = secrets.token_urlsafe(32)
-    _ops_tokens[token] = (int(admin_user_id), time.time() + OPS_TTL_SECONDS)
-    return token
+    exp = int(time.time()) + OPS_TTL_SECONDS
+    payload = f"{int(admin_user_id)}.{exp}"
+    sig = hmac.new(_ops_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    return f"{payload}.{sig}"
 
 
 def ops_token_ok(token: str | None) -> int | None:
     raw = (token or "").strip()
     if not raw:
         return None
-    row = _ops_tokens.get(raw)
-    if row is None:
+    parts = raw.split(".")
+    if len(parts) != 3:
         return None
-    uid, exp = row
-    if exp < time.time():
-        _ops_tokens.pop(raw, None)
+    uid_s, exp_s, sig = parts
+    if not uid_s.isdigit() or not exp_s.isdigit():
         return None
-    return uid
+    payload = f"{uid_s}.{exp_s}"
+    expect = hmac.new(_ops_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    if not hmac.compare_digest(sig, expect):
+        return None
+    if int(exp_s) < time.time():
+        return None
+    return int(uid_s)
 
 
 def extract_ops_token(headers: dict[str, str]) -> str:
@@ -55,6 +65,7 @@ def attach_ops_cookie(response, token: str | None) -> None:
         samesite="lax",
         path="/",
         max_age=OPS_TTL_SECONDS,
+        secure=True,
     )
 
 

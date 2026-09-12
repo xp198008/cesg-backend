@@ -17,6 +17,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.scheduler_lock import should_run_schedulers
 from app.database import AsyncSessionLocal
 from app.geo_utils import geometry_hit, wgs84_to_gcj02
 from app.jt808_openapi_client import jt808_openapi_client
@@ -453,7 +454,7 @@ class ParkAlarmScheduler:
             mirror = {"error": str(exc), "mysql_ok": False}
         return {
             "enabled": bool(settings.park_alarm_enabled),
-            "running": self.running,
+            "running": self.running if should_run_schedulers() else bool(settings.park_alarm_enabled),
             "interval_seconds": int(settings.park_alarm_interval_seconds),
             "lookback_hours": int(settings.park_alarm_lookback_hours),
             "jt808_openapi_configured": jt808_openapi_client.configured(),

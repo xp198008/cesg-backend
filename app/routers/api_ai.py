@@ -90,9 +90,12 @@ async def _ai_context(
     return user_id, company
 
 
-def _ensure_configured() -> None:
-    if not agent_worker_client.configured():
-        raise HTTPException(status_code=503, detail="AI 接口未配置或未启用")
+async def _ensure_configured() -> None:
+    if not await agent_worker_client.configured_async():
+        from app.agent_worker_config import cached_runtime
+
+        reason = cached_runtime().get("ready_reason") or "AI 接口未配置或未启用"
+        raise HTTPException(status_code=503, detail=reason)
 
 
 @router.get("/worker-config")
@@ -143,7 +146,7 @@ async def ai_worker_config_test():
 
 @router.get("/health")
 async def ai_health():
-    _ensure_configured()
+    await _ensure_configured()
     try:
         data = await agent_worker_client.health()
         return {"ok": True, "data": data}
@@ -187,7 +190,7 @@ async def ai_chat(
     db: AsyncSession = Depends(get_db),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
-    _ensure_configured()
+    await _ensure_configured()
     user_id, company = await _ai_context(db, x_user_id=x_user_id, company_override=payload.company)
     input_messages = [m.model_dump(exclude_none=True) for m in payload.input]
 
@@ -222,7 +225,7 @@ async def ai_chat(
 
 @router.post("/cancel/{session_id}")
 async def ai_cancel(session_id: str):
-    _ensure_configured()
+    await _ensure_configured()
     try:
         data = await agent_worker_client.cancel_chat(session_id=session_id)
         return {"ok": True, "data": data}
@@ -237,7 +240,7 @@ async def ai_vehicle_summary(
     gps_hours: int = Query(3, ge=1, le=72),
 ):
     """代理 Agent Worker 车辆综合摘要（docs/aiNew.pdf 第五节）。"""
-    _ensure_configured()
+    await _ensure_configured()
     if not (plate or "").strip() and car_id is None:
         raise HTTPException(status_code=400, detail="plate 与 car_id 必须至少提供一个")
     try:
@@ -261,7 +264,7 @@ async def ai_vehicle_risk_assessment(
     car_id: int | None = Query(None, ge=1),
 ):
     """代理 Agent Worker 车辆风险定级（风险管控-风险智能分析综合风险分）。"""
-    _ensure_configured()
+    await _ensure_configured()
     if not (plate or "").strip() and car_id is None:
         raise HTTPException(status_code=400, detail="plate 与 car_id 必须至少提供一个")
     try:
@@ -280,7 +283,7 @@ async def ai_vehicle_risk_assessment(
 
 @router.get("/sessions/{session_id}")
 async def ai_session(session_id: str):
-    _ensure_configured()
+    await _ensure_configured()
     try:
         data = await agent_worker_client.get_session(session_id=session_id)
         return {"ok": True, "data": data}
@@ -298,7 +301,7 @@ async def ai_list_documents(
     keyword: str | None = Query(None),
     category: str | None = Query(None),
 ):
-    _ensure_configured()
+    await _ensure_configured()
     try:
         data = await agent_worker_client.list_documents(
             dataset_id=dataset_id,
@@ -318,7 +321,7 @@ async def ai_upload_document(
     file: UploadFile = File(...),
     category: str | None = Form(None),
 ):
-    _ensure_configured()
+    await _ensure_configured()
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="文件不能为空")
@@ -337,7 +340,7 @@ async def ai_upload_document(
 
 @router.delete("/knowledge/datasets/{dataset_id}/documents/{document_id}")
 async def ai_delete_document(dataset_id: str, document_id: str):
-    _ensure_configured()
+    await _ensure_configured()
     try:
         await agent_worker_client.delete_document(dataset_id=dataset_id, document_id=document_id)
         return {"ok": True}
@@ -353,7 +356,7 @@ async def ai_video_violation(
     company: str | None = Form(None),
     session_id: str | None = Form(None),
 ):
-    _ensure_configured()
+    await _ensure_configured()
     user_id, resolved_company = await _ai_context(db, x_user_id=x_user_id, company_override=company)
     content = await file.read()
     if not content:
@@ -379,7 +382,7 @@ async def ai_video_violation_by_url(
     x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     """下载远程视频后转发至 Agent Worker 违章判定接口。"""
-    _ensure_configured()
+    await _ensure_configured()
     user_id, resolved_company = await _ai_context(
         db, x_user_id=x_user_id, company_override=payload.company
     )

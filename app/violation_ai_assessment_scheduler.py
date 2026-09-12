@@ -32,9 +32,17 @@ from sqlalchemy.exc import IntegrityError
 
 from app.agent_worker_client import agent_worker_client
 from app.agent_worker_config import cached_runtime
+from app.ai_assess_control import (
+    get_desired,
+    read_state,
+    resolve_running,
+    set_desired,
+    write_state,
+)
 from app.alarm_type_gate import load_disabled_alarm_type_names
 from app.database import AsyncSessionLocal
 from app.models import VehicleViolation, ViolationAiAssessment
+from app.scheduler_lock import should_run_schedulers
 from app.timeutil import china_now_naive, china_today
 from app.violation_ai_assessment import (
     AiRefusalError,
@@ -183,7 +191,7 @@ async def list_recent_assessed(db, *, limit: int = 30) -> list[dict[str, Any]]:
 
 async def run_violation_ai_assess_once() -> AiAssessRoundResult:
     result = AiAssessRoundResult()
-    if not agent_worker_client.configured():
+    if not await agent_worker_client.configured_async():
         result.error = "AI 接口未配置或未启用"
         return result
 
@@ -318,6 +326,7 @@ class ViolationAiAssessmentScheduler:
 
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
+        self._watch_task: asyncio.Task | None = None
         self._running = False
         self._last_result: dict[str, Any] | None = None
         self._last_error: str | None = None
@@ -327,6 +336,26 @@ class ViolationAiAssessmentScheduler:
     @property
     def running(self) -> bool:
         return self._running and self._task is not None and not self._task.done()
+
+    def _snapshot_state(self, *, running: bool) -> dict[str, Any]:
+        return {
+            "running": running,
+            "desired": get_desired(default=True),
+            "last_run_at": (
+                self._last_run_at.isoformat(sep=" ", timespec="seconds") if self._last_run_at else None
+            ),
+            "last_result": self._last_result,
+            "last_error": self._last_error,
+            "deferred_count": len(self.active_defer_ids()),
+        }
+
+    def _write_heartbeat(self, *, running: bool | None = None) -> None:
+        if not should_run_schedulers():
+            return
+        try:
+            write_state(self._snapshot_state(running=self.running if running is None else running))
+        except OSError as exc:
+            logger.warning("写入 AI 评估调度心跳失败: %s", exc)
 
     def active_defer_ids(self) -> list[int]:
         now = time.time()
@@ -348,8 +377,34 @@ class ViolationAiAssessmentScheduler:
         except Exception as exc:  # noqa: BLE001
             logger.warning("AI 评估状态统计失败: %s", exc)
 
+        holder = should_run_schedulers()
+        st = read_state() if not holder else {}
+        if holder:
+            last_run_at = (
+                self._last_run_at.isoformat(sep=" ", timespec="seconds") if self._last_run_at else None
+            )
+            last_result = self._last_result
+            last_error = self._last_error
+            deferred_count = len(self.active_defer_ids())
+            self._write_heartbeat()
+        else:
+            last_run_at = st.get("last_run_at")
+            last_result = st.get("last_result")
+            last_error = st.get("last_error")
+            try:
+                deferred_count = int(st.get("deferred_count") or 0)
+            except (TypeError, ValueError):
+                deferred_count = 0
+
+        running = resolve_running(local_running=self.running, is_holder=holder)
+        try:
+            agent_ok = await agent_worker_client.configured_async()
+        except Exception:
+            agent_ok = agent_worker_client.configured()
+
         return {
-            "running": self.running,
+            "running": running,
+            "desired": get_desired(default=True),
             "enabled": True,
             "interval_seconds": 0,
             "batch_size": _BATCH_SIZE,
@@ -357,12 +412,12 @@ class ViolationAiAssessmentScheduler:
             "order_label": "优先最新（id 从大到小）；一条完成后立刻下一条",
             "user_id": _USER_ID,
             "defer_seconds": _DEFER_NO_EVIDENCE_SEC,
-            "deferred_count": len(self.active_defer_ids()),
-            "agent_worker_configured": agent_worker_client.configured(),
+            "deferred_count": deferred_count,
+            "agent_worker_configured": agent_ok,
             "agent_worker_base_url": str(cached_runtime().get("base_url") or ""),
-            "last_run_at": self._last_run_at.isoformat(sep=" ", timespec="seconds") if self._last_run_at else None,
-            "last_result": self._last_result,
-            "last_error": self._last_error,
+            "last_run_at": last_run_at,
+            "last_result": last_result,
+            "last_error": last_error,
             "today_assessed_db": today_db,
             "pending_unassessed_estimate": pending,
             "recent_assessed": recent,
@@ -374,12 +429,33 @@ class ViolationAiAssessmentScheduler:
         }
 
     def start(self, **_kwargs) -> None:
+        set_desired(True)
+        if should_run_schedulers():
+            self._start_local()
+        else:
+            logger.info("已请求启动 AI 评估调度，等待持锁进程接管")
+
+    def _start_local(self) -> None:
         if self.running:
+            self._write_heartbeat(running=True)
             return
         self._running = True
         self._task = asyncio.create_task(self._loop(), name="violation-ai-assess")
+        self._write_heartbeat(running=True)
+        logger.info("本进程已启动安全报警自动 AI 评估循环")
 
     async def stop(self, **_kwargs) -> None:
+        set_desired(False)
+        if should_run_schedulers():
+            await self._stop_local()
+        else:
+            logger.info("已请求停止 AI 评估调度，等待持锁进程退出循环")
+
+    async def stop_local(self) -> None:
+        """进程退出时只停本机循环，不改运维页开关。"""
+        await self._stop_local()
+
+    async def _stop_local(self) -> None:
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
@@ -388,17 +464,44 @@ class ViolationAiAssessmentScheduler:
             except asyncio.CancelledError:
                 pass
         self._task = None
+        self._write_heartbeat(running=False)
+
+    def start_watch(self) -> None:
+        if not should_run_schedulers():
+            return
+        if self._watch_task and not self._watch_task.done():
+            return
+        self._watch_task = asyncio.create_task(self._watch_desired(), name="violation-ai-assess-watch")
+
+    async def _watch_desired(self) -> None:
+        while True:
+            try:
+                want = get_desired(default=True)
+                if want and not self.running:
+                    self._start_local()
+                elif not want and (self._running or self.running):
+                    await self._stop_local()
+                else:
+                    self._write_heartbeat()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("AI 评估调度开关同步失败: %s", exc)
+            await asyncio.sleep(1)
 
     async def run_once(self) -> AiAssessRoundResult:
         result = await run_violation_ai_assess_once()
         self._last_run_at = china_now_naive()
         self._last_result = result.as_dict()
         self._last_error = result.error
+        self._write_heartbeat()
         return result
 
     async def _loop(self) -> None:
         logger.info("安全报警自动 AI 评估已启动：最新优先，完成后立刻下一条")
         await asyncio.sleep(_STARTUP_DELAY_SEC)
+        if not get_desired(default=True):
+            self._running = False
+            self._write_heartbeat(running=False)
+            return
         # 历史：评估已建议误报但 status 仍为待处理 → 一次性回填
         try:
             async with AsyncSessionLocal() as db:
@@ -418,6 +521,10 @@ class ViolationAiAssessmentScheduler:
         except Exception as exc:  # noqa: BLE001
             logger.warning("启动回捞拒答评估失败: %s", exc)
         while self._running:
+            if not get_desired(default=True):
+                self._running = False
+                self._write_heartbeat(running=False)
+                break
             try:
                 result = await self.run_once()
             except Exception as exc:  # noqa: BLE001

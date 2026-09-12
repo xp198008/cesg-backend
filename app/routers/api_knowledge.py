@@ -133,7 +133,7 @@ def _ai_duplicate_hits(ai_items: list[dict], *, filename: str, sha256: str) -> l
 
 
 async def _load_ai_docs(company: str) -> list[dict]:
-    if not agent_worker_client.configured():
+    if not await agent_worker_client.configured_async():
         return []
     try:
         data = await agent_worker_client.list_all_documents(dataset_name=company)
@@ -169,7 +169,7 @@ async def knowledge_sync_from_ai(
     x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     """从 AI 知识库拉取本公司已学习原文，写入当前分类；内容哈希相同则跳过。"""
-    if not agent_worker_client.configured():
+    if not await agent_worker_client.configured_async():
         raise HTTPException(status_code=503, detail="AI 接口未配置或未启用")
     company, company_key, _, user_id = await _knowledge_scope(db, x_user_id)
     d = category_dir(company_key, category_id)

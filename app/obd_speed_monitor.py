@@ -72,6 +72,8 @@ from app.models import (
     VehicleLocation,
     VehicleViolation,
 )
+from app.scheduler_lock import should_run_schedulers
+from app.shared_scheduler_flag import obd_speed_flag
 from app.timeutil import china_now_naive
 from app.violation_risk import derive_risk_level
 
@@ -160,6 +162,12 @@ def _mark_abnormal_speed_false_alarm(row: VehicleViolation, speed: float) -> Non
     row.handler_name = _ABNORMAL_SPEED_HANDLER
     row.handler_remark = _abnormal_speed_remark(speed)
     row.handled_at = china_now_naive()
+    try:
+        from app.violation_alert_cache import discard_violation_alerts
+
+        discard_violation_alerts([getattr(row, "id", None)])
+    except Exception:
+        pass
 
 
 async def backfill_abnormal_obd_speed_false_alarms(
@@ -1739,6 +1747,7 @@ async def backfill_obd_speed_violation_limits(db: AsyncSession) -> dict[str, Any
 class ObdSpeedScheduler:
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
+        self._watch_task: asyncio.Task | None = None
         self._running = False
         self._last_result: dict[str, Any] | None = None
         self._last_error: str | None = None
@@ -1748,9 +1757,43 @@ class ObdSpeedScheduler:
     def running(self) -> bool:
         return self._running and self._task is not None and not self._task.done()
 
+    def _write_heartbeat(self, *, running: bool | None = None) -> None:
+        if not should_run_schedulers():
+            return
+        try:
+            obd_speed_flag.write_state(
+                {
+                    "running": self.running if running is None else running,
+                    "desired": obd_speed_flag.get_desired(default=True),
+                    "last_run_at": (
+                        self._last_run_at.isoformat(sep=" ", timespec="seconds")
+                        if self._last_run_at
+                        else None
+                    ),
+                    "last_result": self._last_result,
+                    "last_error": self._last_error,
+                }
+            )
+        except OSError as exc:
+            logger.warning("写入 OBD 调度心跳失败: %s", exc)
+
     def status(self) -> dict[str, Any]:
+        holder = should_run_schedulers()
+        st = obd_speed_flag.read_state() if not holder else {}
+        if holder:
+            last_run_at = (
+                self._last_run_at.isoformat(sep=" ", timespec="seconds") if self._last_run_at else None
+            )
+            last_result = self._last_result
+            last_error = self._last_error
+            self._write_heartbeat()
+        else:
+            last_run_at = st.get("last_run_at")
+            last_result = st.get("last_result")
+            last_error = st.get("last_error")
         return {
-            "running": self.running,
+            "running": obd_speed_flag.resolve_running(local_running=self.running, is_holder=holder),
+            "desired": obd_speed_flag.get_desired(default=True),
             "interval_seconds": settings.obd_speed_check_interval_seconds,
             "redis": f"{settings.obd_redis_host}:{settings.obd_redis_port}/{settings.obd_redis_db}",
             "min_speed_kmh": settings.obd_min_speed_kmh,
@@ -1759,20 +1802,41 @@ class ObdSpeedScheduler:
             "session_max_seconds": int(getattr(settings, "obd_speed_session_max_seconds", 900) or 900),
             "open_overspeed_sessions": open_session_count(),
             "open_session_preview": session_status_snapshot()[:10],
-            "last_run_at": self._last_run_at.isoformat(sep=" ", timespec="seconds") if self._last_run_at else None,
-            "last_result": self._last_result,
-            "last_error": self._last_error,
+            "last_run_at": last_run_at,
+            "last_result": last_result,
+            "last_error": last_error,
         }
 
     def start(self, **_kwargs) -> None:
         """启动调度循环（服务启动时默认自动运行）。"""
+        obd_speed_flag.set_desired(True)
+        if should_run_schedulers():
+            self._start_local()
+        else:
+            logger.info("已请求启动 OBD 时速调度，等待持锁进程接管")
+
+    def _start_local(self) -> None:
         if self.running:
+            self._write_heartbeat(running=True)
             return
         self._running = True
         self._task = asyncio.create_task(self._loop(), name="obd-speed-check")
+        self._write_heartbeat(running=True)
+        logger.info("本进程已启动 OBD 时速违章监测循环")
 
     async def stop(self, **_kwargs) -> None:
-        """停止当前会话的调度循环（服务重启后会再次自动启动）。"""
+        """运维页停止：所有进程看到已停止，持锁进程退出循环。"""
+        obd_speed_flag.set_desired(False)
+        if should_run_schedulers():
+            await self._stop_local()
+        else:
+            logger.info("已请求停止 OBD 时速调度，等待持锁进程退出循环")
+
+    async def stop_local(self) -> None:
+        """进程退出时只停本机循环，不改运维页开关。"""
+        await self._stop_local()
+
+    async def _stop_local(self) -> None:
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
@@ -1780,6 +1844,7 @@ class ObdSpeedScheduler:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        self._task = None
         try:
             pending = take_all_overspeed_sessions(reason="scheduler_stop")
             local_n = 0
@@ -1799,6 +1864,28 @@ class ObdSpeedScheduler:
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("OBD 调度停止时落库超速会话失败: %s", exc)
+        self._write_heartbeat(running=False)
+
+    def start_watch(self) -> None:
+        if not should_run_schedulers():
+            return
+        if self._watch_task and not self._watch_task.done():
+            return
+        self._watch_task = asyncio.create_task(self._watch_desired(), name="obd-speed-check-watch")
+
+    async def _watch_desired(self) -> None:
+        while True:
+            try:
+                want = obd_speed_flag.get_desired(default=True)
+                if want and not self.running:
+                    self._start_local()
+                elif not want and (self._running or self.running):
+                    await self._stop_local()
+                else:
+                    self._write_heartbeat()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("OBD 调度开关同步失败: %s", exc)
+            await asyncio.sleep(1)
 
     async def run_once(self) -> ObdSyncResult:
         result = await run_obd_speed_check_once()
@@ -1807,6 +1894,7 @@ class ObdSpeedScheduler:
             "detail": result.detail[:20]
         }
         self._last_error = result.error
+        self._write_heartbeat()
         if result.violations_inserted:
             logger.info(
                 "OBD 时速监测：本轮新增违章 %s 条（扫描 %s Key，有效读数 %s）",
@@ -1819,6 +1907,10 @@ class ObdSpeedScheduler:
     async def _loop(self) -> None:
         logger.info("OBD 时速违章监测调度已启动")
         while self._running:
+            if not obd_speed_flag.get_desired(default=True):
+                self._running = False
+                self._write_heartbeat(running=False)
+                break
             try:
                 await self.run_once()
             except Exception as exc:  # noqa: BLE001

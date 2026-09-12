@@ -78,6 +78,11 @@ class AgentWorkerClient:
         data = cached_runtime()
         return bool(data.get("enabled") and _base_url(data) and _api_key(data))
 
+    async def configured_async(self) -> bool:
+        """多 worker 时 HTTP 进程启动未灌缓存，先从库补一次再判断。"""
+        rt = await _runtime()
+        return bool(rt.get("ready"))
+
     def _timeout(self, runtime: dict[str, Any] | None = None) -> httpx.Timeout:
         sec = float((runtime or cached_runtime()).get("timeout_seconds") or 60)
         return httpx.Timeout(sec, connect=min(10.0, sec), pool=10.0)

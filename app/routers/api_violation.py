@@ -37,7 +37,7 @@ from app.routers.api_vehicle import _vehicle_list_company_fleet_names
 from app.timeutil import china_now_naive
 from app.ttl_cache import ttl_get_or_set_async
 from app.jt808_violation_sync import lookup_company_name, notify_violation_created
-from app.violation_alert_cache import get_alerts_after
+from app.violation_alert_cache import acknowledge_alerts, discard_violation_alerts, get_alerts_after
 from app.alarm_type_gate import (
     expand_disabled_alarm_type_names,
     expand_violation_type_query_names,
@@ -888,6 +888,8 @@ async def violation_alert_cache(
                     alerts = [a for a in alerts if a.get("company_id") is None or a.get("company_id") in subtree]
         except HTTPException:
             pass
+    # 已交给前端播报的从缓存删掉，避免下次轮询再推同一条
+    acknowledge_alerts([a.get("id") for a in alerts])
     return {"ok": True, "items": alerts, "max_seq": max_seq}
 
 
@@ -1168,6 +1170,7 @@ async def violation_handle(violation_id: int, body: ViolationHandleIn, db: Async
             raise HTTPException(status_code=400, detail="手动违章处理请选择「完结」或「申诉」")
         await db.flush()
         await db.refresh(row)
+        discard_violation_alerts([row.id])
         return {"ok": True, "data": await _row_out_enriched(db, row)}
 
     row.handler_remark = body.remark
@@ -1181,6 +1184,7 @@ async def violation_handle(violation_id: int, body: ViolationHandleIn, db: Async
         row.pre_audit_kind = "preprocess"
     await db.flush()
     await db.refresh(row)
+    discard_violation_alerts([row.id])
     return {"ok": True, "data": await _row_out_enriched(db, row)}
 
 
