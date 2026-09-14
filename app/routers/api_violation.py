@@ -851,7 +851,7 @@ async def violation_recent_pending(
 
 @router.get("/alert-cache")
 async def violation_alert_cache(
-    after_seq: int = Query(-1, ge=-1),
+    after_seq: int = Query(-1, ge=-1, le=2_147_483_647),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
 ):
     """新增报警缓存增量。after_seq=-1 只取当前水位（登录时调用一次），

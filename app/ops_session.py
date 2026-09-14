@@ -70,4 +70,4 @@ def attach_ops_cookie(response, token: str | None) -> None:
 
 
 def clear_ops_cookie(response) -> None:
-    response.delete_cookie(key=OPS_COOKIE, path="/")
+    response.delete_cookie(key=OPS_COOKIE, path="/", secure=True, samesite="lax")

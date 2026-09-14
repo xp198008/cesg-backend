@@ -1,8 +1,10 @@
 """短信平台配置与验证码发送接口。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
+
+from app.security import StrictModel, reject_cross_site
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,7 +40,7 @@ class SmsPlatformConfigBody(BaseModel):
     remark: str | None = None
 
 
-class SmsSendCodeBody(BaseModel):
+class SmsSendCodeBody(StrictModel):
     phone: str = Field(..., min_length=11, max_length=20)
 
 
@@ -91,8 +93,9 @@ async def sms_api_config_put(body: SmsPlatformConfigBody, db: AsyncSession = Dep
 
 
 @router.post("/sms/send-code")
-async def sms_send_code(body: SmsSendCodeBody, db: AsyncSession = Depends(get_db)):
+async def sms_send_code(body: SmsSendCodeBody, request: Request, db: AsyncSession = Depends(get_db)):
     """登录页获取验证码。配置缺失或平台失败时统一提示无法获取短信。"""
+    reject_cross_site(request)
     result = await send_login_sms_code(db, body.phone)
     return {
         "ok": result.ok,

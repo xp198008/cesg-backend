@@ -100,6 +100,15 @@ def _find_user_id(cur: pymysql.cursors.Cursor, account: str) -> str | None:
     return str(row[0]) if row else None
 
 
+def _is_platform_admin_account(account: str) -> bool:
+    name = (account or "").strip().lower()
+    if not name:
+        return False
+    if name == "admin":
+        return True
+    return name == (settings.jt808_admin_account or "").strip().lower()
+
+
 def _set_group(cur: pymysql.cursors.Cursor, user_id: str, group_id: int | None) -> None:
     cur.execute("DELETE FROM tgps_group_user WHERE user_id = %s", (user_id,))
     if group_id is not None:
@@ -218,7 +227,9 @@ def _sync_update(
                     uid = fallback
                     params[-1] = uid
                     cur.execute(f"UPDATE tlingx_user SET {', '.join(sets)} WHERE id=%s", params)
-            _set_group(cur, uid, group_id)
+            # admin 必须保有全量车组；按所属公司只写一条会把下属公司从实时监控树抹掉
+            if not _is_platform_admin_account(account):
+                _set_group(cur, uid, group_id)
             conn.commit()
             logger.info("JT808 更新用户 id=%s account=%s", uid, account)
             return uid

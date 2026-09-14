@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     # 服务监听端口（与旧 8000 区分，避免混淆）
     app_port: int = 8100
 
+    # 浏览器 CORS / 来源校验白名单（逗号分隔）。空则用 app.security 内置默认。
+    cors_origins: str = "https://cs.v2xcloud.com,https://113.207.68.96,http://localhost:5173,http://127.0.0.1:5173"
+    # 现网 HTTPS 必须为 true；本地 HTTP 调试可设 COOKIE_SECURE=0
+    cookie_secure: bool = True
+
     # ---- JT808（灵星/808 平台）同步：把用户、公司基础档案下发到 808 ----
     jt808_sync_enabled: bool = True
     # 公司分组同步走 HTTP 8002 API（admin 登录）

@@ -14,6 +14,8 @@ import bcrypt
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+from app.security import INT32_MAX, ONLINE_SECONDS_MAX, StrictModel
 from sqlalchemy import and_, func, not_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,41 +70,41 @@ def _parse_query_datetime(value: str | None, *, end_of_day: bool = False) -> dat
     return None
 
 
-class UserLoginPayload(BaseModel):
+class UserLoginPayload(StrictModel):
     username: str = Field(..., min_length=1, max_length=64)
     password: str = Field(..., min_length=1, max_length=128)
 
 
-class UserPhoneLoginPayload(BaseModel):
+class UserPhoneLoginPayload(StrictModel):
     phone: str = Field(..., min_length=11, max_length=20)
     code: str = Field(..., min_length=4, max_length=4)
 
 
-class UserSessionCheckPayload(BaseModel):
-    user_id: int = Field(..., ge=1)
+class UserSessionCheckPayload(StrictModel):
+    user_id: int = Field(..., ge=1, le=INT32_MAX)
     session_token: str | None = Field(default=None, max_length=128)
 
 
-class RefreshJt808TokenPayload(BaseModel):
-    user_id: int = Field(..., ge=1)
+class RefreshJt808TokenPayload(StrictModel):
+    user_id: int = Field(..., ge=1, le=INT32_MAX)
     session_token: str | None = Field(default=None, max_length=128)
     # 非单点：用现有 token 调 8005 续期；单点在 8005 失败后可走 8003
     lingxtoken: str | None = Field(default=None, max_length=512)
 
 
-class EnsureJt808TokenPayload(BaseModel):
-    user_id: int = Field(..., ge=1)
+class EnsureJt808TokenPayload(StrictModel):
+    user_id: int = Field(..., ge=1, le=INT32_MAX)
     session_token: str | None = Field(default=None, max_length=128)
     # 首次无代登密文时由登录页传入密码，加密后仅用于代登 8003
     password: str | None = Field(default=None, max_length=128)
 
 
-class UserOperationLogIn(BaseModel):
+class UserOperationLogIn(StrictModel):
     username: str = Field(..., min_length=1, max_length=64)
     operation_content: str = Field(..., min_length=1, max_length=2000)
-    user_id: int | None = Field(default=None, ge=1)
+    user_id: int | None = Field(default=None, ge=1, le=INT32_MAX)
     real_name: str | None = Field(default=None, max_length=64)
-    org_id: int | None = Field(default=None, ge=1)
+    org_id: int | None = Field(default=None, ge=1, le=INT32_MAX)
     org_name: str | None = Field(default=None, max_length=128)
     module: str | None = Field(default=None, max_length=64)
     menu: str | None = Field(default=None, max_length=64)
@@ -111,21 +113,26 @@ class UserOperationLogIn(BaseModel):
     vehicle: str | None = Field(default=None, max_length=32)
     plate_color: str | None = Field(default=None, max_length=16)
     device_no: str | None = Field(default=None, max_length=64)
+    source: str | None = Field(default=None, max_length=16)
 
 
-class UserLogoutPayload(BaseModel):
+class UserLogoutPayload(StrictModel):
     username: str | None = Field(default=None, max_length=64)
-    login_log_id: int | None = Field(default=None, ge=1)
-    online_seconds: int | None = Field(default=None, ge=0)
-    user_id: int | None = Field(default=None, ge=1)
+    login_log_id: int | None = Field(default=None, ge=1, le=INT32_MAX)
+    online_seconds: int | None = Field(default=None, ge=0, le=ONLINE_SECONDS_MAX)
+    user_id: int | None = Field(default=None, ge=1, le=INT32_MAX)
     # 主动退出时用于注销 808（单点）；非单点不清理系统共用 token
     lingxtoken: str | None = Field(default=None, max_length=512)
 
 
-class UserSessionHeartbeatPayload(BaseModel):
-    login_log_id: int = Field(..., ge=1)
-    online_seconds: int = Field(..., ge=0)
+class UserSessionHeartbeatPayload(StrictModel):
+    login_log_id: int = Field(..., ge=1, le=INT32_MAX)
+    online_seconds: int = Field(..., ge=0, le=ONLINE_SECONDS_MAX)
     finalize: bool = Field(default=False)
+
+
+class Jt808AuthSyncPayload(StrictModel):
+    pass
 
 
 class UserCreatePayload(BaseModel):
@@ -1089,6 +1096,7 @@ async def user_monitor_scope(
 
 @router.post("/jt808-auth-sync")
 async def user_jt808_auth_sync(
+    _payload: Jt808AuthSyncPayload | None = None,
     db: AsyncSession = Depends(get_db),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
     x_lingx_token: str | None = Header(None, alias="X-Lingx-Token"),

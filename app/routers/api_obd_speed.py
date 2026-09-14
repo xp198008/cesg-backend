@@ -143,6 +143,30 @@ async def park_alarm_run_once():
     return {"ok": True, "result": result, "scheduler": park_alarm_scheduler.status()}
 
 
+@router.get("/api/obd-speed-check/obd-anomaly")
+async def obd_speed_check_obd_anomaly(
+    stale_minutes: int = 15,
+    gps_fresh_minutes: int = 15,
+):
+    """GPS 正在跑或当天跑过（5 < 车速 < 120），但 OBD 停滞超过 15 分钟或停在昨天以前。"""
+    from app.obd_anomaly_scan import GPS_MAX_KMH, GPS_MIN_KMH, scan_obd_anomaly
+
+    minutes = max(1, min(180, int(stale_minutes or 15)))
+    fresh = max(1, min(180, int(gps_fresh_minutes or 15)))
+    async with AsyncSessionLocal() as db:
+        try:
+            data = await scan_obd_anomaly(
+                db,
+                stale_minutes=minutes,
+                gps_min_kmh=GPS_MIN_KMH,
+                gps_max_kmh=GPS_MAX_KMH,
+                gps_fresh_minutes=fresh,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **data}
+
+
 @router.post("/api/obd-speed-check/park-alarm/reset-cursors")
 async def park_alarm_reset_cursors():
     """清空停车扫描游标，下一轮按 lookback 窗口重扫。"""
@@ -236,7 +260,7 @@ _STATUS_PAGE = """<!DOCTYPE html>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: "Microsoft YaHei", system-ui, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 24px; }
-  .wrap { max-width: 1100px; margin: 0 auto; }
+  .wrap { max-width: 1280px; margin: 0 auto; }
   h1 { font-size: 20px; margin-bottom: 4px; }
   .sub { color: #94a3b8; font-size: 13px; margin-bottom: 16px; }
   .tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
@@ -301,10 +325,11 @@ _STATUS_PAGE = """<!DOCTYPE html>
 <body>
 <div class="wrap">
   <h1>后台运维</h1>
-  <div class="sub">OBD 监测 · AI 自动评估 · AI 接口 · 报警类型 · 地图接口 · 短信平台</div>
+  <div class="sub">OBD 监测 · OBD异常 · AI 自动评估 · AI 接口 · 报警类型 · 地图接口 · 短信平台</div>
 
   <div class="tabs">
     <button type="button" class="active" data-tab="status">监测状态</button>
+    <button type="button" data-tab="anomaly">OBD异常</button>
     <button type="button" data-tab="ai">AI 评估</button>
     <button type="button" data-tab="aiapi">AI 接口</button>
     <button type="button" data-tab="alarms">报警类型</button>
@@ -365,6 +390,31 @@ _STATUS_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div id="panel-anomaly" class="panel">
+    <div class="sub" id="anomalyRefreshed">点「立即扫描」检测 GPS 在跑或当天跑过、但 OBD 已停的车辆。</div>
+    <div class="btns">
+      <button id="btnAnomalyScan" class="success">立即扫描</button>
+      <span class="muted" id="anomalySummary"></span>
+    </div>
+    <div class="card">
+      <h2><span class="dot" id="dotAnomaly"></span>OBD 异常车辆</h2>
+      <p class="muted" style="margin-bottom:10px">
+        GPS 只认 <code>大于 5 且小于 120</code> km/h。两类都会列出：
+        ① 近 15 分钟正在跑，但 OBD 超过 15 分钟没收到；
+        ② 当天轨迹里出现过正常 GPS 车速，但 OBD 还停在昨天或更早。
+      </p>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>车牌</th><th>设备号</th><th>公司</th>
+            <th>GPS车速</th><th>GPS时间</th>
+            <th>OBD车速</th><th>OBD时间</th><th>OBD停滞</th><th>说明</th>
+          </tr>
+        </thead>
+        <tbody id="anomalyBody"><tr><td colspan="9">尚未扫描</td></tr></tbody>
+      </table>
+    </div>
+  </div>
 
   <div id="panel-ai" class="panel">
     <div class="sub" id="aiRefreshed">加载中…</div>
@@ -620,6 +670,7 @@ document.querySelectorAll(".tabs button").forEach((btn) => {
     if (btn.dataset.tab === "sms") loadSmsConfig();
     if (btn.dataset.tab === "aiapi") loadAiApiConfig();
     if (btn.dataset.tab === "status") loadStatus();
+    if (btn.dataset.tab === "anomaly") loadAnomaly();
     if (btn.dataset.tab === "ai") loadAiStatus();
   };
 });
@@ -801,6 +852,55 @@ function renderPing(p) {
   }
 }
 
+function renderAnomaly(data) {
+  const items = data.items || [];
+  const n = data.anomaly_count != null ? data.anomaly_count : items.length;
+  $("dotAnomaly").className = "dot " + (n > 0 ? "warn" : "ok");
+  $("anomalySummary").innerHTML =
+    "此刻行驶 " + esc(data.gps_moving_count ?? 0) +
+    " · 当天另有轨迹 " + esc(data.today_gps_moving_count ?? 0) +
+    " · OBD 异常 <b>" + esc(n) + "</b> 台（5&lt;GPS&lt;120；OBD≥" +
+    esc(data.stale_minutes ?? 15) + "分钟或停在昨天以前）";
+  $("anomalyRefreshed").textContent = "扫描于 " + (data.now || new Date().toLocaleString());
+  if (!items.length) {
+    $("anomalyBody").innerHTML = '<tr><td colspan="9" class="okc">当前没有符合条件的 OBD 异常车辆</td></tr>';
+    return;
+  }
+  $("anomalyBody").innerHTML = items.map((r) => {
+    const lag = r.obd_age_minutes == null ? "从未收到" : (esc(r.obd_age_minutes) + " 分钟");
+    return "<tr>" +
+      "<td>" + esc(r.plate_no) + "</td>" +
+      "<td>" + esc(r.device_no) + "</td>" +
+      "<td>" + esc(r.company_name || "—") + "</td>" +
+      "<td>" + esc(r.gps_speed_kmh) + "</td>" +
+      "<td>" + esc(r.gps_time || "—") + "</td>" +
+      "<td>" + (r.obd_speed_kmh == null ? "—" : esc(r.obd_speed_kmh)) + "</td>" +
+      "<td>" + esc(r.obd_time || "—") + "</td>" +
+      "<td>" + lag + "</td>" +
+      "<td>" + esc(r.reason || "") + "</td>" +
+      "</tr>";
+  }).join("");
+}
+
+async function loadAnomaly() {
+  const btn = $("btnAnomalyScan");
+  if (btn) { btn.disabled = true; btn.textContent = "扫描中…"; }
+  $("anomalyBody").innerHTML = '<tr><td colspan="9">扫描中…</td></tr>';
+  $("anomalySummary").textContent = "";
+  try {
+    const res = await authFetch("/api/obd-speed-check/obd-anomaly");
+    if (res.status === 401) { showOpsGate("请输入 admin 密码"); return; }
+    const data = await res.json();
+    if (!res.ok) throw new Error((data && data.detail) || "扫描失败");
+    renderAnomaly(data);
+  } catch (e) {
+    $("dotAnomaly").className = "dot bad";
+    $("anomalyRefreshed").textContent = "扫描失败：" + e;
+    $("anomalyBody").innerHTML = '<tr><td colspan="9" class="err">' + esc(e.message || e) + "</td></tr>";
+  }
+  if (btn) { btn.disabled = false; btn.textContent = "立即扫描"; }
+}
+
 async function loadStatus() {
   try {
     const res = await authFetch("/api/obd-speed-check/status");
@@ -826,6 +926,8 @@ $("btnToggle").onclick = async () => {
   renderToggleBtn();
   loadStatus();
 };
+
+$("btnAnomalyScan").onclick = () => loadAnomaly();
 
 $("btnPing").onclick = async () => {
   const btn = $("btnPing");
@@ -1408,7 +1510,7 @@ function startOpsPage() {
   opsReady = true;
   hideOpsGate();
   const hash = (location.hash || "").replace("#", "");
-  if (hash === "alarms" || hash === "map" || hash === "ai" || hash === "aiapi" || hash === "sms") {
+  if (hash === "alarms" || hash === "map" || hash === "ai" || hash === "aiapi" || hash === "sms" || hash === "anomaly") {
     const btn = document.querySelector('.tabs button[data-tab="' + hash + '"]');
     if (btn) btn.click();
     else loadStatus();
@@ -1539,5 +1641,5 @@ async def obd_status_unlock(body: ObdStatusUnlockBody):
 
 @router.get("/obd-status", response_class=HTMLResponse, include_in_schema=False)
 async def obd_status_page():
-    """后台运维页：OBD / AI / AI 接口 / 报警类型 / 地图 / 短信。访问 /obd-status（#ai / #aiapi / #alarms / #map / #sms）。"""
+    """后台运维页：OBD / OBD异常 / AI / AI 接口 / 报警类型 / 地图 / 短信。访问 /obd-status（#anomaly / #ai / #aiapi / #alarms / #map / #sms）。"""
     return HTMLResponse(_STATUS_PAGE)

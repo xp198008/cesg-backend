@@ -542,6 +542,8 @@ class PrivateMapRule(Base):
     company_name = Column(String(128), nullable=True)
     fleet_name = Column(String(128), nullable=True)
     road_type_name = Column(String(64), nullable=False, server_default="高速公路", default="高速公路")
+    # 重叠仲裁：1 级最高，10 级最低
+    priority_level = Column(Integer, nullable=False, default=5, server_default="5")
     remark = Column(String(255))
     created_by = Column(Integer, nullable=True, index=True)
     created_by_name = Column(String(64), nullable=True)

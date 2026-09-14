@@ -409,6 +409,17 @@ def _normalize_road_type_name(raw: str | None) -> str:
     return text[:64] if text else DEFAULT_ROAD_TYPE_NAME
 
 
+DEFAULT_PRIORITY_LEVEL = 5
+
+
+def _normalize_priority_level(raw) -> int:
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = DEFAULT_PRIORITY_LEVEL
+    return max(1, min(10, n))
+
+
 class PrivateMapRuleCreateBody(BaseModel):
     rule_code: str = Field(..., min_length=1, max_length=64)
     rule_name: str = Field(..., min_length=1, max_length=200)
@@ -419,6 +430,7 @@ class PrivateMapRuleCreateBody(BaseModel):
     ref_public_rule_id: int | None = None
     fleet_name: str | None = Field(None, max_length=128)
     road_type_name: str | None = Field(None, max_length=64)
+    priority_level: int | None = Field(None, ge=1, le=10)
     remark: str | None = Field(None, max_length=255)
 
 
@@ -430,6 +442,7 @@ class PrivateMapRuleUpdateBody(BaseModel):
     ref_public_rule_id: int | None = None
     fleet_name: str | None = Field(None, max_length=128)
     road_type_name: str | None = Field(None, max_length=64)
+    priority_level: int | None = Field(None, ge=1, le=10)
     remark: str | None = Field(None, max_length=255)
 
 
@@ -462,6 +475,7 @@ def _private_rule_out(row: PrivateMapRule) -> dict:
         "company_name": (getattr(row, "company_name", None) or "").strip() or None,
         "fleet_name": (getattr(row, "fleet_name", None) or "").strip() or None,
         "road_type_name": _normalize_road_type_name(getattr(row, "road_type_name", None)),
+        "priority_level": _normalize_priority_level(getattr(row, "priority_level", None)),
         "remark": row.remark,
         "created_by": row.created_by,
         "created_by_name": row.created_by_name,
@@ -1172,6 +1186,7 @@ async def private_map_rule_create(
         company_name=company_name,
         fleet_name=fleet_name,
         road_type_name=_normalize_road_type_name(body.road_type_name),
+        priority_level=_normalize_priority_level(body.priority_level),
         remark=(body.remark or "").strip() or None,
         created_by=creator_id,
         created_by_name=await _resolve_creator_name(db, creator_id),
@@ -1213,6 +1228,8 @@ async def private_map_rule_update(
         row.company_name = company_name
     if "road_type_name" in data:
         row.road_type_name = _normalize_road_type_name(body.road_type_name)
+    if "priority_level" in data and body.priority_level is not None:
+        row.priority_level = _normalize_priority_level(body.priority_level)
     if "remark" in data:
         row.remark = (body.remark or "").strip() or None
     await db.flush()

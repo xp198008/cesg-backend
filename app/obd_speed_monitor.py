@@ -13,9 +13,8 @@
 5. 规则匹配：车辆 → 规则类别(assigned_vehicle_ids) → 私有规则(category_ids)，
    坐标转 GCJ02 后做几何命中（围栏=点在形内；限速折线=点距折线 <= 缓冲带）
 5b. 按车辆坐标查询实况天气，套用类别 weather_speed_limits 调整生效限速
-6. 优先级仲裁（用户约定，四档线性，仅重叠时生效）：
-   继承集团范围 < 纯私有范围 < 继承集团折线 < 纯私有公司折线
-   圆/矩形/多边形同属「范围」档；同级多条命中时随机取一条
+6. 优先级仲裁（仅重叠时生效）：按规则 ``priority_level`` 1–10，数字越小越高；
+   未配置或历史数据默认 5 级；同级多条命中时随机取一条
 7. 超过生效限速 → 维护超速会话（持续只更新终点）；
    会话结束或满 15 分钟拆段时 **同时** 写本地 OBD超速 + 后台 1303（1:1）
 """
@@ -602,29 +601,30 @@ async def _weather_code_at(lat: float, lng: float) -> str:
     return code
 
 
+def rule_user_priority(h: RuleHit) -> int:
+    """地图管理配置的 1–10 级（1 最高）。缺省按 5 级。"""
+    try:
+        n = int(getattr(h.rule, "priority_level", None) or 5)
+    except (TypeError, ValueError):
+        n = 5
+    return max(1, min(10, n))
+
+
 def rule_priority_rank(h: RuleHit) -> int:
-    """四档线性优先级（数值越小越优先，仅重叠仲裁时用）。
-
-    0 纯私有折线 > 1 继承集团折线 > 2 纯私有范围 > 3 继承集团范围
-
-    「范围」含圆 / 矩形 / 多边形，三者同档同等处理（非折线即范围）。
-    """
-    if h.is_self_drawn:
-        return 0 if h.is_speed_rule else 2
-    return 1 if h.is_speed_rule else 3
+    """兼容旧字段：现在与 ``priority_level`` 相同（1 最高，10 最低）。"""
+    return rule_user_priority(h)
 
 
 def arbitrate(hits: list[RuleHit], *, stable: bool = False) -> RuleHit | None:
     """重叠命中时挑一条生效规则：
 
-    1. 四档线性：纯私有折线 > 继承集团折线 > 纯私有范围 > 继承集团范围
-       （圆/矩形/多边形同属范围档）
-    2. 同档多条命中：监测随机取一条；界面展示按规则 id 稳定取一条，避免气泡闪烁
+    1. 按地图管理 1–10 级，数字越小越高
+    2. 同级多条：监测随机取一条；界面气泡按规则 id 稳定取一条，避免闪烁
     """
     if not hits:
         return None
-    best_rank = min(rule_priority_rank(h) for h in hits)
-    top = [h for h in hits if rule_priority_rank(h) == best_rank]
+    best = min(rule_user_priority(h) for h in hits)
+    top = [h for h in hits if rule_user_priority(h) == best]
     if stable:
         return min(top, key=lambda h: (int(h.rule.id or 0), int(h.category.id or 0)))
     return random.choice(top)
@@ -692,6 +692,7 @@ async def resolve_vehicle_rule_speed(
         "rule_name": None,
         "category_name": None,
         "priority_rank": None,
+        "priority_level": None,
         "hit_count": 0,
         "weather_type_code": None,
     }
@@ -731,7 +732,8 @@ async def resolve_vehicle_rule_speed(
         "rule_id": int(winner.rule.id) if winner.rule.id is not None else None,
         "rule_name": (winner.rule.rule_name or "").strip() or None,
         "category_name": (winner.category.type_name or "").strip() or None,
-        "priority_rank": rule_priority_rank(winner),
+        "priority_rank": rule_user_priority(winner),
+        "priority_level": rule_user_priority(winner),
         "hit_count": len(hits),
         "weather_type_code": weather_code,
     }

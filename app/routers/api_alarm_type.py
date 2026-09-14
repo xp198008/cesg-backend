@@ -125,7 +125,7 @@ async def alarm_type_list(
     safety_level: str | None = Query(None),
     status: str | None = Query(None),
     alarm_level: str | None = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=100000),
     page_size: int = Query(20, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):

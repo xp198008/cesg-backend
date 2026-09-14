@@ -166,20 +166,27 @@ def _rule_hit(lng_gcj: float, lat_gcj: float, rule: PrivateMapRule) -> bool:
     return geometry_hit(lng_gcj, lat_gcj, shape, geom, 0.0)
 
 
-def _park_priority_rank(rule: PrivateMapRule) -> int:
-    """范围围栏优先级（数值越小越优先）。
+def _park_user_priority(rule: PrivateMapRule) -> int:
+    try:
+        n = int(getattr(rule, "priority_level", None) or 5)
+    except (TypeError, ValueError):
+        n = 5
+    return max(1, min(10, n))
 
-    圆 / 矩形 / 多边形同档；仅区分来源：纯私有范围 > 继承集团范围。
-    """
+
+def _park_priority_rank(rule: PrivateMapRule) -> int:
+    """范围围栏来源档（数值越小越优先）。纯私有范围 > 继承集团范围。"""
     return 0 if getattr(rule, "ref_public_rule_id", None) is None else 1
 
 
 def _pick_park_hit(
     hits: list[tuple[PrivateMapRule, int, int]],
 ) -> tuple[PrivateMapRule, int, int] | None:
-    """重叠命中只产一条：先取最高优先级档，同级随机一条。"""
+    """重叠命中只产一条：先按 1–10 级，再看来源档，同级随机一条。"""
     if not hits:
         return None
+    best_user = min(_park_user_priority(rule) for rule, _, _ in hits)
+    hits = [h for h in hits if _park_user_priority(h[0]) == best_user]
     best_rank = min(_park_priority_rank(rule) for rule, _, _ in hits)
     top = [h for h in hits if _park_priority_rank(h[0]) == best_rank]
     return random.choice(top)

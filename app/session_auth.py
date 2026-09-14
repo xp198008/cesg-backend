@@ -29,6 +29,8 @@ _PUBLIC_EXACT = {
 _PUBLIC_PREFIXES = (
     # 登录页本地下载（若经 8100 提供）
     "/static/downloads/",
+    # 808 /api 校验网关（808 自身用 lingxtoken，不走 CESG 会话）
+    "/internal/jt808-gateway",
 )
 
 # 仅运维页使用：前台登录不能调用
@@ -95,18 +97,27 @@ def attach_session_cookie(response, session_token: str | None) -> None:
     token = (session_token or "").strip()
     if not token:
         return
+    from app.config import settings
+
     response.set_cookie(
         key=COOKIE_NAME,
         value=token,
         httponly=True,
+        secure=bool(settings.cookie_secure),
         samesite="lax",
         path="/",
-        max_age=60 * 60 * 24 * 7,
     )
 
 
 def clear_session_cookie(response) -> None:
-    response.delete_cookie(key=COOKIE_NAME, path="/")
+    from app.config import settings
+
+    response.delete_cookie(
+        key=COOKIE_NAME,
+        path="/",
+        secure=bool(settings.cookie_secure),
+        samesite="lax",
+    )
 
 
 def _session_cache_key(token: str) -> str:

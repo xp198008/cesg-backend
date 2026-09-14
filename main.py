@@ -22,12 +22,15 @@ except ImportError:
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from app.session_auth import SessionAuthMiddleware
+from app.security import cors_origin_list, sanitize_validation_errors
 from fastapi import HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.exc import DataError
 
 from app.config import settings
 from app.database import init_models
@@ -58,6 +61,7 @@ from app.routers import (
     api_media,
     api_obd_fuel,
     api_obd_speed,
+    api_obd_anomaly,
     api_park_alarm_report,
     api_org,
     api_permission_menu,
@@ -79,6 +83,7 @@ from app.routers import (
     api_violation_ticket,
     api_violation_type,
     api_weather,
+    api_jt808_gateway,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -97,11 +102,45 @@ app = FastAPI(
 app.add_middleware(SessionAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origin_list(),
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _no_store_api(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path or ""
+    if path.startswith("/api") or path.startswith("/internal") or path.startswith("/cmapi"):
+        response.headers.setdefault("Cache-Control", "no-store, no-cache, must-revalidate")
+        response.headers.setdefault("Pragma", "no-cache")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(_request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"detail": sanitize_validation_errors(exc.errors())})
+
+
+@app.exception_handler(DataError)
+async def _data_error_handler(_request: Request, _exc: DataError):
+    return JSONResponse(status_code=400, content={"detail": "参数超出允许范围"})
+
+
+@app.exception_handler(OverflowError)
+async def _overflow_handler(_request: Request, _exc: OverflowError):
+    return JSONResponse(status_code=400, content={"detail": "参数超出允许范围"})
+
+
+@app.exception_handler(Exception)
+async def _unhandled_error_handler(_request: Request, exc: Exception):
+    if isinstance(exc, HTTPException):
+        raise exc
+    logger.exception("未处理异常")
+    return JSONResponse(status_code=500, content={"detail": "服务暂时不可用"})
 
 _vehicle_type_icon_media_dir = Path(__file__).resolve().parent / "data" / "vehicle_type_icons"
 _vehicle_type_icon_media_dir.mkdir(parents=True, exist_ok=True)
@@ -136,6 +175,7 @@ async def driver_avatar_file(filename: str):
     return FileResponse(target)
 
 
+app.include_router(api_jt808_gateway.router)
 app.include_router(api_user.router)
 app.include_router(api_role.router)
 app.include_router(api_org.router)
@@ -151,6 +191,7 @@ app.include_router(api_map_grasp.router)
 app.include_router(api_sms.router)
 app.include_router(api_obd_fuel.router)
 app.include_router(api_obd_speed.router)
+app.include_router(api_obd_anomaly.router)
 app.include_router(api_park_alarm_report.router)
 app.include_router(api_violation_ai_assess.router)
 app.include_router(api_permission_menu.router)
