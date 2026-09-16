@@ -1031,6 +1031,42 @@ class ObdFuelDaily(Base):
     created_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
 
 
+class ObdMileageDaily(Base):
+    """CESG 自有日里程事实表：一车一日一行，起止取 OBD 总里程（zlc）。
+
+    结束里程：当天最后一帧；若次日未启动，用之后第一个自然日的第一条 OBD 下延。
+    启止位置：当天第一条/最后一条定位逆地理。
+    """
+
+    __tablename__ = "obd_mileage_daily"
+    __table_args__ = (
+        UniqueConstraint("device_no", "day", name="uq_obd_mileage_daily_dev_day"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    device_no = Column(String(64), nullable=False, index=True)
+    plate_no = Column(String(32), nullable=True, index=True)
+    vehicle_id = Column(Integer, nullable=True, index=True)
+    company_id = Column(Integer, nullable=True, index=True)
+    company_name = Column(String(128), nullable=True)
+    driver_name = Column(String(64), nullable=True)
+    day = Column(String(8), nullable=False, index=True)  # yyyyMMdd
+    start_mileage = Column(Float, nullable=True)
+    end_mileage = Column(Float, nullable=True)
+    drive_km = Column(Float, nullable=True)
+    start_time = Column(DateTime, nullable=True)
+    end_time = Column(DateTime, nullable=True)
+    start_lng = Column(Float, nullable=True)
+    start_lat = Column(Float, nullable=True)
+    end_lng = Column(Float, nullable=True)
+    end_lat = Column(Float, nullable=True)
+    start_address = Column(String(512), nullable=True)
+    end_address = Column(String(512), nullable=True)
+    closed = Column(Boolean, nullable=False, default=False, server_default="0")
+    source = Column(String(32), nullable=False, default="obd_zlc", server_default="obd_zlc")
+    updated_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
+    created_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
+
+
 class RoutePlanHistory(Base):
     """路径规划下发历史：用户向设备发送语音/文字规划结果时落库。"""
 

@@ -884,7 +884,7 @@ def local_alarm_period_range(
     weekly_end_date: str | None = None,
     report_month: str | None = None,
 ) -> tuple[datetime, datetime] | None:
-    """司机画像本地报警区间：优先用页面起止日期，不对齐到上周三。"""
+    """企业/司机画像本地报警区间：优先用页面起止日期，不对齐到上周三。"""
     start_text = str(start_date or "").strip()
     end_text = str(end_date or "").strip()
     if start_text or end_text:
@@ -983,6 +983,73 @@ async def query_driver_local_alarm_counts(
     for name, cnt in rows:
         counts[classify_local_alarm_field(str(name or ""))] += int(cnt or 0)
     return counts
+
+
+async def query_company_local_alarm_items(
+    db: AsyncSession,
+    *,
+    company_ids: set[int],
+    start_at: datetime,
+    end_at: datetime,
+    name_map: dict[int, str],
+) -> list[dict[str, Any]]:
+    """按安全管理本地报警（含 OBD 超速）生成企业画像车辆行，供子公司分桶。"""
+    allow = {int(x) for x in company_ids if x is not None}
+    if not allow:
+        return []
+    company_expr = func.coalesce(VehicleViolation.company_id, Vehicle.company_id)
+    disabled = await load_disabled_alarm_type_names(db)
+    rows = (
+        await db.execute(
+            select(
+                company_expr.label("company_id"),
+                VehicleViolation.plate_no,
+                VehicleViolation.vehicle_id,
+                VehicleViolation.violation_type_name,
+                func.count().label("cnt"),
+            )
+            .outerjoin(Vehicle, Vehicle.id == VehicleViolation.vehicle_id)
+            .where(
+                violation_list_visibility(disabled),
+                VehicleViolation.violation_time >= start_at,
+                VehicleViolation.violation_time < end_at,
+                company_expr.in_(allow),
+            )
+            .group_by(
+                company_expr,
+                VehicleViolation.plate_no,
+                VehicleViolation.vehicle_id,
+                VehicleViolation.violation_type_name,
+            )
+        )
+    ).all()
+    grouped: dict[tuple[Any, str], dict[str, Any]] = {}
+    for company_id, plate_no, vehicle_id, type_name, cnt in rows:
+        plate = str(plate_no or "").strip()
+        oid = _as_int(company_id) or None
+        key = (oid, plate)
+        item = grouped.get(key)
+        if item is None:
+            item = {
+                "car_id": _as_int(vehicle_id) or None,
+                "vehicle_id": _as_int(vehicle_id) or None,
+                "plate_no": plate,
+                "company_id": oid,
+                "company_name": name_map.get(oid) if oid is not None else "未匹配公司",
+                **_empty_counts(),
+            }
+            grouped[key] = item
+        item[classify_local_alarm_field(str(type_name or ""))] += int(cnt or 0)
+    items: list[dict[str, Any]] = []
+    for item in grouped.values():
+        total = total_alarm_count(item)
+        score = risk_score_from_counts(item)
+        item["total_alarm_count"] = total
+        item["risk_score"] = score
+        item["risk_level"] = risk_level_from_score(score)
+        item["radar"] = radar_values(item)
+        items.append(item)
+    return items
 
 
 def overlay_driver_local_profile(
@@ -1424,8 +1491,17 @@ async def query_risk_profile(
             filter_car_id = int(mapped)
 
     meta: dict[str, Any] = {"source": "weekly", "period": None, "week_ends": [], "requested_period": None}
+    use_local_company_alarms = dimension == "company" and bool(
+        str(start_date or "").strip() or str(end_date or "").strip()
+    )
 
-    if mode == "monthly":
+    if use_local_company_alarms:
+        # 企业画像有页面起止日期时，用安全管理本地报警，不再对齐外部周报周三周末。
+        raw_items = []
+        meta["source"] = "local_violation"
+        meta["requested_period"] = end_date or start_date
+        meta["period"] = end_date or start_date
+    elif mode == "monthly":
         if not report_month:
             today = date.today()
             report_month = f"{today.year:04d}{today.month:02d}"
@@ -1513,6 +1589,7 @@ async def query_risk_profile(
         x for x in enriched if _as_int(x.get("company_id")) in scope_allow
     ]
 
+    allow_companies: set[int] = set(scope_allow)
     selected_raw: list[int] = []
     if company_ids:
         selected_raw = [int(x) for x in company_ids if x is not None]
@@ -1576,6 +1653,36 @@ async def query_risk_profile(
             if keyword in str(x.get("driver_name") or "")
         ]
 
+    if use_local_company_alarms:
+        dt_range = local_alarm_period_range(
+            mode=mode,
+            start_date=start_date,
+            end_date=end_date,
+            weekly_end_date=meta.get("requested_period") or weekly_end_date or meta.get("period"),
+            report_month=report_month or meta.get("period"),
+        )
+        if dt_range is not None:
+            start_at, end_at = dt_range
+            enriched = await query_company_local_alarm_items(
+                db,
+                company_ids=allow_companies,
+                start_at=start_at,
+                end_at=end_at,
+                name_map=name_map,
+            )
+            meta["source"] = "local_violation"
+            meta["alarm_period"] = {
+                "start_at": start_at.isoformat(sep=" "),
+                "end_at": (end_at - timedelta(seconds=1)).isoformat(sep=" "),
+            }
+            logger.info(
+                "企业风险画像改用本地报警 n=%s start=%s end=%s allow=%s",
+                len(enriched),
+                start_at,
+                end_at,
+                len(allow_companies),
+            )
+
     # 企业风险画像：选中公司按 JT808 直接下级分桶；失败则回退本地组织树；未选则滚到集团二级
     if dimension == "company":
         if enriched:
@@ -1638,6 +1745,8 @@ async def query_risk_profile(
         selected_company_name=selected_company_label or None,
         selected_company_id=selected_company_pk,
     )
+    if use_local_company_alarms and meta.get("alarm_period"):
+        payload["alarm_rank_period"] = meta["alarm_period"]
     if dimension == "vehicle":
         payload = await attach_vehicle_obd_indicators(
             db, payload, plates=filter_plates or None

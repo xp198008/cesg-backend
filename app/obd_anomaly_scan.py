@@ -31,6 +31,7 @@ GPS_MIN_KMH = 5.0
 GPS_MAX_KMH = 120.0
 OBD_STALE_MINUTES = 15
 GPS_FRESH_MINUTES = 15
+OBD_LINK_ABNORMAL_MESSAGE = "OBD接头异常"
 
 
 def _parse_compact_ts(raw: Any) -> datetime | None:
@@ -415,6 +416,13 @@ def _judge_obd_status(
 ) -> tuple[bool, str]:
     """返回 (是否异常, 原因)。"""
     obd_at = obd.get("at") if obd else None
+    if kind == "online":
+        # 定位还在、0900 却不是标准油/电 OBD（如 J1939 扫描日志）时，Redis 会停在旧帧。
+        if obd_at is not None and now - obd_at <= stale_after:
+            return False, ""
+        if obd_at is None:
+            return True, "终端在线但未收到有效OBD"
+        return True, "终端在线但OBD已停滞"
     if kind == "today":
         if obd_at is not None and obd_at >= today_start:
             return False, ""
@@ -474,7 +482,7 @@ def _item_from_car(
         "obd_age_minutes": _minutes_ago(now, obd_at),
         "obd_source": None if not obd else obd.get("source"),
         "reason": reason,
-        "message": "OBD检测接口存在异常" if abnormal else "",
+        "message": OBD_LINK_ABNORMAL_MESSAGE if abnormal else "",
     }
 
 
@@ -576,6 +584,9 @@ def _load_cars_for_ids(
                     and gps_min < float(gps_speed) < gps_max
                 )
                 today = today_hits.get(cid)
+                online_or_located = bool(info.get("online")) or (
+                    gps_at is not None and gps_at >= cutoff
+                )
                 if live:
                     cars.append({**info, "kind": "live"})
                 elif today:
@@ -587,6 +598,8 @@ def _load_cars_for_ids(
                             "kind": "today",
                         }
                     )
+                elif online_or_located:
+                    cars.append({**info, "kind": "online"})
             yc = _latest_obd_by_car(cur, "tgps_obd_yc", ids)
             dc = _latest_obd_by_car(cur, "tgps_obd_dc", ids)
     finally:

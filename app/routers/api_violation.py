@@ -17,6 +17,8 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from fastapi import APIRouter, Depends, File, HTTPException, Header, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+from app.security import OFFSET_MAX, PAGE_MAX, StrictModel
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -78,8 +80,12 @@ class ViolationAppealResolveIn(BaseModel):
     handler_name: str | None = Field(None, max_length=64)
 
 
-class ViolationPendingAliveIn(BaseModel):
-    ids: list[int] = Field(default_factory=list, max_length=3000)
+class ViolationPendingAliveIn(StrictModel):
+    ids: list[int] = Field(..., max_length=3000)
+
+
+class ViolationFetchMediaIn(StrictModel):
+    id: int = Field(..., ge=1)
 
 
 class ViolationOnlineAmongIn(BaseModel):
@@ -611,9 +617,16 @@ async def _scoped_query(
     return q
 
 
-async def _get_visible_violation_or_404(db: AsyncSession, violation_id: int) -> VehicleViolation:
-    """按 id 取记录；非 OBD 且无图片/视频证据时视为不存在（不在页面展示）。"""
-    row = await db.scalar(select(VehicleViolation).where(VehicleViolation.id == violation_id).limit(1))
+async def _get_visible_violation_or_404(
+    db: AsyncSession,
+    violation_id: int,
+    request: Request,
+) -> VehicleViolation:
+    """按 id 取当前组织/分配范围内的记录；越权或无证据时按不存在处理。"""
+    x_org_id = request.headers.get("x-org-id")
+    x_user_id = request.headers.get("x-user-id")
+    q = await _scoped_query(db, x_org_id, None, x_user_id)
+    row = await db.scalar(q.where(VehicleViolation.id == int(violation_id)).limit(1))
     if row is None or not violation_row_is_page_visible(row):
         raise HTTPException(status_code=404, detail="记录不存在")
     return row
@@ -695,10 +708,10 @@ async def violation_list(
         True,
         description="是否按停用报警类型软隐藏历史记录；默认开启",
     ),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=PAGE_MAX),
     page_size: int = Query(20, ge=1, le=3000),
     limit: int | None = Query(None, ge=1, le=3000),
-    offset: int | None = Query(None, ge=0),
+    offset: int | None = Query(None, ge=0, le=OFFSET_MAX),
     min_id: int | None = Query(None, ge=0),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
@@ -1119,14 +1132,21 @@ async def violation_manual(
 
 
 @router.get("/{violation_id}/detail")
-async def violation_detail(violation_id: int, db: AsyncSession = Depends(get_db)):
-    row = await _get_visible_violation_or_404(db, violation_id)
+async def violation_detail(violation_id: int, request: Request, db: AsyncSession = Depends(get_db)):
+    row = await _get_visible_violation_or_404(db, violation_id, request)
     return {"ok": True, "data": await _row_out_enriched(db, row)}
 
 
 @router.post("/{violation_id}/fetch-device-media")
-async def violation_fetch_device_media(violation_id: int, db: AsyncSession = Depends(get_db)):
-    row = await _get_visible_violation_or_404(db, violation_id)
+async def violation_fetch_device_media(
+    violation_id: int,
+    body: ViolationFetchMediaIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    if int(body.id) != int(violation_id):
+        raise HTTPException(status_code=400, detail="记录不存在")
+    row = await _get_visible_violation_or_404(db, violation_id, request)
     evidence = normalize_evidence_payload(_json_loads(row.ttx_evidence_refs, {}))
     return {
         "ok": True,
@@ -1138,13 +1158,18 @@ async def violation_fetch_device_media(violation_id: int, db: AsyncSession = Dep
 
 
 @router.patch("/{violation_id}/handle")
-async def violation_handle(violation_id: int, body: ViolationHandleIn, db: AsyncSession = Depends(get_db)):
+async def violation_handle(
+    violation_id: int,
+    body: ViolationHandleIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """处理动作。
 
     - 设备报警等：confirm → 待审核(preprocess)；误报 → 误报
     - 手动违章（审核通过后的待处理）：完结 → 已处理；申诉 → 已处理+申诉中
     """
-    row = await _get_visible_violation_or_404(db, violation_id)
+    row = await _get_visible_violation_or_404(db, violation_id, request)
     action = (body.action or "confirm").strip()
     is_manual = (row.source or "").strip() == "manual"
     status = (row.status or "").strip()
@@ -1189,7 +1214,12 @@ async def violation_handle(violation_id: int, body: ViolationHandleIn, db: Async
 
 
 @router.patch("/{violation_id}/audit")
-async def violation_audit(violation_id: int, body: ViolationAuditIn, db: AsyncSession = Depends(get_db)):
+async def violation_audit(
+    violation_id: int,
+    body: ViolationAuditIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """待审核分流。
 
     依据 ``pre_audit_kind``：
@@ -1201,7 +1231,7 @@ async def violation_audit(violation_id: int, body: ViolationAuditIn, db: AsyncSe
     - reject  + ``ticket_appeal`` → 罚单待处理
     - reject  + 其它              → 待处理
     """
-    row = await _get_visible_violation_or_404(db, violation_id)
+    row = await _get_visible_violation_or_404(db, violation_id, request)
     if (row.status or "").strip() != "待审核":
         raise HTTPException(status_code=400, detail="仅「待审核」记录可进行审核确认或打回")
 
@@ -1259,10 +1289,11 @@ async def violation_audit(violation_id: int, body: ViolationAuditIn, db: AsyncSe
 async def violation_appeal_resolve(
     violation_id: int,
     body: ViolationAppealResolveIn,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """违章申诉页：对「申诉中」记录通过/驳回。"""
-    row = await _get_visible_violation_or_404(db, violation_id)
+    row = await _get_visible_violation_or_404(db, violation_id, request)
     if (row.appeal_status or "").strip() != "申诉中":
         raise HTTPException(status_code=400, detail="仅「申诉中」记录可进行申诉处理")
     result = (body.result or "").strip().lower()
@@ -1288,9 +1319,14 @@ async def violation_appeal_resolve(
 
 
 @router.patch("/{violation_id}/ticket-process-complete")
-async def violation_ticket_complete(violation_id: int, body: TicketProcessIn, db: AsyncSession = Depends(get_db)):
+async def violation_ticket_complete(
+    violation_id: int,
+    body: TicketProcessIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """罚单待处理 → 已处理，并将关联罚单结案为「完成」。"""
-    row = await _get_visible_violation_or_404(db, violation_id)
+    row = await _get_visible_violation_or_404(db, violation_id, request)
     if (row.status or "").strip() != "罚单待处理":
         raise HTTPException(status_code=400, detail="仅「罚单待处理」记录可操作处理完成")
     row.status = "已处理"
@@ -1305,9 +1341,14 @@ async def violation_ticket_complete(violation_id: int, body: TicketProcessIn, db
 
 
 @router.patch("/{violation_id}/ticket-appeal-submit")
-async def violation_ticket_appeal(violation_id: int, body: TicketAppealIn, db: AsyncSession = Depends(get_db)):
+async def violation_ticket_appeal(
+    violation_id: int,
+    body: TicketAppealIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """罚单待处理 → 待审核（罚单岗发起申诉），写入申诉说明并回到审核队列。"""
-    row = await _get_visible_violation_or_404(db, violation_id)
+    row = await _get_visible_violation_or_404(db, violation_id, request)
     if (row.status or "").strip() != "罚单待处理":
         raise HTTPException(status_code=400, detail="仅「罚单待处理」记录可提交申诉")
     rm = (body.remark or "").strip()
@@ -1331,7 +1372,7 @@ async def violation_ticket_appeal_with_attachments(
     db: AsyncSession = Depends(get_db),
 ):
     """罚单待处理 → 待审核（罚单岗申诉），支持上传申诉附件。"""
-    row = await _get_visible_violation_or_404(db, violation_id)
+    row = await _get_visible_violation_or_404(db, violation_id, request)
     if (row.status or "").strip() != "罚单待处理":
         raise HTTPException(status_code=400, detail="仅「罚单待处理」记录可提交申诉")
 
@@ -1367,8 +1408,12 @@ async def violation_ticket_appeal_with_attachments(
 
 
 @router.patch("/{violation_id}/false-alarm-reopen")
-async def violation_false_alarm_reopen(violation_id: int, db: AsyncSession = Depends(get_db)):
-    row = await _get_visible_violation_or_404(db, violation_id)
+async def violation_false_alarm_reopen(
+    violation_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    row = await _get_visible_violation_or_404(db, violation_id, request)
     row.status = "待处理"
     row.pre_audit_kind = None
     row.appeal_status = None
@@ -1412,4 +1457,10 @@ async def violation_ai_assessment_analyze_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
+
+
+@router.api_route("/{violation_id}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], include_in_schema=False)
+@router.api_route("/{violation_id}/", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], include_in_schema=False)
+async def violation_id_not_a_collection(violation_id: int):
+    raise HTTPException(status_code=404, detail="记录不存在")
 

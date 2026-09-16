@@ -4,6 +4,7 @@ from __future__ import annotations
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from app.config import settings
@@ -11,6 +12,15 @@ from app.config import settings
 INT32_MAX = 2_147_483_647
 ONLINE_SECONDS_MAX = 31_536_000
 PAGE_MAX = 100_000
+OFFSET_MAX = 2_000_000
+PAGE_SIZE_MAX = 5_000
+
+_PAGING_LIMITS = {
+    "page": (1, PAGE_MAX),
+    "page_size": (1, PAGE_SIZE_MAX),
+    "offset": (0, OFFSET_MAX),
+    "limit": (1, PAGE_SIZE_MAX),
+}
 
 _DEFAULT_CORS_ORIGINS = (
     "https://cs.v2xcloud.com",
@@ -64,6 +74,23 @@ def is_allowed_request_origin(request: Request) -> bool:
 def reject_cross_site(request: Request) -> None:
     if not is_allowed_request_origin(request):
         raise HTTPException(status_code=403, detail="拒绝跨站请求")
+
+
+def reject_oversized_paging(request: Request) -> JSONResponse | None:
+    """超大 page/offset 在进 SQL 前直接 400，避免 MySQL OFFSET 500。"""
+    for key, raw in request.query_params.multi_items():
+        bounds = _PAGING_LIMITS.get((key or "").lower())
+        if bounds is None:
+            continue
+        text = str(raw or "").strip()
+        digits = text.lstrip("+-")
+        if not digits.isdigit() or len(digits) > 10:
+            return JSONResponse(status_code=400, content={"detail": "参数超出允许范围"})
+        value = int(text)
+        lo, hi = bounds
+        if value < lo or value > hi:
+            return JSONResponse(status_code=400, content={"detail": "参数超出允许范围"})
+    return None
 
 
 def sanitize_validation_errors(errors: list[dict]) -> list[dict]:

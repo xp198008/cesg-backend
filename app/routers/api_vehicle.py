@@ -33,6 +33,7 @@ from app.models import (
     Vehicle,
     VehicleAllocRuleVehicle,
     VehicleDevice,
+    VehicleTypeDict,
 )
 from app.org_scope import (
     collect_org_company_subtree_ids,
@@ -242,6 +243,183 @@ def _org_level_names(
     while len(names) < max_levels:
         names.append(None)
     return names[:max_levels]
+
+
+def _org_name_kind(name: str) -> str:
+    text = _norm(name)
+    if not text:
+        return ""
+    if ("组" in text or "班组" in text) and "公司" not in text:
+        return "team"
+    if "项目" in text:
+        return "project"
+    if "公司" in text and "本部" not in text:
+        return "company"
+    return "other"
+
+
+def _org_company_project_team(
+    org_id: int | None,
+    company_map: dict[int, str | None],
+    parent_map: dict[int, int | None],
+) -> tuple[str, str, str]:
+    """按组织树上溯拆出公司 / 项目 / 班组（从本级往上取最近匹配）。"""
+    if not org_id:
+        return "", "", ""
+    chain: list[str] = []
+    current: int | None = int(org_id)
+    visited: set[int] = set()
+    while current and current not in visited:
+        visited.add(current)
+        text = _norm(company_map.get(current))
+        if text:
+            chain.append(text)
+        current = parent_map.get(current)
+    company = project = team = ""
+    for name in chain:
+        kind = _org_name_kind(name)
+        if kind == "team" and not team:
+            team = name
+        elif kind == "project" and not project:
+            project = name
+        elif kind == "company" and not company:
+            company = name
+    if not company:
+        for name in chain:
+            if _org_name_kind(name) == "other" and "本部" not in name:
+                company = name
+                break
+        if not company and chain:
+            company = chain[-1]
+    return company, project, team
+
+
+def _export_num(value) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        num = float(value)
+        if num == int(num):
+            return str(int(num))
+        return str(value)
+    except (TypeError, ValueError):
+        return _norm(value)
+
+
+def _format_export_channels(device: VehicleDevice | None, channel_count: int | None) -> str:
+    raw = device.channels if device and device.channels else None
+    if isinstance(raw, list) and raw:
+        return ",".join(_norm(x) for x in raw if _norm(x))
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    count = int(channel_count or 0)
+    if count > 0:
+        return ",".join(f"CH{i}" for i in range(1, count + 1))
+    return ""
+
+
+# 自定义导出字段（与 1.0 勾选弹窗对齐，并补公司/项目/班组）
+VEHICLE_EXPORT_GROUPS: list[dict] = [
+    {
+        "key": "basic",
+        "label": "基本信息",
+        "fields": [
+            {"key": "index", "label": "序号", "default": True},
+            {"key": "plate_no", "label": "车牌号", "default": True},
+            {"key": "plate_color", "label": "车牌颜色", "default": True},
+            {"key": "color", "label": "车辆颜色", "default": False},
+            {"key": "vin", "label": "车辆识别代码VIN", "default": True},
+            {"key": "engine_no", "label": "车辆发动机号", "default": False},
+            {"key": "product_model_code", "label": "车辆产品型号代码", "default": False},
+            {"key": "frame_no", "label": "车架号", "default": False},
+            {"key": "org_company", "label": "公司", "default": True},
+            {"key": "org_project", "label": "项目", "default": True},
+            {"key": "org_team", "label": "班组", "default": True},
+            {"key": "company_name", "label": "所属公司", "default": False},
+            {"key": "fleet_name", "label": "车队", "default": False},
+            {"key": "driver_name", "label": "司机", "default": False},
+            {"key": "agent", "label": "代理商", "default": False},
+            {"key": "service_start_date", "label": "服务开始日", "default": False},
+            {"key": "service_end_date", "label": "服务到期日", "default": False},
+            {"key": "install_date", "label": "安装日期", "default": True},
+            {"key": "vehicle_type", "label": "车辆类型", "default": True},
+            {"key": "vehicle_spec", "label": "车辆规格", "default": True},
+            {"key": "manufacturer", "label": "制造厂家", "default": False},
+            {"key": "brand", "label": "车辆品牌", "default": False},
+            {"key": "model", "label": "车辆型号", "default": False},
+            {"key": "vehicle_category", "label": "车辆类别", "default": False},
+            {"key": "status", "label": "使用状态", "default": True},
+            {"key": "scrap_date", "label": "报废日期", "default": False},
+            {"key": "remark", "label": "备注", "default": False},
+            {"key": "last_online_at", "label": "最后上线时间", "default": False},
+            {"key": "updated_at", "label": "更新时间", "default": False},
+        ],
+    },
+    {
+        "key": "device",
+        "label": "设备信息",
+        "fields": [
+            {"key": "device_no", "label": "设备号", "default": True},
+            {"key": "terminal_type", "label": "终端类型", "default": False},
+            {"key": "sim_no", "label": "SIM卡号", "default": False},
+            {"key": "device_sn", "label": "设备序列号", "default": False},
+            {"key": "product_model", "label": "产品型号", "default": False},
+            {"key": "channels", "label": "通道", "default": True},
+            {"key": "channel_count", "label": "通道数", "default": False},
+        ],
+    },
+    {
+        "key": "license",
+        "label": "证件信息",
+        "fields": [
+            {"key": "driving_license_no", "label": "行驶证编号", "default": False},
+            {"key": "inspect_date", "label": "年检日期", "default": False},
+        ],
+    },
+    {
+        "key": "config",
+        "label": "车辆配置及主要技术参数",
+        "fields": [
+            {"key": "vehicle_length", "label": "车辆长度", "default": False},
+            {"key": "vehicle_width", "label": "车辆宽度", "default": False},
+            {"key": "vehicle_height", "label": "车辆高度", "default": False},
+            {"key": "loaded_weight", "label": "满载车辆重量", "default": False},
+            {"key": "vehicle_payload", "label": "车辆载重量", "default": False},
+            {"key": "curb_weight", "label": "车辆自重", "default": False},
+            {"key": "engine_displacement", "label": "发动机排量", "default": False},
+            {"key": "fuel_tank_capacity", "label": "油箱容积", "default": False},
+            {"key": "battery_capacity", "label": "电池容量", "default": False},
+            {"key": "range_mileage", "label": "续航里程", "default": False},
+        ],
+    },
+    {
+        "key": "ops",
+        "label": "经营运输信息",
+        "fields": [
+            {"key": "vehicle_usage", "label": "车辆用途", "default": False},
+            {"key": "route", "label": "运营线路", "default": False},
+        ],
+    },
+    {
+        "key": "registry",
+        "label": "购买登记信息",
+        "fields": [
+            {"key": "owner_name", "label": "机动车所有人", "default": False},
+            {"key": "contact_name", "label": "联系人", "default": False},
+            {"key": "contact_phone", "label": "联系电话", "default": False},
+        ],
+    },
+]
+
+_VEHICLE_EXPORT_FIELD_MAP = {
+    field["key"]: field for group in VEHICLE_EXPORT_GROUPS for field in group["fields"]
+}
+_DEFAULT_EXPORT_KEYS = [
+    field["key"]
+    for group in VEHICLE_EXPORT_GROUPS
+    for field in group["fields"]
+    if field.get("default")
+]
 
 
 def _norm(s) -> str:
@@ -698,12 +876,25 @@ async def vehicle_create(
     if bare_no and bare_no != _norm(payload.device_no):
         await _remove_reserve_for_device_no(db, bare_no)
     await db.flush()
+    snap = await snapshot_vehicle(db, v)
+    extras = []
+    for key, label in (
+        ("plate_color", "车牌颜色"),
+        ("device_no", "设备号"),
+        ("company_name", "所属公司"),
+        ("vehicle_type", "车辆类型"),
+        ("vin", "VIN"),
+    ):
+        val = snap.get(key)
+        if val and val != "空":
+            extras.append(f"{label}：{val}")
+    plate = _norm(payload.plate_no) or "--"
     await write_vehicle_operation_log(
         db,
         request=request,
         x_user_id=x_user_id,
         action="新增",
-        content=f"新增车辆信息：{_norm(payload.plate_no) or '--'}",
+        content=("新增车辆信息：" + plate + ("；" + "；".join(extras) if extras else "")),
         plate=_norm(payload.plate_no),
         plate_color=_norm(payload.plate_color),
         device_no=_norm(payload.device_no),
@@ -1540,7 +1731,7 @@ async def vehicle_list(
     scope_org_tree: bool = Query(False),
     online_source: str = Query("db"),
     fields: str | None = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=100000),
     page_size: int = Query(20, ge=1, le=1000),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
@@ -1695,6 +1886,100 @@ async def vehicle_list(
     return {"total": total, "items": items, "page": page, "page_size": page_size}
 
 
+def _parse_export_keys(columns: str | None) -> list[str]:
+    raw = [x.strip() for x in str(columns or "").split(",") if x.strip()]
+    keys: list[str] = []
+    seen: set[str] = set()
+    for key in raw or list(_DEFAULT_EXPORT_KEYS):
+        if key not in _VEHICLE_EXPORT_FIELD_MAP or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys or list(_DEFAULT_EXPORT_KEYS)
+
+
+def _vehicle_export_value_map(
+    index: int,
+    v: Vehicle,
+    *,
+    org_company: str,
+    org_project: str,
+    org_team: str,
+    company_name: str,
+    fleet_name: str,
+    driver_name: str,
+    device: VehicleDevice | None,
+    type_spec: str,
+) -> dict[str, str]:
+    last_online = ""
+    if v.last_online_at:
+        last_online = str(v.last_online_at).replace("T", " ")[:19]
+    updated = ""
+    if v.updated_at:
+        updated = str(v.updated_at).replace("T", " ")[:19]
+    raw_dev = _norm(device.device_no) if device else ""
+    return {
+        "index": str(index),
+        "plate_no": _norm(v.plate_no),
+        "plate_color": _norm(v.plate_color) or "黄牌",
+        "color": _norm(v.color),
+        "vin": _norm(v.vin),
+        "engine_no": _norm(v.engine_no),
+        "product_model_code": _norm(v.product_model_code),
+        "frame_no": _norm(v.frame_no),
+        "org_company": org_company,
+        "org_project": org_project,
+        "org_team": org_team,
+        "company_name": company_name,
+        "fleet_name": fleet_name,
+        "driver_name": driver_name,
+        "agent": _norm(v.agent),
+        "service_start_date": _export_date_text(v.service_start_date),
+        "service_end_date": _export_date_text(v.service_end_date),
+        "install_date": _export_date_text(v.install_date),
+        "vehicle_type": _norm(v.vehicle_type),
+        "vehicle_spec": type_spec or _norm(v.vehicle_grade),
+        "manufacturer": _norm(v.manufacturer),
+        "brand": _norm(v.brand),
+        "model": _norm(v.model),
+        "vehicle_category": _export_vehicle_category_label(v.vehicle_category),
+        "status": (_norm(v.status) or "正常").split(",")[0],
+        "scrap_date": _export_date_text(v.scrap_date),
+        "remark": _norm(v.remark),
+        "last_online_at": last_online,
+        "updated_at": updated,
+        "device_no": _bare_device_no(raw_dev) if raw_dev else "",
+        "terminal_type": _norm(device.terminal_type) if device else "",
+        "sim_no": _norm(device.sim_no) if device else "",
+        "device_sn": _norm(device.device_sn) if device else "",
+        "product_model": _norm(device.product_model) if device else "",
+        "channels": _format_export_channels(device, v.channel_count),
+        "channel_count": str(int(v.channel_count)) if v.channel_count else "",
+        "driving_license_no": _norm(v.driving_license_no),
+        "inspect_date": _export_date_text(v.inspect_date),
+        "vehicle_length": _export_num(v.vehicle_length),
+        "vehicle_width": _export_num(v.vehicle_width),
+        "vehicle_height": _export_num(v.vehicle_height),
+        "loaded_weight": _export_num(v.loaded_weight),
+        "vehicle_payload": _export_num(v.vehicle_payload),
+        "curb_weight": _export_num(v.curb_weight),
+        "engine_displacement": _norm(v.engine_displacement),
+        "fuel_tank_capacity": _norm(v.fuel_tank_capacity) or _export_num(v.fuel_tank),
+        "battery_capacity": _norm(v.battery_capacity),
+        "range_mileage": _norm(v.range_mileage),
+        "vehicle_usage": _norm(v.vehicle_usage),
+        "route": _norm(v.route),
+        "owner_name": _norm(v.owner_name),
+        "contact_name": _norm(v.contact_name),
+        "contact_phone": _norm(v.contact_phone),
+    }
+
+
+@router.get("/export-columns")
+async def vehicle_export_columns():
+    return {"ok": True, "groups": VEHICLE_EXPORT_GROUPS}
+
+
 @router.get("/export-carinfos")
 async def export_vehicle_carinfos(
     plate_no: str | None = Query(None),
@@ -1704,11 +1989,13 @@ async def export_vehicle_carinfos(
     company_ids: str | None = Query(None),
     scope_org_tree: bool = Query(False),
     ids: str | None = Query(None),
+    columns: str | None = Query(None),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
-    """导出与导入模板相同列的车辆 xlsx，可改完再导入。勾选 ids 优先，否则按当前筛选。"""
+    """导出车辆 xlsx。默认含公司/项目/班组与 1.0 常用字段；columns 为自定义勾选。"""
+    keys = _parse_export_keys(columns)
     q = await _build_vehicle_list_query(
         db,
         plate_no=plate_no,
@@ -1724,12 +2011,21 @@ async def export_vehicle_carinfos(
     q = q.order_by(Vehicle.created_at.desc(), Vehicle.id.desc())
     rows = (await db.execute(q)).scalars().all()
 
-    company_map: dict[int, str] = {}
-    for cid, cname in (await db.execute(select(OrgCompany.id, OrgCompany.name))).all():
-        company_map[int(cid)] = _norm(cname)
+    parent_map, company_map, _gid_to_local, _local_to_gid = await load_org_company_maps(db)
     fleet_map: dict[int, str] = {}
     for fid, fname in (await db.execute(select(Fleet.id, Fleet.name))).all():
         fleet_map[int(fid)] = _norm(fname)
+
+    type_spec_by_name: dict[str, str] = {}
+    type_spec_by_code: dict[str, str] = {}
+    for tname, tcode, spec in (
+        await db.execute(select(VehicleTypeDict.type_name, VehicleTypeDict.type_code, VehicleTypeDict.spec))
+    ).all():
+        spec_text = _norm(spec)
+        if spec_text and _norm(tname):
+            type_spec_by_name[_norm(tname)] = spec_text
+        if spec_text and _norm(tcode):
+            type_spec_by_code[_norm(tcode)] = spec_text
 
     vehicle_ids = [r.id for r in rows]
     main_dev_map: dict[int, VehicleDevice] = {}
@@ -1743,16 +2039,48 @@ async def export_vehicle_carinfos(
             if d.vehicle_id not in main_dev_map:
                 main_dev_map[d.vehicle_id] = d
 
-    data_rows = [
-        _vehicle_carinfos_row(
-            r,
-            company_map.get(int(r.company_id)) if r.company_id else "",
-            fleet_map.get(int(r.fleet_id)) if r.fleet_id else "",
-            main_dev_map.get(r.id),
+    driver_ids = sorted({int(r.driver_id) for r in rows if r.driver_id})
+    driver_map: dict[int, str] = {}
+    if driver_ids:
+        for did, dname in (
+            await db.execute(select(Driver.id, Driver.name).where(Driver.id.in_(driver_ids)))
+        ).all():
+            if _norm(dname):
+                driver_map[int(did)] = _norm(dname)
+
+    headers = [_VEHICLE_EXPORT_FIELD_MAP[k]["label"] for k in keys]
+    data_rows: list[list] = []
+    for idx, r in enumerate(rows, start=1):
+        org_company, org_project, org_team = _org_company_project_team(
+            r.company_id, company_map, parent_map
         )
-        for r in rows
-    ]
-    wb = _vehicle_carinfos_workbook(data_rows)
+        display_company, display_fleet = _vehicle_list_company_fleet_names(
+            r.company_id, r.fleet_id, company_map, parent_map, fleet_map
+        )
+        type_spec = (
+            type_spec_by_name.get(_norm(r.vehicle_type), "")
+            or type_spec_by_code.get(_norm(r.vehicle_type_code), "")
+        )
+        values = _vehicle_export_value_map(
+            idx,
+            r,
+            org_company=org_company,
+            org_project=org_project,
+            org_team=org_team,
+            company_name=_norm(display_company),
+            fleet_name=_norm(display_fleet),
+            driver_name=_norm(r.driver_name) or (driver_map.get(int(r.driver_id)) if r.driver_id else ""),
+            device=main_dev_map.get(r.id),
+            type_spec=type_spec,
+        )
+        data_rows.append([values.get(k, "") for k in keys])
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "车辆信息"
+    ws.append(headers)
+    for row in data_rows:
+        ws.append(row)
     stamp = china_now_naive().strftime("%Y%m%d_%H%M%S")
     return _stream_xlsx(wb, f"车辆信息_{stamp}.xlsx")
 

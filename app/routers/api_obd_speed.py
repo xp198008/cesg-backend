@@ -21,6 +21,7 @@ from app.jt808_violation_sync import TABLE_NAME, jt808_violation_sync_status
 from app.obd_speed_monitor import backfill_obd_speed_violation_limits, obd_speed_scheduler, ping_redis
 from app.park_alarm_scheduler import park_alarm_scheduler
 from app.vehicle_jt808_sync import queue_snapshot, vehicle_jt808_sync_scheduler
+from app.org_jt808_sync import org_jt808_sync_scheduler
 
 router = APIRouter(tags=["obd-speed-check"])
 
@@ -66,6 +67,7 @@ async def obd_speed_check_status():
         "obd_fuel_sync": fuel_sync_info,
         "park_alarm_scheduler": park_alarm_scheduler.status(),
         "vehicle_jt808_sync": vehicle_sync_info,
+        "org_jt808_sync": org_jt808_sync_scheduler.status(),
     }
 
 

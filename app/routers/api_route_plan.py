@@ -246,7 +246,7 @@ async def route_plan_history_list(
     plate_no: str | None = None,
     terminal_id: str | None = None,
     send_status: str | None = None,
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=100000),
     page_size: int = Query(50, ge=1, le=500),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
     db: AsyncSession = Depends(get_db),
@@ -352,7 +352,7 @@ async def route_plan_preset_create(
 
 @router.get("/preset/list")
 async def route_plan_preset_list(
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=100000),
     page_size: int = Query(100, ge=1, le=500),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
     x_user_id: str | None = Header(None, alias="X-User-Id"),

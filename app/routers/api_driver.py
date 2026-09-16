@@ -6,13 +6,14 @@ from app.timeutil import china_now_naive
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import Driver, Fleet, OrgCompany, Vehicle, VehicleDevice
+from app.user_audit import format_create_content, format_update_content, write_biz_operation_log
 
 _PHONE_RE = re.compile(r"^1\d{10}$")
 _ID_LIKE_RE = re.compile(r"^(?:\d{15}|\d{17}[\dXx])$")
@@ -411,8 +412,25 @@ async def driver_get(did: int, db: AsyncSession = Depends(get_db)):
     return {"ok": True, "data": _row_out(d, cn)}
 
 
+def _driver_log_fields(row: Driver, company_name: str | None) -> dict[str, str]:
+    return {
+        "所属公司": (company_name or "").strip() or "空",
+        "性别": (row.gender or "").strip() or "空",
+        "手机": (row.phone or "").strip() or "空",
+        "驾驶证号": (row.driver_license_no or "").strip() or "空",
+        "准驾车型": (row.driver_type or "").strip() or "空",
+        "重点关注": "是" if row.is_key_focus else "否",
+        "头像": (row.avatar_url or "").strip() or "空",
+    }
+
+
 @router.post("")
-async def driver_create(body: DriverCreateIn, db: AsyncSession = Depends(get_db)):
+async def driver_create(
+    body: DriverCreateIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
     company_id = _require_company_id(body.company_id)
     await _ensure_company(db, company_id)
     bd = _parse_date(body.birth_date)
@@ -438,17 +456,34 @@ async def driver_create(body: DriverCreateIn, db: AsyncSession = Depends(get_db)
     )
     db.add(row)
     await db.flush()
+    cn = await db.scalar(select(OrgCompany.name).where(OrgCompany.id == row.company_id).limit(1))
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="新增",
+        menu="司机信息",
+        content=format_create_content(f"新增司机：{row.name}", _driver_log_fields(row, cn)),
+    )
     await db.commit()
     await db.refresh(row)
-    cn = await db.scalar(select(OrgCompany.name).where(OrgCompany.id == row.company_id).limit(1))
     return {"ok": True, "data": _row_out(row, cn)}
 
 
 @router.put("/{did}")
-async def driver_update(did: int, body: DriverUpdateIn, db: AsyncSession = Depends(get_db)):
+async def driver_update(
+    did: int,
+    body: DriverUpdateIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
     row = (await db.execute(select(Driver).where(Driver.id == did))).scalar_one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="司机不存在")
+    old_name = row.name
+    old_cn = await db.scalar(select(OrgCompany.name).where(OrgCompany.id == row.company_id).limit(1)) if row.company_id else None
+    old_fields = {"姓名": old_name or "空", **_driver_log_fields(row, old_cn)}
     patch = body.model_dump(exclude_unset=True)
     next_company_id = patch["company_id"] if "company_id" in patch else row.company_id
     company_id = _require_company_id(next_company_id)
@@ -504,17 +539,42 @@ async def driver_update(did: int, body: DriverUpdateIn, db: AsyncSession = Depen
         row.avatar_url = v.strip() if isinstance(v, str) and v.strip() else None
     if "is_key_focus" in patch and patch["is_key_focus"] is not None:
         row.is_key_focus = bool(int(patch["is_key_focus"]))
+    cn = await db.scalar(select(OrgCompany.name).where(OrgCompany.id == row.company_id).limit(1))
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="修改",
+        menu="司机信息",
+        content=format_update_content(
+            f"修改司机：{row.name or old_name}",
+            old_fields,
+            {"姓名": row.name or "空", **_driver_log_fields(row, cn)},
+        ),
+    )
     await db.commit()
     await db.refresh(row)
-    cn = await db.scalar(select(OrgCompany.name).where(OrgCompany.id == row.company_id).limit(1))
     return {"ok": True, "data": _row_out(row, cn)}
 
 
 @router.delete("/{did}")
-async def driver_delete(did: int, db: AsyncSession = Depends(get_db)):
-    r = await db.execute(select(Driver.id).where(Driver.id == did).limit(1))
-    if r.scalar_one_or_none() is None:
+async def driver_delete(
+    did: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
+    row = (await db.execute(select(Driver).where(Driver.id == did).limit(1))).scalar_one_or_none()
+    if row is None:
         raise HTTPException(status_code=404, detail="司机不存在")
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="删除",
+        menu="司机信息",
+        content=f"删除司机：{row.name or '--'}",
+    )
     await db.execute(delete(Driver).where(Driver.id == did))
     await db.commit()
     return {"ok": True}

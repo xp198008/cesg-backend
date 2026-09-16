@@ -181,9 +181,20 @@ async def build_home_stats(db: AsyncSession, x_org_id: str | None) -> dict:
 # ---------------------------------------------------------------------------
 
 _FAULT_LEVEL_MAP = {"高": "一级故障", "中": "二级故障", "低": "三级故障"}
-# 看板「已处理」只计正式办结；误报不展示、不参与分类与今日汇总
-_HANDLED_VIOLATION_STATUSES = ("已处理",)
+# 看板「已处理」：已办结、罚单待处理，以及已提交罚单/警告（待审核 ticket）。
+# 仅「确认处理」进审核队列（preprocess）仍算未处理；误报不展示、不参与分类与今日汇总。
+_HANDLED_VIOLATION_STATUSES = ("已处理", "罚单待处理")
 _FALSE_ALARM_STATUS = "误报"
+
+
+def _board_handled_clause():
+    return or_(
+        VehicleViolation.status.in_(_HANDLED_VIOLATION_STATUSES),
+        and_(
+            VehicleViolation.status == "待审核",
+            VehicleViolation.pre_audit_kind.in_(("ticket", "ticket_appeal")),
+        ),
+    )
 
 
 def _fmt_dt(value, fmt: str = "%H:%M:%S") -> str:
@@ -236,7 +247,7 @@ async def _board_warnings(db: AsyncSession, scope, now: datetime, filter_rules) 
         (await db.scalar(scoped(
             select(func.count()).select_from(VehicleViolation).where(
                 VehicleViolation.violation_time >= day_start,
-                VehicleViolation.status.in_(_HANDLED_VIOLATION_STATUSES),
+                _board_handled_clause(),
             )
         ))) or 0
     )
@@ -261,7 +272,7 @@ async def _board_warnings(db: AsyncSession, scope, now: datetime, filter_rules) 
                     VehicleViolation.violation_type_name,
                     func.count().label("cnt"),
                     func.sum(
-                        case((VehicleViolation.status.in_(_HANDLED_VIOLATION_STATUSES), 1), else_=0)
+                        case((_board_handled_clause(), 1), else_=0)
                     ).label("handled"),
                 )
                 .where(VehicleViolation.violation_time >= type_since)

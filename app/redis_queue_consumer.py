@@ -383,6 +383,23 @@ async def _handle_obd(db: AsyncSession, data: dict, raw_text: str, energy_type: 
     await db.execute(stmt)
     await db.flush()
 
+    zlc = _to_float(_pick(data, ("zlc", "A01", "total_mileage", "totalMileage", "odometer")))
+    if device_no is not None and zlc is not None:
+        try:
+            from app.obd_mileage_daily import upsert_obd_mileage_tick
+
+            await upsert_obd_mileage_tick(
+                db,
+                device_no=str(device_no),
+                zlc=zlc,
+                report_time=report_time,
+                lat=_to_float(_pick(data, ("lat", "latitude"))),
+                lng=_to_float(_pick(data, ("lng", "longitude"))),
+                plate_no=str(_pick(data, _PLATE_KEYS) or "") or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("OBD 日里程写入跳过: %s", exc)
+
     # 燃油报表事实表：仅油车且算出耗油量时写入（一车一日）
     if energy_type == "oil" and device_no is not None and fuel is not None:
         vehicle_id, plate_from_vehicle, company_id = await _resolve_vehicle(db, str(device_no))

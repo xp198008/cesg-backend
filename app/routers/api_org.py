@@ -8,7 +8,7 @@ from app.timeutil import china_now_naive
 from io import BytesIO
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook, load_workbook
 from pydantic import BaseModel, Field
@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import jt808_group
+from app.org_jt808_sync import org_jt808_sync_scheduler
 from app.database import get_db
 from app.models import (
     Driver,
@@ -34,6 +35,7 @@ from app.org_scope import (
     wants_org_tree_scope,
 )
 from app.risk_profile_service import load_org_company_maps, resolve_selected_to_local_org_ids
+from app.user_audit import format_create_content, format_update_content, write_biz_operation_log
 
 router = APIRouter(prefix="/api/org", tags=["org"])
 logger = logging.getLogger(__name__)
@@ -251,7 +253,8 @@ async def import_company_excel(file: UploadFile = File(...), db: AsyncSession = 
     rows = _dedupe_and_validate_import_rows(rows)
     await _clear_org_before_import(db)
     imported = await _import_rows_in_levels(db, rows)
-    return {"ok": True, "imported": imported}
+    org_jt808_sync_scheduler.kick()
+    return {"ok": True, "imported": imported, "jt808_sync": "queued"}
 
 
 async def _load_all_map(db: AsyncSession) -> dict[int, OrgCompany]:
@@ -821,8 +824,9 @@ async def _resolve_jt_fid(db: AsyncSession, parent_id: int | None) -> tuple[int 
 @router.post("/companies")
 async def company_create(
     body: OrgCompanyCreate,
-    background_tasks: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     await _validate_single_head_company(db, body.parent_id, None)
     await _validate_parent(db, body.parent_id, None)
@@ -836,30 +840,56 @@ async def company_create(
     db.add(row)
     await db.flush()
     row.org_code = _gen_org_code(row.id)
-    fid, jt_warn = await _resolve_jt_fid(db, body.parent_id)
-    cid, cname, ccode = row.id, row.name, row.org_code
+    _fid, jt_warn = await _resolve_jt_fid(db, body.parent_id)
+    cid, ccode = row.id, row.org_code
+    parent_name = None
+    if body.parent_id:
+        parent_name = await db.scalar(select(OrgCompany.name).where(OrgCompany.id == body.parent_id).limit(1))
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="新增",
+        menu="组织架构",
+        content=format_create_content(
+            f"新增组织架构：{row.name}",
+            {
+                "上级架构": parent_name or "空",
+                "联系电话": (body.contact_phone or "").strip() or "空",
+                "地址": (body.address or "").strip() or "空",
+            },
+        ),
+    )
     await db.commit()
 
-    queued = False
-    if fid is not None:
-        background_tasks.add_task(jt808_group.bg_create, cid, cname, fid)
-        queued = True
+    org_jt808_sync_scheduler.kick()
     return {"id": cid, "org_code": ccode,
-            "jt808_sync": ("queued" if queued else "skipped"), "jt808_warn": jt_warn}
+            "jt808_sync": "queued", "jt808_warn": jt_warn}
 
 
 @router.put("/companies/{company_id}")
 async def company_update(
     company_id: int,
     body: OrgCompanyUpdate,
-    background_tasks: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     row = (await db.execute(select(OrgCompany).where(OrgCompany.id == company_id))).scalar_one_or_none()
     if not row:
         raise HTTPException(404, "组织不存在")
     patch = body.model_dump(exclude_unset=True)
     old_name = row.name
+    old_parent_name = None
+    if row.parent_id:
+        old_parent_name = await db.scalar(select(OrgCompany.name).where(OrgCompany.id == row.parent_id).limit(1))
+    old_fields = {
+        "名称": old_name or "空",
+        "上级架构": old_parent_name or "空",
+        "联系电话": (row.contact_phone or "").strip() or "空",
+        "地址": (row.address or "").strip() or "空",
+        "法人": (row.legal_person or "").strip() or "空",
+    }
     name_changed = False
     parent_changed = False
     if "parent_id" in patch:
@@ -879,16 +909,29 @@ async def company_update(
         row.address = (patch["address"] or "").strip() or None
     row.updated_at = china_now_naive()
 
-    do_edit = bool(row.jt808_group_id and (name_changed or parent_changed))
-    new_fid = None
-    if do_edit:
-        new_fid, _ = await _resolve_jt_fid(db, row.parent_id)
-    gid, new_name = row.jt808_group_id, row.name
+    new_parent_name = None
+    if row.parent_id:
+        new_parent_name = await db.scalar(select(OrgCompany.name).where(OrgCompany.id == row.parent_id).limit(1))
+    new_fields = {
+        "名称": row.name or "空",
+        "上级架构": new_parent_name or "空",
+        "联系电话": (row.contact_phone or "").strip() or "空",
+        "地址": (row.address or "").strip() or "空",
+        "法人": (row.legal_person or "").strip() or "空",
+    }
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="修改",
+        menu="组织架构",
+        content=format_update_content(f"修改组织架构：{row.name or old_name}", old_fields, new_fields),
+    )
     await db.commit()
-
-    if do_edit:
-        background_tasks.add_task(jt808_group.bg_edit, gid, new_name, new_fid)
-    return {"ok": True, "jt808_sync": ("queued" if do_edit else None)}
+    if name_changed or parent_changed or not row.jt808_group_id:
+        org_jt808_sync_scheduler.kick()
+        return {"ok": True, "jt808_sync": "queued"}
+    return {"ok": True, "jt808_sync": None}
 
 
 def _org_delete_order(root_id: int, by_parent: dict[int | None, list[int]]) -> list[int]:
@@ -908,11 +951,14 @@ def _org_delete_order(root_id: int, by_parent: dict[int | None, list[int]]) -> l
 async def company_delete(
     company_id: int,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     row = (await db.execute(select(OrgCompany).where(OrgCompany.id == company_id))).scalar_one_or_none()
     if not row:
         raise HTTPException(404, "组织不存在")
+    deleted_name = row.name
 
     tree_ids = await _descendant_ids(db, company_id)
     vv = await db.scalar(select(func.count()).select_from(Vehicle).where(Vehicle.company_id.in_(tree_ids)))
@@ -949,6 +995,14 @@ async def company_delete(
         await db.rollback()
         raise HTTPException(400, "该组织仍被其他数据引用，无法删除") from exc
 
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="删除",
+        menu="组织架构",
+        content=f"删除组织架构：{deleted_name or '--'}",
+    )
     gids = [gid_map[oid] for oid in delete_ids if oid in gid_map]
     for gid in gids:
         background_tasks.add_task(jt808_group.bg_delete, gid)

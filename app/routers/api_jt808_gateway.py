@@ -117,18 +117,22 @@ def _forward_headers(request: Request) -> dict[str, str]:
 @router.api_route("/internal/jt808-gateway", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 @router.api_route("/internal/jt808-gateway/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def jt808_gateway(request: Request, path: str = ""):
+    if request.method == "OPTIONS":
+        return Response(status_code=204)
+    if request.method != "POST":
+        return JSONResponse(status_code=405, content={"code": -1, "message": "接口参数不合法"})
+
     raw = await request.body()
     parsed: Any = None
     if raw:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            parsed = None
-        if parsed is not None:
-            if _has_operator_keys(parsed):
-                return _reject()
-            if isinstance(parsed, dict) and "apicode" in parsed and not _apicode_ok(parsed.get("apicode")):
-                return _reject()
+            return _reject()
+    if not isinstance(parsed, dict) or _has_operator_keys(parsed):
+        return _reject()
+    if "apicode" not in parsed or not _apicode_ok(parsed.get("apicode")):
+        return _reject()
 
     url = _upstream_url(path)
     timeout = httpx.Timeout(60.0, connect=8.0)

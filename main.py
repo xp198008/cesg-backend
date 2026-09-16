@@ -26,7 +26,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from app.session_auth import SessionAuthMiddleware
-from app.security import cors_origin_list, sanitize_validation_errors
+from app.security import cors_origin_list, reject_oversized_paging, sanitize_validation_errors
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -45,6 +45,7 @@ from app.shared_scheduler_flag import obd_speed_flag
 from app.park_alarm_scheduler import park_alarm_scheduler
 from app.redis_queue_consumer import redis_queue_scheduler
 from app.vehicle_jt808_sync import vehicle_jt808_sync_scheduler
+from app.org_jt808_sync import org_jt808_sync_scheduler
 from app.violation_ai_assessment_scheduler import violation_ai_assessment_scheduler
 from app.routers import (
     api_ai,
@@ -60,6 +61,7 @@ from app.routers import (
     api_map_rules,
     api_media,
     api_obd_fuel,
+    api_obd_mileage,
     api_obd_speed,
     api_obd_anomaly,
     api_park_alarm_report,
@@ -96,6 +98,7 @@ app = FastAPI(
     docs_url="/docs" if _enable_docs else None,
     redoc_url="/redoc" if _enable_docs else None,
     openapi_url="/openapi.json" if _enable_docs else None,
+    redirect_slashes=False,
 )
 
 # 先加会话校验（内侧），再加 CORS（外侧），这样 401 也能带跨域头；OPTIONS 由 CORS 直接放行。
@@ -111,6 +114,9 @@ app.add_middleware(
 
 @app.middleware("http")
 async def _no_store_api(request: Request, call_next):
+    oversized = reject_oversized_paging(request)
+    if oversized is not None:
+        return oversized
     response = await call_next(request)
     path = request.url.path or ""
     if path.startswith("/api") or path.startswith("/internal") or path.startswith("/cmapi"):
@@ -190,6 +196,7 @@ app.include_router(api_map_rules.router)
 app.include_router(api_map_grasp.router)
 app.include_router(api_sms.router)
 app.include_router(api_obd_fuel.router)
+app.include_router(api_obd_mileage.router)
 app.include_router(api_obd_speed.router)
 app.include_router(api_obd_anomaly.router)
 app.include_router(api_park_alarm_report.router)
@@ -382,6 +389,21 @@ async def _background_startup_backfill() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("启动回填 OBD 时速异常误报失败: %s", exc)
 
+    try:
+        from datetime import datetime, timedelta
+
+        from app.obd_mileage_daily import backfill_obd_mileage_range
+        from app.timeutil import china_now_naive
+
+        now = china_now_naive()
+        start = (now - timedelta(days=14)).strftime("%Y%m%d")
+        end = now.strftime("%Y%m%d")
+        async with AsyncSessionLocal() as s:
+            result = await backfill_obd_mileage_range(s, start, end)
+        logger.info("启动回填 OBD 日里程 %s~%s wrote=%s", start, end, (result or {}).get("wrote"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("启动回填 OBD 日里程失败: %s", exc)
+
 
 @app.on_event("startup")
 async def _startup() -> None:
@@ -480,6 +502,10 @@ async def _startup() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("车辆 808 同步调度未启用: %s", exc)
     try:
+        org_jt808_sync_scheduler.start()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("组织 808 同步调度未启用: %s", exc)
+    try:
         from app.ai_assess_control import get_desired
 
         want = get_desired(default=settings.violation_ai_assess_auto_enabled)
@@ -533,6 +559,10 @@ async def _shutdown() -> None:
         pass
     try:
         await vehicle_jt808_sync_scheduler.stop()
+    except Exception:
+        pass
+    try:
+        await org_jt808_sync_scheduler.stop()
     except Exception:
         pass
     try:

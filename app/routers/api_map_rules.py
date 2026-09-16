@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_db
 from app.models import (
@@ -249,7 +250,7 @@ def _rule_out(row: PublicMapRule) -> dict:
 @router.get("/public-map-rules")
 async def public_map_rules_list(
     limit: int = Query(500, ge=1, le=2000),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=2000000),
     is_public: int | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
@@ -304,6 +305,7 @@ async def public_map_rule_update(
         row.rule_name = body.rule_name.strip()
     if "geometry_json" in data:
         row.geometry_json = body.geometry_json
+        flag_modified(row, "geometry_json")
     if "remark" in data:
         row.remark = (body.remark or "").strip() or None
     await db.flush()
@@ -500,7 +502,7 @@ async def _resolve_creator_name(db: AsyncSession, user_id: int | None) -> str | 
 @router.get("/private-map-rules")
 async def private_map_rules_list(
     limit: int = Query(500, ge=1, le=2000),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=2000000),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
     db: AsyncSession = Depends(get_db),
 ):
@@ -825,7 +827,7 @@ async def map_rule_category_weather_rule_options(
 @router.get("/map-rule-categories")
 async def map_rule_categories_list(
     limit: int = Query(500, ge=1, le=2000),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=2000000),
     type_name: str | None = Query(None),
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
     db: AsyncSession = Depends(get_db),

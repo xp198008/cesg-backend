@@ -127,6 +127,11 @@ class Settings(BaseSettings):
     vehicle_jt808_sync_interval_seconds: int = 10
     vehicle_jt808_sync_batch_size: int = 20
 
+    # ---- 组织架构 → 808：对照 tgps_group 名称/上级，缺的建、漂的改 ----
+    org_jt808_sync_enabled: bool = True
+    org_jt808_sync_interval_seconds: int = 60
+    org_jt808_sync_batch_size: int = 50
+
     # ---- 通天星 CMS（queryUserVehicle：同步车牌 / 设备号）----
     tongtianxing_base_url: str = ""
     tongtianxing_username: str = ""

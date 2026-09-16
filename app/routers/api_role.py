@@ -5,7 +5,7 @@ import json
 import secrets
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +15,7 @@ from app.database import get_db
 from app.models import OrgCompany, SysRole, SysUser
 from app.permission_names import permission_ids_to_piped_titles, remark_text_for_stored_role
 from app.risk_profile_service import load_org_company_maps, resolve_selected_to_local_org_ids
+from app.user_audit import format_create_content, format_update_content, write_biz_operation_log
 
 
 def _api_role_no_cache(response: Response) -> None:
@@ -202,7 +203,12 @@ async def role_detail(role_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/create")
-async def role_create(payload: RoleCreatePayload, db: AsyncSession = Depends(get_db)):
+async def role_create(
+    payload: RoleCreatePayload,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
     _validate_payload_org(payload.is_global, payload.org_id)
     name = (payload.name or "").strip()
     if not name:
@@ -228,6 +234,20 @@ async def role_create(payload: RoleCreatePayload, db: AsyncSession = Depends(get
     db.add(role)
     await db.flush()
     await db.refresh(role)
+    org_name = "全局共享" if role.is_global else None
+    if role.org_id:
+        org_name = await db.scalar(select(OrgCompany.name).where(OrgCompany.id == role.org_id).limit(1))
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="新增",
+        menu="角色管理",
+        content=format_create_content(
+            f"新增角色：{role.name}",
+            {"所属公司": org_name or "空", "权限摘要": (role.remark or "").strip() or "空"},
+        ),
+    )
     return {
         "ok": True,
         "message": "创建成功",
@@ -241,13 +261,27 @@ async def role_create(payload: RoleCreatePayload, db: AsyncSession = Depends(get
 
 
 @router.post("/update")
-async def role_update(payload: RoleUpdatePayload, db: AsyncSession = Depends(get_db)):
+async def role_update(
+    payload: RoleUpdatePayload,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
     _validate_payload_org(payload.is_global, payload.org_id)
     role = await db.scalar(select(SysRole).where(SysRole.id == payload.role_id).limit(1))
     if role is None:
         raise HTTPException(status_code=404, detail="角色不存在")
     if (role.code or "").strip().lower() == "admin":
         raise HTTPException(status_code=400, detail="内置系统管理员不可编辑")
+    old_name = role.name
+    old_org_name = "全局共享" if role.is_global else None
+    if role.org_id:
+        old_org_name = await db.scalar(select(OrgCompany.name).where(OrgCompany.id == role.org_id).limit(1))
+    old_fields = {
+        "名称": old_name or "空",
+        "所属公司": old_org_name or "空",
+        "权限摘要": (role.remark or "").strip() or "空",
+    }
     name = (payload.name or "").strip()
     dup = await db.scalar(
         select(SysRole.id).where(SysRole.name == name, SysRole.id != payload.role_id).limit(1)
@@ -267,6 +301,25 @@ async def role_update(payload: RoleUpdatePayload, db: AsyncSession = Depends(get
     role.permissions = perms
     await db.flush()
     await db.refresh(role)
+    new_org_name = "全局共享" if role.is_global else None
+    if role.org_id:
+        new_org_name = await db.scalar(select(OrgCompany.name).where(OrgCompany.id == role.org_id).limit(1))
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="修改",
+        menu="角色管理",
+        content=format_update_content(
+            f"修改角色：{role.name or old_name}",
+            old_fields,
+            {
+                "名称": role.name or "空",
+                "所属公司": new_org_name or "空",
+                "权限摘要": (role.remark or "").strip() or "空",
+            },
+        ),
+    )
     return {
         "ok": True,
         "message": "更新成功",
@@ -278,7 +331,13 @@ async def role_update(payload: RoleUpdatePayload, db: AsyncSession = Depends(get
     }
 
 
-async def _delete_sys_role_core(db: AsyncSession, role_id: int) -> dict:
+async def _delete_sys_role_core(
+    db: AsyncSession,
+    role_id: int,
+    *,
+    request: Request | None = None,
+    x_user_id: str | None = None,
+) -> dict:
     role = await db.scalar(select(SysRole).where(SysRole.id == role_id).limit(1))
     if role is None:
         raise HTTPException(status_code=404, detail="角色不存在")
@@ -289,23 +348,47 @@ async def _delete_sys_role_core(db: AsyncSession, role_id: int) -> dict:
     ) or 0
     if n_users > 0:
         raise HTTPException(status_code=400, detail=f"仍有 {n_users} 个用户关联该角色，请先调整用户角色后再删")
+    role_name = role.name
     res = await db.execute(delete(SysRole).where(SysRole.id == role_id))
     if int(getattr(res, "rowcount", 0) or 0) == 0:
         raise HTTPException(status_code=404, detail="角色不存在或已删除")
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="删除",
+        menu="角色管理",
+        content=f"删除角色：{role_name or '--'}",
+    )
     await db.flush()
     return {"ok": True, "message": "删除成功", "id": role_id}
 
 
 @router.post("/delete")
-async def role_delete_by_json(payload: RoleDeleteBody, db: AsyncSession = Depends(get_db)):
-    return await _delete_sys_role_core(db, payload.role_id)
+async def role_delete_by_json(
+    payload: RoleDeleteBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
+    return await _delete_sys_role_core(db, payload.role_id, request=request, x_user_id=x_user_id)
 
 
 @router.delete("/{role_id}")
-async def role_delete(role_id: int, db: AsyncSession = Depends(get_db)):
-    return await _delete_sys_role_core(db, role_id)
+async def role_delete(
+    role_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
+    return await _delete_sys_role_core(db, role_id, request=request, x_user_id=x_user_id)
 
 
 @router.post("/{role_id}/delete")
-async def role_delete_post(role_id: int, db: AsyncSession = Depends(get_db)):
-    return await _delete_sys_role_core(db, role_id)
+async def role_delete_post(
+    role_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
+    return await _delete_sys_role_core(db, role_id, request=request, x_user_id=x_user_id)

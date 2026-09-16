@@ -7,13 +7,14 @@ from app.timeutil import china_now_naive
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal, get_db
 from app.models import Vehicle, VehicleTypeDict
+from app.user_audit import format_create_content, format_update_content, write_biz_operation_log
 
 router = APIRouter(prefix="/api/vehicle-type", tags=["vehicle-type"])
 
@@ -251,7 +252,7 @@ async def ensure_default_vehicle_types() -> None:
 @router.get("/list")
 async def vehicle_type_list(
     type_name: str | None = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=100000),
     page_size: int = Query(20, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):
@@ -298,7 +299,12 @@ async def vehicle_type_get(tid: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("")
-async def vehicle_type_create(body: VehicleTypeCreateIn, db: AsyncSession = Depends(get_db)):
+async def vehicle_type_create(
+    body: VehicleTypeCreateIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
     type_name = _normalize_required_text(body.type_name, "车型名称")
     spec = _normalize_required_text(body.spec, "车型规格")
     icon_url = _normalize_required_text(body.icon_url, "车型图标")
@@ -315,6 +321,17 @@ async def vehicle_type_create(body: VehicleTypeCreateIn, db: AsyncSession = Depe
     db.add(row)
     await db.flush()
     await db.refresh(row)
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="新增",
+        menu="车辆类型维护",
+        content=format_create_content(
+            f"新增车辆类型：{row.type_name}",
+            {"车辆规格": row.spec or "空", "车型图标": row.icon_url or "空"},
+        ),
+    )
     return {"ok": True, "data": _row_out(row)}
 
 
@@ -343,10 +360,22 @@ async def vehicle_type_icon_upload(file: UploadFile = File(...)):
 
 
 @router.patch("/{tid}")
-async def vehicle_type_update(tid: int, body: VehicleTypeUpdateIn, db: AsyncSession = Depends(get_db)):
+async def vehicle_type_update(
+    tid: int,
+    body: VehicleTypeUpdateIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
     row = await db.scalar(select(VehicleTypeDict).where(VehicleTypeDict.id == tid).limit(1))
     if row is None:
         raise HTTPException(status_code=404, detail="记录不存在")
+    old_name = row.type_name
+    old_fields = {
+        "车辆类型": row.type_name or "空",
+        "车辆规格": row.spec or "空",
+        "车型图标": row.icon_url or "空",
+    }
     if body.type_name is not None:
         type_name = _normalize_required_text(body.type_name, "车型名称")
         await _ensure_unique_type_name(db, type_name, exclude_id=tid)
@@ -359,14 +388,43 @@ async def vehicle_type_update(tid: int, body: VehicleTypeUpdateIn, db: AsyncSess
         row.icon_url = _normalize_required_text(body.icon_url, "车型图标")
     await db.flush()
     await db.refresh(row)
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="修改",
+        menu="车辆类型维护",
+        content=format_update_content(
+            f"修改车辆类型：{row.type_name or old_name}",
+            old_fields,
+            {
+                "车辆类型": row.type_name or "空",
+                "车辆规格": row.spec or "空",
+                "车型图标": row.icon_url or "空",
+            },
+        ),
+    )
     return {"ok": True, "data": _row_out(row)}
 
 
 @router.delete("/{tid}")
-async def vehicle_type_delete(tid: int, db: AsyncSession = Depends(get_db)):
+async def vehicle_type_delete(
+    tid: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
     row = await db.scalar(select(VehicleTypeDict).where(VehicleTypeDict.id == tid).limit(1))
     if row is None:
         raise HTTPException(status_code=404, detail="记录不存在")
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="删除",
+        menu="车辆类型维护",
+        content=f"删除车辆类型：{row.type_name or '--'}",
+    )
     await db.delete(row)
     await db.flush()
     return {"ok": True}

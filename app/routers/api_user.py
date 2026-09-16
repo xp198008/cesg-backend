@@ -26,7 +26,16 @@ from app.jt808_openapi_credentials import invalidate_openapi_token_if_service_us
 from app.database import get_db
 from app.models import OrgCompany, SysRole, SysUser, UserLoginLog, UserOnlineDaily, UserOperationLog
 from app.permission_names import permission_ids_to_piped_titles
-from app.user_audit import append_operation_log, client_ip, duration_between, duration_seconds_between, format_duration_seconds
+from app.user_audit import (
+    append_operation_log,
+    client_ip,
+    duration_between,
+    duration_seconds_between,
+    format_create_content,
+    format_duration_seconds,
+    format_update_content,
+    write_biz_operation_log,
+)
 from app.user_online_daily import (
     close_open_sessions_for_user,
     record_login_daily,
@@ -48,6 +57,20 @@ router = APIRouter(prefix="/api/user", tags=["user"])
 
 def _client_login_ip(request: Request) -> str:
     return client_ip(request)
+
+
+def _user_log_fields(user: SysUser, org: OrgCompany | None, role: SysRole | None) -> dict[str, str]:
+    return {
+        "所属公司": (org.name if org else "") or "空",
+        "角色": (role.name if role else "") or "空",
+        "手机": (user.phone or "").strip() or "空",
+        "身份证": (user.identity or "").strip() or "空",
+        "状态": "启用" if user.is_active else "停用",
+        "有效期": _fmt_date(user.valid_until) or "空",
+        "单点登录": "是" if user.single_login else "否",
+        "外协用户": "是" if getattr(user, "is_outsource", False) else "否",
+        "允许改密": "是" if user.allow_pwd_edit else "否",
+    }
 
 
 def _parse_query_datetime(value: str | None, *, end_of_day: bool = False) -> datetime | None:
@@ -322,7 +345,9 @@ async def user_list(
 async def user_create(
     payload: UserCreatePayload,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     username = (payload.username or "").strip()
     if not username:
@@ -371,6 +396,14 @@ async def user_create(
         raise HTTPException(status_code=500, detail=f"新增用户失败: {e}")
 
     uid = user.id
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="新增",
+        menu="用户信息",
+        content=format_create_content(f"新增用户：账号 {username}", _user_log_fields(user, org, role)),
+    )
     await db.commit()
     background_tasks.add_task(jt808_user.bg_create, uid)
     return {
@@ -400,7 +433,9 @@ async def user_create(
 async def user_update(
     payload: UserUpdatePayload,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     username = (payload.username or "").strip()
     if not username:
@@ -409,6 +444,9 @@ async def user_update(
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
     old_username = (user.username or "").strip()
+    old_org = await db.scalar(select(OrgCompany).where(OrgCompany.id == user.org_id).limit(1)) if user.org_id else None
+    old_role = await db.scalar(select(SysRole).where(SysRole.id == user.role_id).limit(1)) if user.role_id else None
+    old_fields = {"账号": old_username or "空", **_user_log_fields(user, old_org, old_role)}
     exists = await db.scalar(
         select(SysUser.id).where(SysUser.username == username, SysUser.id != payload.user_id).limit(1)
     )
@@ -443,6 +481,15 @@ async def user_update(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"更新用户失败: {e}")
 
+    new_fields = {"账号": username or "空", **_user_log_fields(user, org, role)}
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="修改",
+        menu="用户信息",
+        content=format_update_content(f"修改用户：账号 {username or old_username or '--'}", old_fields, new_fields),
+    )
     await db.commit()
     background_tasks.add_task(jt808_user.bg_update, user.id, old_username)
     return {
@@ -492,6 +539,7 @@ def _password_matches(user: SysUser, password: str) -> bool:
 @router.post("/set-password")
 async def user_set_password(
     payload: UserSetPasswordPayload,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
@@ -522,6 +570,14 @@ async def user_set_password(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"修改密码失败: {e}")
 
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="修改",
+        menu="用户信息",
+        content=f"修改用户密码：账号 {(user.username or '').strip() or '--'}",
+    )
     await db.commit()
     invalidate_openapi_token_if_service_user(user.username)
     sync_result = await jt808_user.sync_set_password(user.id, new_pwd)
@@ -542,7 +598,9 @@ async def user_set_password(
 @router.post("/reset-password")
 async def user_reset_password(
     payload: UserResetPasswordPayload,
+    request: Request,
     db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     user = await db.scalar(select(SysUser).where(SysUser.id == payload.user_id).limit(1))
     if user is None:
@@ -552,6 +610,14 @@ async def user_reset_password(
     store_proxy_password(user, new_pwd)
     await db.flush()
     await db.refresh(user)
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="修改",
+        menu="用户信息",
+        content=f"重置用户密码：账号 {(user.username or '').strip() or '--'}",
+    )
     await db.commit()
     invalidate_openapi_token_if_service_user(user.username)
     sync_result = await jt808_user.sync_set_password(user.id, new_pwd)
@@ -1301,7 +1367,9 @@ async def user_refresh_jt808_token(payload: RefreshJt808TokenPayload, db: AsyncS
 async def user_delete(
     user_id: int,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     user = await db.scalar(select(SysUser).where(SysUser.id == user_id).limit(1))
     if user is None:
@@ -1310,6 +1378,14 @@ async def user_delete(
         raise HTTPException(status_code=400, detail="admin 为系统内置账号，不允许删除")
     jt_uid = (getattr(user, "jt808_user_id", None) or "").strip() or None
     uname = (user.username or "").strip()
+    await write_biz_operation_log(
+        db,
+        request=request,
+        x_user_id=x_user_id,
+        action="删除",
+        menu="用户信息",
+        content=f"删除用户：账号 {uname or '--'}",
+    )
     await db.delete(user)
     await db.flush()
     await db.commit()
