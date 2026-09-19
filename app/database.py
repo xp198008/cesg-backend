@@ -191,6 +191,12 @@ async def init_models() -> None:
                 "UPDATE private_map_rule SET priority_level = 5 "
                 "WHERE priority_level IS NULL OR priority_level < 1 OR priority_level > 10"
             )
+            cols = await conn.exec_driver_sql("PRAGMA table_info(public_map_rule)")
+            names = {row[1] for row in cols.fetchall()}
+            if names and "road_type_name" not in names:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE public_map_rule ADD COLUMN road_type_name VARCHAR(64) DEFAULT '高速公路'"
+                )
             cols = await conn.exec_driver_sql("PRAGMA table_info(vehicle_violation)")
             names = {row[1] for row in cols.fetchall()}
             if names:
@@ -477,6 +483,20 @@ async def init_models() -> None:
                     "UPDATE private_map_rule SET priority_level = 5 "
                     "WHERE priority_level IS NULL OR priority_level < 1 OR priority_level > 10"
                 )
+            except Exception:
+                pass
+            try:
+                exists = await conn.exec_driver_sql(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'public_map_rule' "
+                    "AND COLUMN_NAME = 'road_type_name'"
+                )
+                row = exists.fetchone()
+                if row is not None and int(row[0] or 0) == 0:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE public_map_rule ADD COLUMN "
+                        "road_type_name VARCHAR(64) NOT NULL DEFAULT '高速公路'"
+                    )
             except Exception:
                 pass
 

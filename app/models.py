@@ -518,6 +518,7 @@ class PublicMapRule(Base):
     is_public = Column(Integer, nullable=False, default=1, server_default="1")
     geometry_json = Column(JSON, nullable=False)
     remark = Column(String(255))
+    road_type_name = Column(String(64), nullable=False, server_default="高速公路", default="高速公路")
     created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
 
@@ -1104,3 +1105,31 @@ class RoutePlanPreset(Base):
     send_count = Column(Integer, nullable=False, default=0, server_default="0")
     created_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
     updated_at = Column(DateTime, nullable=True)
+
+
+class AlarmBlockedRecord(Base):
+    """主动安全报警被挡住、处理列表看不到的记录（无证据未入库、类型过滤、自动误报等）。"""
+
+    __tablename__ = "alarm_blocked_record"
+    __table_args__ = (
+        Index("ix_alarm_blocked_time_reason", "alarm_time", "reason_code"),
+        Index("ix_alarm_blocked_plate_time", "plate_no", "alarm_time"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    external_alarm_id = Column(String(128), nullable=False, unique=True, index=True)
+    plate_no = Column(String(16), nullable=False, default="", server_default="", index=True)
+    terminal_id = Column(String(32), nullable=True)
+    vehicle_id = Column(Integer, nullable=True, index=True)
+    company_name = Column(String(128), nullable=True)
+    violation_type_name = Column(String(64), nullable=True)
+    alarm_time = Column(DateTime, nullable=False, index=True)
+    source = Column(String(32), nullable=False, default="jt808_adas", server_default="jt808_adas")
+    reason_code = Column(String(32), nullable=False, index=True)
+    reason_text = Column(String(255), nullable=False, default="", server_default="")
+    image_count = Column(Integer, nullable=False, default=0, server_default="0")
+    video_count = Column(Integer, nullable=False, default=0, server_default="0")
+    file_count = Column(Integer, nullable=False, default=0, server_default="0")
+    speed = Column(Float, nullable=True)
+    visible_on_platform = Column(Boolean, nullable=False, default=False, server_default="0")
+    last_seen_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
+    created_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now())

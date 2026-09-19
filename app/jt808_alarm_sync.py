@@ -22,6 +22,7 @@ from app.alarm_type_gate import evaluate_alarm_type_ingest, log_alarm_type_gate
 from app.jt808_openapi_client import Jt808OpenApiError, jt808_openapi_client
 from app.jt808_openapi_credentials import service_openapi_username
 from app.jt808_violation_sync import lookup_company_name, notify_violation_created
+from app.alarm_blocked import clear_alarm_blocked, upsert_alarm_blocked
 from app.models import Jt808AlarmSyncState, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTicket
 from app.plate_util import norm_plate
 from app.violation_filters import is_unknown_violation_type_name
@@ -336,6 +337,29 @@ def _has_image_or_video_evidence(media: Any) -> bool:
     return bool((isinstance(images, list) and images) or (isinstance(videos, list) and videos))
 
 
+# 与 violation_ai_assessment._AI_REQUIRED_IMAGE_COUNT 一致：满套才不自动误报
+_FULL_TICKET_EVIDENCE_IMAGE_COUNT = 3
+
+
+def _has_full_ticket_evidence(media: Any) -> bool:
+    """满 3 张图 + 1 段视频：后一条不应被前一条证据不足误报的 15 分钟间隔挡住。"""
+    if isinstance(media, str):
+        try:
+            media = json.loads(media)
+        except json.JSONDecodeError:
+            return False
+    if not isinstance(media, dict):
+        return False
+    images = media.get("images")
+    videos = media.get("videos")
+    return (
+        isinstance(images, list)
+        and len(images) >= _FULL_TICKET_EVIDENCE_IMAGE_COUNT
+        and isinstance(videos, list)
+        and len(videos) >= 1
+    )
+
+
 def _jt808_media_url(raw: Any) -> str:
     url = str(raw or "").strip()
     if not url:
@@ -521,10 +545,15 @@ async def _last_window_start(db: AsyncSession, source: str) -> datetime:
     return row.last_window_end_at - timedelta(seconds=30)
 
 
-async def _fetch_adas_alarm_items(start_at: datetime, end_at: datetime) -> tuple[list[dict[str, Any]], int, str | None]:
+async def _fetch_adas_alarm_items(
+    start_at: datetime,
+    end_at: datetime,
+    *,
+    max_pages: int | None = None,
+) -> tuple[list[dict[str, Any]], int, str | None]:
     """只拉 808 列表，不碰 CESG 库。"""
     page_size = max(1, int(settings.jt808_alarm_sync_page_size))
-    max_pages = max(1, int(settings.jt808_alarm_sync_max_pages))
+    max_pages = max(1, int(max_pages if max_pages is not None else settings.jt808_alarm_sync_max_pages))
     items: list[dict[str, Any]] = []
     total = 0
     try:
@@ -556,6 +585,124 @@ async def _fetch_position_rows(terminals: list[str]) -> list[dict[str, Any]]:
             if isinstance(item, dict):
                 rows.append(item)
     return rows
+
+
+def _media_counts(media: dict[str, Any] | None, files: Any) -> tuple[int, int, int]:
+    raw_n = len(files) if isinstance(files, list) else 0
+    if not isinstance(media, dict):
+        return 0, 0, raw_n
+    images = media.get("images")
+    videos = media.get("videos")
+    return (
+        len(images) if isinstance(images, list) else 0,
+        len(videos) if isinstance(videos, list) else 0,
+        raw_n,
+    )
+
+
+async def describe_alarm_block(
+    db: AsyncSession,
+    source: str,
+    item: dict[str, Any],
+    *,
+    end_at: datetime,
+    car_id_cache: dict[str, dict[str, str]],
+    company_name_cache: dict[int, str | None],
+) -> dict[str, Any] | None:
+    """未入库原因；返回 None 表示可以入库。"""
+    ext_id = _external_alarm_id(source, item)
+    terminal_id = await _terminal_from_alarm_item(item, car_id_cache)
+    plate = str(item.get("carno") or item.get("plate") or "").strip()
+    if not plate and item.get("car_id"):
+        plate = await _plate_by_platform_car_id(item.get("car_id"), car_id_cache)
+    vehicle = await _resolve_vehicle_for_alarm(db, terminal_id, plate)
+    type_name = _alarm_type_name(source, item)
+    alarm_time = _parse_api_time(item.get("gpstime") or item.get("ts")) or end_at
+    media = _split_media_files(item.get("files"))
+    image_count, video_count, file_count = _media_counts(media, item.get("files"))
+    speed = _alarm_packet_speed_kmh(item)
+    company_name = None
+    vehicle_id = None
+    if vehicle is not None:
+        vehicle_id = vehicle.id
+        plate = vehicle.plate_no or plate
+        company_name = await lookup_company_name(db, vehicle.company_id, company_name_cache)
+
+    payload = {
+        "external_alarm_id": ext_id,
+        "plate_no": plate,
+        "terminal_id": terminal_id,
+        "vehicle_id": vehicle_id,
+        "company_name": company_name,
+        "violation_type_name": type_name,
+        "alarm_time": alarm_time,
+        "source": source,
+        "image_count": image_count,
+        "video_count": video_count,
+        "file_count": file_count,
+        "speed": speed,
+        "visible_on_platform": False,
+    }
+    if vehicle is None:
+        return {**payload, "reason_code": "no_vehicle"}
+    if _is_unknown_alarm_item(source, item):
+        return {**payload, "reason_code": "unknown_type"}
+    gate = await evaluate_alarm_type_ingest(
+        db,
+        type_name=type_name,
+        vehicle_id=vehicle.id,
+        alarm_time=alarm_time,
+        relax_interval_when_full_evidence=_has_full_ticket_evidence(media),
+    )
+    if not gate.get("allow"):
+        reason = str(gate.get("reason") or "filtered")
+        code = {"interval": "interval", "disabled": "type_disabled", "missing": "type_missing"}.get(reason, "type_missing")
+        return {**payload, "reason_code": code}
+    if not _has_image_or_video_evidence(media):
+        return {**payload, "reason_code": "no_evidence"}
+    return None
+
+
+async def inspect_and_record_blocked_items(
+    db: AsyncSession,
+    items: list[dict[str, Any]],
+    *,
+    end_at: datetime,
+    source: str = _SOURCE_ADAS,
+) -> tuple[int, int, int]:
+    """扫描 808 列表：已入库跳过，应挡住的写入异常表。返回 (recorded, already_in, would_ingest)。"""
+    from app.alarm_blocked import existing_external_ids
+
+    ext_ids = []
+    parsed: list[tuple[str, dict[str, Any]]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        ext_id = _external_alarm_id(source, item)
+        ext_ids.append(ext_id)
+        parsed.append((ext_id, item))
+    already = await existing_external_ids(db, ext_ids)
+    recorded = 0
+    allowed = 0
+    car_id_cache: dict[str, dict[str, str]] = {}
+    company_name_cache: dict[int, str | None] = {}
+    for ext_id, item in parsed:
+        if ext_id in already:
+            continue
+        info = await describe_alarm_block(
+            db,
+            source,
+            item,
+            end_at=end_at,
+            car_id_cache=car_id_cache,
+            company_name_cache=company_name_cache,
+        )
+        if info is None:
+            allowed += 1
+            continue
+        await upsert_alarm_blocked(db, **info)
+        recorded += 1
+    return recorded, len(already), allowed
 
 
 async def _sync_alarm_source(
@@ -597,6 +744,42 @@ async def _sync_alarm_source(
             exists = await db.scalar(select(VehicleViolation.id).where(VehicleViolation.external_alarm_id == ext_id).limit(1))
             if exists:
                 continue
+            blocked = await describe_alarm_block(
+                db,
+                source,
+                item,
+                end_at=end_at,
+                car_id_cache=car_id_cache,
+                company_name_cache=company_name_cache,
+            )
+            if blocked:
+                await upsert_alarm_blocked(db, **blocked)
+                code = blocked.get("reason_code")
+                if code == "no_vehicle":
+                    result.skipped_no_vehicle += 1
+                elif code == "unknown_type":
+                    result.skipped_unknown_type += 1
+                elif code == "interval":
+                    result.skipped_interval += 1
+                    log_alarm_type_gate(
+                        source=source,
+                        external_id=ext_id,
+                        alarm_type_name=str(blocked.get("violation_type_name") or ""),
+                        reason="interval",
+                        plate=str(blocked.get("plate_no") or ""),
+                    )
+                elif code == "no_evidence":
+                    result.skipped_no_evidence += 1
+                else:
+                    result.skipped_filtered += 1
+                    log_alarm_type_gate(
+                        source=source,
+                        external_id=ext_id,
+                        alarm_type_name=str(blocked.get("violation_type_name") or ""),
+                        reason=str(code),
+                        plate=str(blocked.get("plate_no") or ""),
+                    )
+                continue
             terminal_id = await _terminal_from_alarm_item(item, car_id_cache)
             plate = str(item.get("carno") or item.get("plate") or "").strip()
             if not plate and item.get("car_id"):
@@ -605,37 +788,16 @@ async def _sync_alarm_source(
             if vehicle is None:
                 result.skipped_no_vehicle += 1
                 continue
-            if _is_unknown_alarm_item(source, item):
-                result.skipped_unknown_type += 1
-                continue
             alarm_time = _parse_api_time(item.get("gpstime") or item.get("ts")) or end_at
             type_name = _alarm_type_name(source, item)
+            media = _split_media_files(item.get("files"))
             gate = await evaluate_alarm_type_ingest(
                 db,
                 type_name=type_name,
                 vehicle_id=vehicle.id,
                 alarm_time=alarm_time,
+                relax_interval_when_full_evidence=_has_full_ticket_evidence(media),
             )
-            if not gate.get("allow"):
-                reason = str(gate.get("reason") or "filtered")
-                log_alarm_type_gate(
-                    source=source,
-                    external_id=ext_id,
-                    alarm_type_name=type_name,
-                    reason=reason,
-                    plate=plate,
-                    interval_minutes=getattr(gate.get("alarm_type"), "min_interval_minutes", None),
-                )
-                if reason == "interval":
-                    result.skipped_interval += 1
-                else:
-                    result.skipped_filtered += 1
-                continue
-            # 808 主动安全：无图片/视频证据一律不入库（OBD 超速走独立通道，不受此限制）。
-            media = _split_media_files(item.get("files"))
-            if not _has_image_or_video_evidence(media):
-                result.skipped_no_evidence += 1
-                continue
             lat = _as_float(item.get("lat"))
             lng = _as_float(item.get("lng"))
             address = str(item.get("address") or "").strip()
@@ -669,6 +831,25 @@ async def _sync_alarm_source(
             db.add(row)
             await db.flush()
             if auto_false:
+                img_n, vid_n, file_n = _media_counts(media, item.get("files"))
+                await upsert_alarm_blocked(
+                    db,
+                    external_alarm_id=ext_id,
+                    reason_code="auto_false_stopped",
+                    plate_no=vehicle.plate_no,
+                    terminal_id=terminal_id,
+                    vehicle_id=vehicle.id,
+                    company_name=company_name,
+                    violation_type_name=type_name,
+                    alarm_time=alarm_time,
+                    source=source,
+                    image_count=img_n,
+                    video_count=vid_n,
+                    file_count=file_n,
+                    speed=auto_false[0],
+                    visible_on_platform=True,
+                    reason_text=auto_false[1],
+                )
                 logger.info(
                     "接打电话停车自动误报: plate=%s speed=%s type=%s ext_id=%s",
                     vehicle.plate_no,
@@ -676,6 +857,8 @@ async def _sync_alarm_source(
                     type_name,
                     ext_id,
                 )
+            else:
+                await clear_alarm_blocked(db, ext_id)
             await notify_violation_created(db, row)
             result.inserted += 1
             if terminal_id:

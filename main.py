@@ -26,7 +26,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from app.session_auth import SessionAuthMiddleware
-from app.security import cors_origin_list, reject_oversized_paging, sanitize_validation_errors
+from app.security import CSP_API, cors_origin_list, reject_oversized_paging, sanitize_validation_errors
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -123,6 +123,9 @@ async def _no_store_api(request: Request, call_next):
         response.headers.setdefault("Cache-Control", "no-store, no-cache, must-revalidate")
         response.headers.setdefault("Pragma", "no-cache")
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Content-Security-Policy", CSP_API)
+    if "server" in response.headers:
+        del response.headers["server"]
     return response
 
 
@@ -601,4 +604,5 @@ if __name__ == "__main__":
         workers=max(1, workers),
         reload_excludes=["**/data/**", "**/__pycache__/**", "**/*.pyc"],
         log_level="info",
+        server_header=False,
     )

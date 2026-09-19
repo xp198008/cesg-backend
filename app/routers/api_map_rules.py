@@ -224,12 +224,14 @@ class PublicMapRuleCreateBody(BaseModel):
     draw_shape_type: str = Field(..., min_length=1, max_length=32)
     geometry_json: dict[str, Any] | list[Any]
     remark: str | None = Field(None, max_length=255)
+    road_type_name: str | None = Field(None, max_length=64)
 
 
 class PublicMapRuleUpdateBody(BaseModel):
     rule_name: str | None = Field(None, min_length=1, max_length=200)
     geometry_json: dict[str, Any] | list[Any] | None = None
     remark: str | None = Field(None, max_length=255)
+    road_type_name: str | None = Field(None, max_length=64)
 
 
 def _rule_out(row: PublicMapRule) -> dict:
@@ -242,6 +244,7 @@ def _rule_out(row: PublicMapRule) -> dict:
         "is_public": row.is_public,
         "geometry_json": row.geometry_json,
         "remark": row.remark,
+        "road_type_name": _normalize_road_type_name(getattr(row, "road_type_name", None)),
         "created_at": row.created_at.strftime("%Y-%m-%d %H:%M:%S") if row.created_at else None,
         "updated_at": row.updated_at.strftime("%Y-%m-%d %H:%M:%S") if row.updated_at else None,
     }
@@ -285,6 +288,7 @@ async def public_map_rule_create(body: PublicMapRuleCreateBody, db: AsyncSession
         geometry_json=body.geometry_json,
         is_public=1,
         remark=(body.remark or "").strip() or None,
+        road_type_name=_normalize_road_type_name(body.road_type_name),
     )
     db.add(row)
     await db.flush()
@@ -308,6 +312,8 @@ async def public_map_rule_update(
         flag_modified(row, "geometry_json")
     if "remark" in data:
         row.remark = (body.remark or "").strip() or None
+    if "road_type_name" in data:
+        row.road_type_name = _normalize_road_type_name(body.road_type_name)
     await db.flush()
     return {"ok": True}
 
@@ -394,6 +400,7 @@ async def public_map_rules_from_private(
             geometry_json=row.geometry_json,
             is_public=1,
             remark=(f"{remark}；{note}" if remark else note)[:255],
+            road_type_name=_normalize_road_type_name(getattr(row, "road_type_name", None)),
         )
         db.add(pub)
         await db.flush()
@@ -1300,7 +1307,7 @@ async def private_map_rules_batch_from_public(
                 category_ids=[],
                 company_name=company_name,
                 fleet_name=fleet_name,
-                road_type_name=DEFAULT_ROAD_TYPE_NAME,
+                road_type_name=_normalize_road_type_name(getattr(pub, "road_type_name", None)),
                 remark=pub.remark,
                 created_by=creator_id,
                 created_by_name=creator_name,
@@ -1314,6 +1321,7 @@ async def private_map_rules_batch_from_public(
             row.geometry_json = pub.geometry_json
             row.ref_public_rule_id = public_id
             row.remark = pub.remark
+            row.road_type_name = _normalize_road_type_name(getattr(pub, "road_type_name", None))
             updated += 1
     await db.flush()
     return {"ok": True, "created": created, "updated": updated, "skipped": skipped}

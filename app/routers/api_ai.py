@@ -4,11 +4,11 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +20,7 @@ from app.agent_worker_config import (
     save_ai_worker_config,
 )
 from app.ai_datasets import AI_DATASETS, resolve_ai_company, resolve_dataset_id
+from app.ai_stream_sanitize import sanitize_sse_bytes
 from app.database import get_db
 from app.models import OrgCompany, SysUser
 
@@ -196,12 +197,14 @@ async def ai_chat(
 
     async def event_stream():
         try:
-            async for chunk in agent_worker_client.chat_stream(
-                user_id=user_id,
-                company=company,
-                session_id=payload.session_id,
-                input_messages=input_messages,
-                stream=payload.stream,
+            async for chunk in sanitize_sse_bytes(
+                agent_worker_client.chat_stream(
+                    user_id=user_id,
+                    company=company,
+                    session_id=payload.session_id,
+                    input_messages=input_messages,
+                    stream=payload.stream,
+                )
             ):
                 yield chunk
         except AgentWorkerError as exc:
@@ -279,6 +282,33 @@ async def ai_vehicle_risk_assessment(
         raise HTTPException(status_code=status, detail=text) from exc
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text) from exc
+
+
+@router.get("/attachment")
+async def ai_attachment(
+    url: str = Query(..., min_length=4, max_length=2048),
+    filename: str | None = Query(None, max_length=255),
+):
+    """经 HTTPS 代理拉取 Agent Worker 附件，避免浏览器拦截 HTTP 不安全下载。"""
+    await _ensure_configured()
+    safe_name = "".join(ch for ch in str(filename or "") if ch not in "/\\").strip() or None
+    try:
+        file = await agent_worker_client.fetch_attachment(url, fallback_name=safe_name or "")
+    except AgentWorkerError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    name = safe_name or file.get("filename") or "download"
+    ascii_name = name.encode("ascii", "ignore").decode("ascii") or "download"
+    return Response(
+        content=file["content"],
+        media_type=file.get("content_type") or "application/octet-stream",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(name)}'
+            ),
+        },
+    )
 
 
 @router.get("/sessions/{session_id}")

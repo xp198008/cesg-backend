@@ -9,7 +9,7 @@ import logging
 import re
 from collections.abc import AsyncIterator
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
@@ -341,6 +341,33 @@ class AgentWorkerClient:
                 break
             page += 1
         return {"items": items, "total": total or len(items)}
+
+    def _allowed_attachment_url(self, url: str) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            raise AgentWorkerError("附件地址无效")
+        base = _base_url()
+        if raw.startswith("/"):
+            return f"{base}{raw}"
+        parsed = urlparse(raw)
+        allowed = {urlparse(base).netloc.lower(), "113.207.68.94:5002"}
+        if parsed.scheme not in ("http", "https") or parsed.netloc.lower() not in allowed:
+            raise AgentWorkerError("不允许下载该地址")
+        return raw
+
+    async def fetch_attachment(self, url: str, *, fallback_name: str = "") -> dict[str, Any]:
+        await self._ensure_ready()
+        target = self._allowed_attachment_url(url)
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
+            resp = await client.get(target, headers=_bearer_headers() or None, follow_redirects=True)
+            if resp.status_code >= 400:
+                self._raise_http(resp, prefix="附件下载失败：")
+            name = self._filename_from_headers(resp.headers, fallback_name)
+            return {
+                "content": resp.content,
+                "filename": name or fallback_name or "download",
+                "content_type": resp.headers.get("content-type") or "application/octet-stream",
+            }
 
     async def download_document_file(
         self,

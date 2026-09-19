@@ -1,9 +1,8 @@
-"""组织架构 → 808 定时同步。
+"""组织架构 → 808 定时同步（基础数据为准）。
 
-基础数据 org_company 为准，实时监控树读的是 808 tgps_group。
-公司增删改当时会 best-effort 推一次，失败或手工改库后两边会漂。
-本定时器对照名称和上级：缺分组就建，名称/上级不一致就 8002 改回去。
-不删除 808 多出来的分组。
+CESG org_company 有、808 没有 → 8002 新建；名称/上级漂了 → 8002 改回去。
+808 多出来、基础数据没有的分组 → 8002 删除，两边对齐。
+仍挂着车辆的 808 多余分组先跳过，避免把车挂空。
 """
 from __future__ import annotations
 
@@ -52,6 +51,86 @@ def _load_jt808_groups() -> dict[int, dict[str, Any]]:
         conn.close()
 
 
+def _808_child_first(groups: dict[int, dict[str, Any]]) -> list[int]:
+    """先叶子后父级，删除多余分组时避免父节点下还有子节点。"""
+    by_parent: dict[int, list[int]] = {}
+    for gid, info in groups.items():
+        fid = int(info.get("fid") or 0)
+        by_parent.setdefault(fid, []).append(int(gid))
+    for kids in by_parent.values():
+        kids.sort()
+    out: list[int] = []
+    seen: set[int] = set()
+
+    def walk(fid: int) -> None:
+        for gid in by_parent.get(fid, []):
+            if gid in seen:
+                continue
+            seen.add(gid)
+            walk(gid)
+            out.append(gid)
+
+    walk(0)
+    for gid in groups:
+        if int(gid) not in seen:
+            out.append(int(gid))
+    return out
+
+
+def _808_group_car_counts(gids: list[int]) -> dict[int, int]:
+    if not gids:
+        return {}
+    import pymysql
+
+    conn = pymysql.connect(
+        host=settings.jt808_mysql_host,
+        port=int(settings.jt808_mysql_port),
+        user=settings.jt808_mysql_user,
+        password=settings.jt808_mysql_password,
+        database=settings.jt808_mysql_database,
+        charset="utf8mb4",
+        connect_timeout=min(8.0, settings.jt808_sync_timeout),
+        read_timeout=15,
+        write_timeout=15,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT group_id, COUNT(*) FROM tgps_car WHERE group_id IN %s GROUP BY group_id",
+                (tuple(int(x) for x in gids),),
+            )
+            return {int(gid): int(cnt or 0) for gid, cnt in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def _808_clear_group_users(gids: list[int]) -> None:
+    if not gids:
+        return
+    import pymysql
+
+    conn = pymysql.connect(
+        host=settings.jt808_mysql_host,
+        port=int(settings.jt808_mysql_port),
+        user=settings.jt808_mysql_user,
+        password=settings.jt808_mysql_password,
+        database=settings.jt808_mysql_database,
+        charset="utf8mb4",
+        connect_timeout=min(8.0, settings.jt808_sync_timeout),
+        read_timeout=15,
+        write_timeout=15,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM tgps_group_user WHERE group_id IN %s",
+                (tuple(int(x) for x in gids),),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _parent_first(rows: list[tuple[int, str, int | None, int | None]]) -> list[tuple[int, str, int | None, int | None]]:
     by_parent: dict[int | None, list[tuple[int, str, int | None, int | None]]] = {}
     ids = {r[0] for r in rows}
@@ -76,6 +155,58 @@ def _parent_first(rows: list[tuple[int, str, int | None, int | None]]) -> list[t
         if row[0] not in seen:
             out.append(row)
     return out
+
+
+async def _purge_808_orphans(
+    groups: dict[int, dict[str, Any]],
+    *,
+    bound: set[int],
+    remain: int,
+) -> tuple[int, int, list[str]]:
+    """删除 808 有、基础数据没有的分组。"""
+    if remain <= 0:
+        return 0, 0, []
+    orphans = [int(gid) for gid in groups if int(gid) not in bound]
+    if not orphans:
+        return 0, 0, []
+    try:
+        car_counts = await asyncio.to_thread(_808_group_car_counts, orphans)
+    except Exception as exc:  # noqa: BLE001
+        return 0, 0, [f"统计 808 多余分组车辆失败: {exc}"]
+
+    deleted = 0
+    skipped = 0
+    errors: list[str] = []
+    still = set(orphans)
+    for gid in _808_child_first(groups):
+        if deleted >= remain:
+            break
+        if gid not in still:
+            continue
+        kids = [int(cid) for cid, info in groups.items() if int(info.get("fid") or 0) == gid]
+        if any(cid in bound or cid in still for cid in kids):
+            skipped += 1
+            continue
+        cars = int(car_counts.get(gid) or 0)
+        if cars > 0:
+            name = (groups.get(gid) or {}).get("name") or ""
+            logger.warning("808 多余分组仍有车辆，未删除 gid=%s name=%s cars=%s", gid, name, cars)
+            skipped += 1
+            still.discard(gid)
+            continue
+        try:
+            await asyncio.to_thread(_808_clear_group_users, [gid])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("清理 808 多余分组用户关系失败 gid=%s: %s", gid, exc)
+        ok = await jt808_group.del_group(gid)
+        if ok:
+            groups.pop(gid, None)
+            still.discard(gid)
+            deleted += 1
+        else:
+            name = (groups.get(gid) or {}).get("name") or ""
+            errors.append(f"{name}#{gid}: 删除 808 多余分组失败")
+    return deleted, skipped, errors
 
 
 class OrgJt808SyncScheduler:
@@ -239,23 +370,36 @@ class OrgJt808SyncScheduler:
             else:
                 errors.append(f"{name}#{oid}: 改分组失败 gid={current_gid}")
 
+        purged = 0
+        if ops < batch:
+            purged, purge_skip, purge_errs = await _purge_808_orphans(
+                groups,
+                bound=bound,
+                remain=batch - ops,
+            )
+            skipped += purge_skip
+            errors.extend(purge_errs)
+            ops += purged
+
         payload = {
             "org_total": len(companies),
             "created": created,
             "bound_existed": bound_existed,
             "edited": edited,
+            "purged": purged,
             "skipped": skipped,
             "errors": errors[:20],
         }
         self._last_run_at = china_now_naive()
         self._last_result = payload
         self._last_error = errors[0] if errors else None
-        if created or bound_existed or edited or errors:
+        if created or bound_existed or edited or purged or errors:
             logger.info(
-                "组织 808 同步：新建%s 回绑%s 改上级/名称%s 跳过%s 失败%s",
+                "组织 808 同步：新建%s 回绑%s 改上级/名称%s 清808多余%s 跳过%s 失败%s",
                 created,
                 bound_existed,
                 edited,
+                purged,
                 skipped,
                 len(errors),
             )

@@ -11,6 +11,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 from app.config import settings
+from app.security import CSP_API, is_allowed_request_origin
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +92,21 @@ def _looks_reflected(text: str) -> bool:
     return any(marker in low for marker in _REFLECT_MARKERS)
 
 
+_API_SECURE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Content-Security-Policy": CSP_API,
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+
+
 def _reject(message: str = "接口参数不合法") -> JSONResponse:
-    return JSONResponse(status_code=400, content={"code": -1, "message": message})
+    return JSONResponse(status_code=400, content={"code": -1, "message": message}, headers=_API_SECURE_HEADERS)
+
+
+def _not_found() -> Response:
+    # 探测/非法/跨站请求不回 JSON 业务错误，避免 AppScan 把「接口参数不合法」当成活 API
+    return Response(status_code=404, content=b"", headers=_API_SECURE_HEADERS)
 
 
 def _sanitize_upstream_json(payload: Any) -> tuple[Any, int] | None:
@@ -100,7 +114,7 @@ def _sanitize_upstream_json(payload: Any) -> tuple[Any, int] | None:
         return None
     message = str(payload.get("message") or payload.get("msg") or "")
     if _looks_reflected(message) or _has_operator_keys(payload):
-        return {"code": -1, "message": "接口参数不合法"}, 400
+        return None, 404
     return None
 
 
@@ -117,10 +131,10 @@ def _forward_headers(request: Request) -> dict[str, str]:
 @router.api_route("/internal/jt808-gateway", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 @router.api_route("/internal/jt808-gateway/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def jt808_gateway(request: Request, path: str = ""):
-    if request.method == "OPTIONS":
-        return Response(status_code=204)
     if request.method != "POST":
-        return JSONResponse(status_code=405, content={"code": -1, "message": "接口参数不合法"})
+        return _not_found()
+    if not is_allowed_request_origin(request):
+        return _not_found()
 
     raw = await request.body()
     parsed: Any = None
@@ -128,11 +142,11 @@ async def jt808_gateway(request: Request, path: str = ""):
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            return _reject()
+            return _not_found()
     if not isinstance(parsed, dict) or _has_operator_keys(parsed):
-        return _reject()
+        return _not_found()
     if "apicode" not in parsed or not _apicode_ok(parsed.get("apicode")):
-        return _reject()
+        return _not_found()
 
     url = _upstream_url(path)
     timeout = httpx.Timeout(60.0, connect=8.0)
@@ -147,7 +161,11 @@ async def jt808_gateway(request: Request, path: str = ""):
             )
     except httpx.HTTPError as exc:
         logger.warning("808 网关转发失败: %s", exc)
-        return JSONResponse(status_code=502, content={"code": -1, "message": "接口暂时不可用"})
+        return JSONResponse(
+            status_code=502,
+            content={"code": -1, "message": "接口暂时不可用"},
+            headers=_API_SECURE_HEADERS,
+        )
 
     media = (upstream.headers.get("content-type") or "").split(";")[0].strip().lower()
     body = upstream.content
@@ -161,9 +179,11 @@ async def jt808_gateway(request: Request, path: str = ""):
             rewritten = _sanitize_upstream_json(payload)
             if rewritten is not None:
                 payload, status = rewritten
-                return JSONResponse(status_code=status, content=payload)
+                if status == 404 and payload is None:
+                    return _not_found()
+                return JSONResponse(status_code=status, content=payload, headers=_API_SECURE_HEADERS)
             if _looks_reflected(body.decode("utf-8", "replace")):
-                return _reject()
+                return _not_found()
 
     headers = {
         key: value
@@ -171,4 +191,6 @@ async def jt808_gateway(request: Request, path: str = ""):
         if key.lower() not in _STRIP_RESP
     }
     headers.setdefault("Cache-Control", "no-store, no-cache, must-revalidate")
+    headers.setdefault("Content-Security-Policy", CSP_API)
+    headers.setdefault("X-Content-Type-Options", "nosniff")
     return Response(content=body, status_code=status, headers=headers, media_type=media or None)

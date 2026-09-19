@@ -104,7 +104,7 @@ def attach_session_cookie(response, session_token: str | None) -> None:
         value=token,
         httponly=True,
         secure=bool(settings.cookie_secure),
-        samesite="lax",
+        samesite="strict",
         path="/",
     )
 
@@ -116,7 +116,7 @@ def clear_session_cookie(response) -> None:
         key=COOKIE_NAME,
         path="/",
         secure=bool(settings.cookie_secure),
-        samesite="lax",
+        samesite="strict",
     )
 
 

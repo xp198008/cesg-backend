@@ -1191,6 +1191,26 @@ async def maybe_apply_insufficient_evidence_on_create(
         discard_violation_alerts([row.id])
     except Exception:
         pass
+    try:
+        from app.alarm_blocked import upsert_alarm_blocked
+
+        await upsert_alarm_blocked(
+            db,
+            external_alarm_id=str(getattr(row, "external_alarm_id", "") or f"local:{row.id}"),
+            reason_code="insufficient_evidence",
+            plate_no=str(getattr(row, "plate_no", "") or ""),
+            terminal_id=str(getattr(row, "terminal_id", "") or "") or None,
+            vehicle_id=getattr(row, "vehicle_id", None),
+            company_name=getattr(row, "company_name", None),
+            violation_type_name=getattr(row, "violation_type_name", None),
+            alarm_time=getattr(row, "violation_time", None),
+            source=str(getattr(row, "source", "") or "jt808_adas"),
+            image_count=len(_list_image_urls(row)),
+            video_count=1 if _first_video_url(row) else 0,
+            visible_on_platform=True,
+        )
+    except Exception:
+        pass
     logger.info(
         "入库证据不足即误报 violation_id=%s plate=%s",
         row.id,

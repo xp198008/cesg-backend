@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import bcrypt
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -169,6 +169,70 @@ async def obd_speed_check_obd_anomaly(
     return {"ok": True, **data}
 
 
+@router.get("/api/obd-speed-check/alarm-blocked")
+async def alarm_blocked_list(
+    reason: str | None = Query(None),
+    plate_no: str | None = Query(None),
+    start_time: str | None = Query(None),
+    end_time: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+):
+    """被挡住、处理列表看不到的主动安全报警。"""
+    from datetime import datetime
+
+    from app.alarm_blocked import list_alarm_blocked
+
+    def _parse(raw: str | None) -> datetime | None:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(text[:19] if " " in text else text[:10], fmt)
+            except ValueError:
+                continue
+        return None
+
+    async with AsyncSessionLocal() as db:
+        data = await list_alarm_blocked(
+            db,
+            reason_code=reason,
+            plate_no=plate_no,
+            start_time=_parse(start_time),
+            end_time=_parse(end_time),
+            page=page,
+            page_size=page_size,
+        )
+    return {"ok": True, **data}
+
+
+@router.get("/api/obd-speed-check/alarm-blocked/stats")
+async def alarm_blocked_stats_api(hours: int = Query(24, ge=1, le=168)):
+    from app.alarm_blocked import alarm_blocked_stats
+
+    async with AsyncSessionLocal() as db:
+        data = await alarm_blocked_stats(db, hours=hours)
+    return {"ok": True, **data}
+
+
+@router.post("/api/obd-speed-check/alarm-blocked/scan")
+async def alarm_blocked_scan(hours: int = Query(12, ge=1, le=72)):
+    """对照 808 近 N 小时，把平台没有的报警按原因记入异常表。"""
+    from app.alarm_blocked import scan_recent_blocked_from_808
+
+    async with AsyncSessionLocal() as db:
+        try:
+            data = await scan_recent_blocked_from_808(db, hours=hours)
+            await db.commit()
+        except Exception as exc:  # noqa: BLE001
+            await db.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not data.get("ok") and not data.get("fetched"):
+        raise HTTPException(status_code=400, detail=data.get("error") or "扫描失败")
+    return {"ok": True, **data}
+
+
 @router.post("/api/obd-speed-check/park-alarm/reset-cursors")
 async def park_alarm_reset_cursors():
     """清空停车扫描游标，下一轮按 lookback 窗口重扫。"""
@@ -258,7 +322,7 @@ _STATUS_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>后台运维 · OBD / AI评估 / 报警类型 / 地图接口 / 短信平台</title>
+<title>后台运维 · OBD / 报警异常 / AI评估 / 报警类型 / 地图接口 / 短信平台</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: "Microsoft YaHei", system-ui, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 24px; }
@@ -322,16 +386,23 @@ _STATUS_PAGE = """<!DOCTYPE html>
   #opsGate { z-index: 80; }
   #opsGate .modal { width: min(420px, 100%); }
   #opsGateErr { color: #fca5a5; min-height: 18px; }
+  .stat-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
+  .stat-pill { background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 8px 12px; min-width: 140px; }
+  .stat-pill b { display: block; font-size: 18px; color: #f8fafc; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+  .tag-out { background: #7f1d1d55; color: #fecaca; }
+  .tag-hide { background: #78350f55; color: #fde68a; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>后台运维</h1>
-  <div class="sub">OBD 监测 · OBD异常 · AI 自动评估 · AI 接口 · 报警类型 · 地图接口 · 短信平台</div>
+  <div class="sub">OBD 监测 · OBD异常 · 报警异常 · AI 自动评估 · AI 接口 · 报警类型 · 地图接口 · 短信平台</div>
 
   <div class="tabs">
     <button type="button" class="active" data-tab="status">监测状态</button>
     <button type="button" data-tab="anomaly">OBD异常</button>
+    <button type="button" data-tab="blocked">报警异常</button>
     <button type="button" data-tab="ai">AI 评估</button>
     <button type="button" data-tab="aiapi">AI 接口</button>
     <button type="button" data-tab="alarms">报警类型</button>
@@ -415,6 +486,47 @@ _STATUS_PAGE = """<!DOCTYPE html>
         </thead>
         <tbody id="anomalyBody"><tr><td colspan="9">尚未扫描</td></tr></tbody>
       </table>
+    </div>
+  </div>
+
+  <div id="panel-blocked" class="panel">
+    <div class="sub" id="blockedRefreshed">车载有、处理列表没有的主动安全报警。点「扫描近12小时」对照 808 补齐刚才被挡住的记录。</div>
+    <div class="btns">
+      <button id="btnBlockedScan" class="success">扫描近12小时</button>
+      <button id="btnBlockedRefresh" class="ghost">刷新列表</button>
+      <span class="muted" id="blockedSummary"></span>
+    </div>
+    <div class="stat-row" id="blockedStats"></div>
+    <div class="card">
+      <h2><span class="dot" id="dotBlocked"></span>被挡住的报警</h2>
+      <p class="muted" style="margin-bottom:10px">
+        未进入平台：无图/视频、未匹配车辆、类型停用或间隔未到。<br>
+        待处理看不到：停车接打电话自动误报、证据不足（未满 3 图 + 1 视频）已落在误报查询。
+      </p>
+      <div class="filters">
+        <label>原因
+          <select id="blkReason">
+            <option value="">全部原因</option>
+          </select>
+        </label>
+        <label>车牌<input id="blkPlate" placeholder="模糊"></label>
+        <label>开始时间<input id="blkStart" placeholder="YYYY-MM-DD"></label>
+        <label>结束时间<input id="blkEnd" placeholder="YYYY-MM-DD"></label>
+      </div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>报警时间</th><th>车牌</th><th>公司</th><th>类型</th>
+            <th>原因</th><th>图/视频</th><th>车速</th><th>平台</th><th>最近发现</th>
+          </tr>
+        </thead>
+        <tbody id="blockedBody"><tr><td colspan="9">尚未加载</td></tr></tbody>
+      </table>
+      <div class="pager">
+        <button type="button" class="ghost" id="blkPrev">上一页</button>
+        <span id="blkPageInfo">—</span>
+        <button type="button" class="ghost" id="blkNext">下一页</button>
+      </div>
     </div>
   </div>
 
@@ -673,6 +785,7 @@ document.querySelectorAll(".tabs button").forEach((btn) => {
     if (btn.dataset.tab === "aiapi") loadAiApiConfig();
     if (btn.dataset.tab === "status") loadStatus();
     if (btn.dataset.tab === "anomaly") loadAnomaly();
+    if (btn.dataset.tab === "blocked") loadBlocked();
     if (btn.dataset.tab === "ai") loadAiStatus();
   };
 });
@@ -902,6 +1015,130 @@ async function loadAnomaly() {
   }
   if (btn) { btn.disabled = false; btn.textContent = "立即扫描"; }
 }
+
+let blkPage = 1;
+const blkPageSize = 50;
+let blkReasonsLoaded = false;
+
+function blockedQuery() {
+  const q = new URLSearchParams();
+  q.set("page", String(blkPage));
+  q.set("page_size", String(blkPageSize));
+  const reason = ($("blkReason").value || "").trim();
+  const plate = ($("blkPlate").value || "").trim();
+  const start = ($("blkStart").value || "").trim();
+  const end = ($("blkEnd").value || "").trim();
+  if (reason) q.set("reason", reason);
+  if (plate) q.set("plate_no", plate);
+  if (start) q.set("start_time", start);
+  if (end) q.set("end_time", end);
+  return q.toString();
+}
+
+function renderBlockedStats(data) {
+  const parts = [];
+  parts.push('<div class="stat-pill">全部记录<b>' + esc(data.total) + "</b></div>");
+  parts.push('<div class="stat-pill">近 ' + esc(data.recent_hours) + " 小时<b>" + esc(data.recent_count) + "</b></div>");
+  parts.push('<div class="stat-pill">未进平台<b>' + esc(data.not_on_platform) + "</b></div>");
+  (data.by_reason || []).slice(0, 6).forEach((r) => {
+    parts.push('<div class="stat-pill">' + esc(r.label) + "<b>" + esc(r.count) + "</b></div>");
+  });
+  $("blockedStats").innerHTML = parts.join("");
+}
+
+function renderBlockedList(data) {
+  if (!blkReasonsLoaded && data.reasons) {
+    const sel = $("blkReason");
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">全部原因</option>' + data.reasons.map((r) =>
+      '<option value="' + esc(r.code) + '">' + esc(r.label) + "</option>"
+    ).join("");
+    sel.value = cur;
+    blkReasonsLoaded = true;
+  }
+  const items = data.items || [];
+  $("blockedSummary").textContent = "共 " + (data.total || 0) + " 条";
+  $("dotBlocked").className = "dot " + (data.total ? "warn" : "ok");
+  $("blkPageInfo").textContent = "第 " + data.page + " 页 / 每页 " + data.page_size + " / 共 " + data.total;
+  $("blkPrev").disabled = data.page <= 1;
+  $("blkNext").disabled = data.page * data.page_size >= data.total;
+  if (!items.length) {
+    $("blockedBody").innerHTML = '<tr><td colspan="9">没有被挡住的记录。可点「扫描近12小时」对照 808。</td></tr>';
+    return;
+  }
+  $("blockedBody").innerHTML = items.map((r) => {
+    const vis = r.visible_on_platform
+      ? '<span class="tag tag-hide">仅误报可见</span>'
+      : '<span class="tag tag-out">未进平台</span>';
+    return "<tr>" +
+      "<td>" + esc(r.alarm_time || "—") + "</td>" +
+      "<td>" + esc(r.plate_no || "—") + "</td>" +
+      "<td>" + esc(r.company_name || "—") + "</td>" +
+      "<td>" + esc(r.violation_type_name || "—") + "</td>" +
+      "<td>" + esc(r.reason_text || r.reason_code || "") + "</td>" +
+      "<td>" + esc(r.image_count) + " / " + esc(r.video_count) + "</td>" +
+      "<td>" + (r.speed == null ? "—" : esc(r.speed)) + "</td>" +
+      "<td>" + vis + "</td>" +
+      "<td>" + esc(r.last_seen_at || "—") + "</td>" +
+      "</tr>";
+  }).join("");
+}
+
+async function loadBlocked() {
+  $("blockedBody").innerHTML = '<tr><td colspan="9">加载中…</td></tr>';
+  try {
+    const [listRes, statRes] = await Promise.all([
+      authFetch("/api/obd-speed-check/alarm-blocked?" + blockedQuery()),
+      authFetch("/api/obd-speed-check/alarm-blocked/stats?hours=24"),
+    ]);
+    if (listRes.status === 401 || statRes.status === 401) { showOpsGate("请输入 admin 密码"); return; }
+    const listData = await listRes.json();
+    const statData = await statRes.json();
+    if (!listRes.ok) throw new Error((listData && listData.detail) || "加载失败");
+    renderBlockedList(listData);
+    if (statRes.ok) renderBlockedStats(statData);
+    $("blockedRefreshed").textContent = "刷新于 " + new Date().toLocaleString();
+  } catch (e) {
+    $("dotBlocked").className = "dot bad";
+    $("blockedRefreshed").textContent = "加载失败：" + e;
+    $("blockedBody").innerHTML = '<tr><td colspan="9" class="err">' + esc(e.message || e) + "</td></tr>";
+  }
+}
+
+async function scanBlocked() {
+  const btn = $("btnBlockedScan");
+  btn.disabled = true;
+  btn.textContent = "扫描中…";
+  $("blockedSummary").textContent = "正在对照 808…";
+  try {
+    const res = await authFetch("/api/obd-speed-check/alarm-blocked/scan?hours=12", { method: "POST" });
+    if (res.status === 401) { showOpsGate("请输入 admin 密码"); return; }
+    const data = await res.json();
+    if (!res.ok) throw new Error((data && data.detail) || "扫描失败");
+    $("blockedSummary").textContent = "扫描完成：808 " + esc(data["808_total"]) +
+      " / 本页拉取 " + esc(data.fetched) +
+      " / 新记 " + esc(data.recorded) +
+      " / 已在平台 " + esc(data.already_in);
+    blkPage = 1;
+    await loadBlocked();
+  } catch (e) {
+    $("blockedSummary").textContent = "";
+    alert("扫描失败：" + (e.message || e));
+  }
+  btn.disabled = false;
+  btn.textContent = "扫描近12小时";
+}
+
+$("btnBlockedScan").onclick = scanBlocked;
+$("btnBlockedRefresh").onclick = () => { blkPage = 1; loadBlocked(); };
+$("blkPrev").onclick = () => { if (blkPage > 1) { blkPage -= 1; loadBlocked(); } };
+$("blkNext").onclick = () => { blkPage += 1; loadBlocked(); };
+["blkReason", "blkPlate", "blkStart", "blkEnd"].forEach((id) => {
+  $(id).addEventListener("change", () => { blkPage = 1; loadBlocked(); });
+});
+$("blkPlate").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") { ev.preventDefault(); blkPage = 1; loadBlocked(); }
+});
 
 async function loadStatus() {
   try {
@@ -1512,7 +1749,7 @@ function startOpsPage() {
   opsReady = true;
   hideOpsGate();
   const hash = (location.hash || "").replace("#", "");
-  if (hash === "alarms" || hash === "map" || hash === "ai" || hash === "aiapi" || hash === "sms" || hash === "anomaly") {
+  if (hash === "alarms" || hash === "map" || hash === "ai" || hash === "aiapi" || hash === "sms" || hash === "anomaly" || hash === "blocked") {
     const btn = document.querySelector('.tabs button[data-tab="' + hash + '"]');
     if (btn) btn.click();
     else loadStatus();
@@ -1643,5 +1880,5 @@ async def obd_status_unlock(body: ObdStatusUnlockBody):
 
 @router.get("/obd-status", response_class=HTMLResponse, include_in_schema=False)
 async def obd_status_page():
-    """后台运维页：OBD / OBD异常 / AI / AI 接口 / 报警类型 / 地图 / 短信。访问 /obd-status（#anomaly / #ai / #aiapi / #alarms / #map / #sms）。"""
+    """后台运维页：OBD / OBD异常 / 报警异常 / AI / AI 接口 / 报警类型 / 地图 / 短信。访问 /obd-status（#anomaly / #blocked / #ai / #aiapi / #alarms / #map / #sms）。"""
     return HTMLResponse(_STATUS_PAGE)

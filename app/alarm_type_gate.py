@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, not_, or_, select, true
+from sqlalchemy import and_, func, not_, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AlarmTypeDict, VehicleViolation
@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 _DISABLED_NAMES_TTL = 60.0
 _RISK_MAP_TTL = 60.0
+# 与 violation_ai_assessment 证据不足误报备注对齐，避免闸门把这类误报当成间隔锚点
+_INSUFFICIENT_EVIDENCE_REMARK_MARK = "缺少3张照片及1段视频"
 
 
 async def load_alarm_type_by_name(db: AsyncSession, type_name: str) -> AlarmTypeDict | None:
@@ -195,6 +197,15 @@ async def load_alarm_type_risk_map(db: AsyncSession) -> dict[str, str]:
     return dict(cached)
 
 
+def _prior_insufficient_evidence_false_alarm_clause():
+    """前一条因缺 3 图 + 1 视频被落成误报，不占用最小间隔。"""
+    return and_(
+        VehicleViolation.status == "误报",
+        VehicleViolation.handler_remark.isnot(None),
+        VehicleViolation.handler_remark.contains(_INSUFFICIENT_EVIDENCE_REMARK_MARK),
+    )
+
+
 async def _within_min_interval(
     db: AsyncSession,
     *,
@@ -202,6 +213,7 @@ async def _within_min_interval(
     type_names: list[str],
     alarm_time: datetime,
     minutes: int,
+    ignore_insufficient_false_alarm: bool = False,
 ) -> bool:
     if minutes <= 0 or vehicle_id is None or alarm_time is None:
         return False
@@ -210,16 +222,15 @@ async def _within_min_interval(
         return False
     since = alarm_time - timedelta(minutes=int(minutes))
     # 下界用「> since」：距上次满整分钟（如 15 分钟）时允许再入，避免卡在边界永远被挡
-    exists = await db.scalar(
-        select(VehicleViolation.id)
-        .where(
-            VehicleViolation.vehicle_id == vehicle_id,
-            VehicleViolation.violation_type_name.in_(names),
-            VehicleViolation.violation_time > since,
-            VehicleViolation.violation_time <= alarm_time,
-        )
-        .limit(1)
-    )
+    conds = [
+        VehicleViolation.vehicle_id == vehicle_id,
+        VehicleViolation.violation_type_name.in_(names),
+        VehicleViolation.violation_time > since,
+        VehicleViolation.violation_time <= alarm_time,
+    ]
+    if ignore_insufficient_false_alarm:
+        conds.append(not_(_prior_insufficient_evidence_false_alarm_clause()))
+    exists = await db.scalar(select(VehicleViolation.id).where(*conds).limit(1))
     return exists is not None
 
 
@@ -230,12 +241,15 @@ async def evaluate_alarm_type_ingest(
     vehicle_id: int | None,
     alarm_time: datetime,
     interval_type_names: list[str] | None = None,
+    relax_interval_when_full_evidence: bool = False,
 ) -> dict[str, Any]:
     """
     入库闸门：
     - 字典中不存在 / 停用 → 不入库
     - 最小间隔内同车同类型已有记录 → 不入库
     interval_type_names：间隔判定时额外纳入的历史类型名（兼容改名前旧记录）
+    relax_interval_when_full_evidence：本条已满 3 图 + 1 视频时，
+    前一条因证据不足自动误报不占用间隔
     """
     name = (type_name or "").strip()
     row = await load_alarm_type_by_name(db, name)
@@ -265,6 +279,7 @@ async def evaluate_alarm_type_ingest(
         type_names=interval_names,
         alarm_time=alarm_time,
         minutes=interval,
+        ignore_insufficient_false_alarm=relax_interval_when_full_evidence,
     ):
         return {
             "allow": False,

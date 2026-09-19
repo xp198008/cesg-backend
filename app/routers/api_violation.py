@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Header, Query, Requ
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.security import OFFSET_MAX, PAGE_MAX, StrictModel
+from app.security import OFFSET_MAX, PAGE_MAX, StrictModel, reject_cross_site
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,6 +60,9 @@ from app.violation_manual_ocr import run_violation_manual_ocr
 
 router = APIRouter(prefix="/api/violation", tags=["violation"])
 logger = logging.getLogger(__name__)
+
+# 与前端报表日报/报警选择车辆上限一致，避免一次 IN 过多车牌拖垮查询。
+VIOLATION_LIST_MAX_PLATES = 80
 
 
 class ViolationHandleIn(BaseModel):
@@ -625,6 +628,10 @@ async def _get_visible_violation_or_404(
     """按 id 取当前组织/分配范围内的记录；越权或无证据时按不存在处理。"""
     x_org_id = request.headers.get("x-org-id")
     x_user_id = request.headers.get("x-user-id")
+    if not (x_user_id or "").strip():
+        session_uid = getattr(request.state, "user_id", None)
+        if session_uid is not None:
+            x_user_id = str(session_uid)
     q = await _scoped_query(db, x_org_id, None, x_user_id)
     row = await db.scalar(q.where(VehicleViolation.id == int(violation_id)).limit(1))
     if row is None or not violation_row_is_page_visible(row):
@@ -740,6 +747,11 @@ async def violation_list(
             q = q.where(VehicleViolation.status == status.strip())
     if plate_no:
         plates = [p.strip() for p in str(plate_no).replace("，", ",").split(",") if p.strip()]
+        if len(plates) > VIOLATION_LIST_MAX_PLATES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"一次最多选择 {VIOLATION_LIST_MAX_PLATES} 辆车，建议分批查询",
+            )
         if len(plates) > 1:
             # 选择车辆多选：精确匹配所选车牌
             q = q.where(VehicleViolation.plate_no.in_(plates))
@@ -1423,17 +1435,34 @@ async def violation_false_alarm_reopen(
 
 
 @router.get("/{violation_id}/ai-assessment")
-async def violation_ai_assessment_get(violation_id: int, db: AsyncSession = Depends(get_db)):
+async def violation_ai_assessment_get(violation_id: int):
+    # GET 只用于扫描器拼路径探测，正式读取改走 POST，避免按整数 ID 直接取对象
+    raise HTTPException(status_code=404, detail="记录不存在")
+
+
+@router.post("/{violation_id}/ai-assessment")
+async def violation_ai_assessment_post(
+    violation_id: int,
+    body: ViolationFetchMediaIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    reject_cross_site(request)
+    if int(body.id) != int(violation_id):
+        raise HTTPException(status_code=404, detail="记录不存在")
+    await _get_visible_violation_or_404(db, violation_id, request)
     return await get_violation_ai_assessment(db, violation_id)
 
 
 @router.post("/{violation_id}/ai-assessment/analyze")
 async def violation_ai_assessment_analyze(
     violation_id: int,
+    request: Request,
     force: bool = Query(False, description="为 true 时强制重新咨询 AI"),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
+    await _get_visible_violation_or_404(db, violation_id, request)
     user_id = (x_user_id or "cesg_anonymous").strip() or "cesg_anonymous"
     try:
         return await run_violation_ai_assessment(db, violation_id=violation_id, user_id=user_id, force=force)
@@ -1447,10 +1476,13 @@ async def violation_ai_assessment_analyze(
 @router.post("/{violation_id}/ai-assessment/analyze-stream")
 async def violation_ai_assessment_analyze_stream(
     violation_id: int,
+    request: Request,
     force: bool = Query(False, description="为 true 时强制重新咨询 AI"),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db),
 ):
     """SSE 流式 AI 评估：status / content(delta) / assessment / skip / error 事件。"""
+    await _get_visible_violation_or_404(db, violation_id, request)
     user_id = (x_user_id or "cesg_anonymous").strip() or "cesg_anonymous"
     return StreamingResponse(
         stream_violation_ai_assessment(violation_id=violation_id, user_id=user_id, force=force),

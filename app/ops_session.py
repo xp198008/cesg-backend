@@ -62,7 +62,7 @@ def attach_ops_cookie(response, token: str | None) -> None:
         key=OPS_COOKIE,
         value=raw,
         httponly=True,
-        samesite="lax",
+        samesite="strict",
         path="/",
         max_age=OPS_TTL_SECONDS,
         secure=True,
@@ -70,4 +70,4 @@ def attach_ops_cookie(response, token: str | None) -> None:
 
 
 def clear_ops_cookie(response) -> None:
-    response.delete_cookie(key=OPS_COOKIE, path="/", secure=True, samesite="lax")
+    response.delete_cookie(key=OPS_COOKIE, path="/", secure=True, samesite="strict")

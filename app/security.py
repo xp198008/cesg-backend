@@ -29,6 +29,12 @@ _DEFAULT_CORS_ORIGINS = (
     "http://127.0.0.1:5173",
 )
 
+# JSON/API 响应用：不执行脚本，供 AppScan 检查 CSP 是否缺失或不安全
+CSP_API = (
+    "default-src 'none'; script-src 'none'; object-src 'none'; "
+    "frame-ancestors 'none'; base-uri 'none'"
+)
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -62,12 +68,13 @@ def is_allowed_origin(origin: str) -> bool:
 
 
 def is_allowed_request_origin(request: Request) -> bool:
+    """Origin、Referer 任一出现且不在白名单即拒绝（AppScan CSRF 会改 Referer 但保留 Origin）。"""
     origin = (request.headers.get("origin") or "").strip()
-    if origin:
-        return is_allowed_origin(origin)
     referer = (request.headers.get("referer") or "").strip()
-    if referer:
-        return is_allowed_origin(_origin_from_url(referer))
+    if origin and not is_allowed_origin(origin):
+        return False
+    if referer and not is_allowed_origin(_origin_from_url(referer)):
+        return False
     return True
 
 
