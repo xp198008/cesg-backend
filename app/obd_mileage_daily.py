@@ -65,6 +65,32 @@ def _drive_km(start: float | None, end: float | None) -> float | None:
     return round(diff, 2)
 
 
+def _is_obd_source(source: str | None) -> bool:
+    text = str(source or "")
+    return text.startswith("obd_zlc") and "gap" not in text
+
+
+def _abnormal_of(start: float | None, end: float | None) -> tuple[bool, str]:
+    if start is None or end is None:
+        return False, ""
+    diff = float(end) - float(start)
+    if diff < 0:
+        return True, "rollback"
+    if diff > _MAX_DAY_KM:
+        return True, "jump"
+    return False, ""
+
+
+def _prev_end(prev: ObdMileageDaily | None) -> float | None:
+    if prev is None:
+        return None
+    if prev.end_mileage is not None:
+        return float(prev.end_mileage)
+    if prev.start_mileage is not None:
+        return float(prev.start_mileage)
+    return None
+
+
 def _fmt_dt(value: datetime | None) -> str:
     if value is None:
         return ""
@@ -194,9 +220,9 @@ async def upsert_obd_mileage_tick(
         gap = _day_diff(prev.day, day)
         now_close = china_now_naive()
         if gap is not None and gap == 1 and not prev.closed:
-            # 相邻日：用本帧下延关闭昨天
-            if prev.end_mileage is None or float(prev.end_mileage) < float(zlc):
-                prev.end_mileage = float(zlc)
+            # 相邻日：只关闭昨天，隔夜公里算进今天（今日开始=昨日结束）
+            if prev.end_mileage is None:
+                prev.end_mileage = prev.start_mileage
             prev.closed = True
             prev.drive_km = _drive_km(prev.start_mileage, prev.end_mileage)
             prev.updated_at = now_close
@@ -224,6 +250,11 @@ async def upsert_obd_mileage_tick(
     ).scalar_one_or_none()
     now = china_now_naive()
     if row is None:
+        start = _prev_end(prev)
+        if start is None:
+            start = float(zlc)
+        drive = _drive_km(start, float(zlc))
+        abnormal, _reason = _abnormal_of(start, float(zlc))
         db.add(
             ObdMileageDaily(
                 device_no=device_no,
@@ -233,9 +264,9 @@ async def upsert_obd_mileage_tick(
                 company_name=meta.get("company_name"),
                 driver_name=meta.get("driver_name"),
                 day=day,
-                start_mileage=float(zlc),
+                start_mileage=start,
                 end_mileage=float(zlc),
-                drive_km=0.0,
+                drive_km=0.0 if drive is None else drive,
                 start_time=report_time,
                 end_time=report_time,
                 start_lng=lng,
@@ -243,14 +274,27 @@ async def upsert_obd_mileage_tick(
                 end_lng=lng,
                 end_lat=lat,
                 closed=False,
-                source="obd_zlc",
+                source="obd_zlc_abnormal" if abnormal else "obd_zlc",
                 updated_at=now,
                 created_at=now,
             )
         )
         return
-    if row.start_mileage is None:
-        row.start_mileage = float(zlc)
+    if not _is_obd_source(row.source or ""):
+        # 无 OBD 时先写过 GPS 日结，现已来 OBD：改走 OBD 起止，不再混 GPS
+        start = _prev_end(prev)
+        if start is None:
+            start = float(zlc)
+        row.start_mileage = start
+        row.start_time = report_time
+        if lat is not None and lng is not None:
+            row.start_lat = lat
+            row.start_lng = lng
+        abnormal, _reason = _abnormal_of(start, float(zlc))
+        row.source = "obd_zlc_abnormal" if abnormal else "obd_zlc"
+    elif row.start_mileage is None:
+        chained = _prev_end(prev)
+        row.start_mileage = chained if chained is not None else float(zlc)
         row.start_time = report_time
         if lat is not None and lng is not None:
             row.start_lat = lat
@@ -261,6 +305,12 @@ async def upsert_obd_mileage_tick(
         row.end_lat = lat
         row.end_lng = lng
     row.drive_km = _drive_km(row.start_mileage, row.end_mileage)
+    if _is_obd_source(row.source or ""):
+        abnormal, _reason = _abnormal_of(row.start_mileage, row.end_mileage)
+        if abnormal:
+            row.source = "obd_zlc_abnormal"
+        elif (row.source or "") == "obd_zlc_abnormal":
+            row.source = "obd_zlc"
     if meta.get("plate_no"):
         row.plate_no = meta["plate_no"]
     if meta.get("company_id"):
@@ -646,11 +696,15 @@ async def _fill_gap_zero_days(db: AsyncSession, start_day: str, end_day: str) ->
 
 
 async def _apply_carry_forward(db: AsyncSession, start_day: str, end_day: str) -> None:
-    """相邻日：结束里程空时用次日开始里程下延。跨天中间不把里程并过来。"""
+    """有 OBD 的车：今日开始 = 上一有数据日结束。空档日保持 0，恢复日后把空档公里算进去。"""
     rows = (
         await db.execute(
             select(ObdMileageDaily)
-            .where(ObdMileageDaily.day >= start_day, ObdMileageDaily.day <= end_day)
+            .where(ObdMileageDaily.device_no.in_(
+                select(ObdMileageDaily.device_no)
+                .where(ObdMileageDaily.day >= start_day, ObdMileageDaily.day <= end_day)
+                .distinct()
+            ))
             .order_by(ObdMileageDaily.device_no, ObdMileageDaily.day)
         )
     ).scalars().all()
@@ -659,18 +713,32 @@ async def _apply_carry_forward(db: AsyncSession, start_day: str, end_day: str) -
         by_dev.setdefault(str(row.device_no), []).append(row)
     now = china_now_naive()
     for seq in by_dev.values():
-        for i, row in enumerate(seq):
-            if (row.source or "") == "obd_zlc_gap":
+        last_end: float | None = None
+        for row in seq:
+            src = row.source or ""
+            if src.startswith("gps"):
+                last_end = _prev_end(row)
+                continue
+            if src == "obd_zlc_gap":
+                if last_end is not None:
+                    row.start_mileage = last_end
+                    row.end_mileage = last_end
                 row.drive_km = 0.0
                 continue
-            nxt = seq[i + 1] if i + 1 < len(seq) else None
-            if row.end_mileage is None and nxt is not None and nxt.start_mileage is not None:
-                if _day_diff(row.day, nxt.day) == 1:
-                    row.end_mileage = float(nxt.start_mileage)
-                    row.closed = True
-                    row.updated_at = now
+            if last_end is not None:
+                row.start_mileage = last_end
+                row.updated_at = now
+            drive = _drive_km(row.start_mileage, row.end_mileage)
+            abnormal, _reason = _abnormal_of(row.start_mileage, row.end_mileage)
+            row.drive_km = 0.0 if drive is None else drive
+            if abnormal and _is_obd_source(src):
+                row.source = "obd_zlc_abnormal"
+            elif src == "obd_zlc_abnormal" and not abnormal:
+                row.source = "obd_zlc"
             if row.end_mileage is not None:
-                row.drive_km = _drive_km(row.start_mileage, row.end_mileage)
+                last_end = float(row.end_mileage)
+            elif row.start_mileage is not None:
+                last_end = float(row.start_mileage)
 
 
 async def _fill_missing_addresses(db: AsyncSession, start_day: str, end_day: str, *, limit: int = 40) -> None:
@@ -943,7 +1011,11 @@ def serialize_daily_row(row: ObdMileageDaily, orgs: dict[int, dict[str, Any]] | 
     is_gap = (row.source or "") == "obd_zlc_gap"
     start_m = None if is_gap else row.start_mileage
     end_m = None if is_gap else row.end_mileage
+    abnormal, abnormal_reason = _abnormal_of(row.start_mileage, row.end_mileage)
     drive = 0.0 if is_gap else (row.drive_km if row.drive_km is not None else _drive_km(row.start_mileage, row.end_mileage))
+    if drive is None:
+        drive = 0.0
+        abnormal = True
     return {
         "device_no": row.device_no,
         "deviceId": row.device_no,
@@ -982,10 +1054,202 @@ def serialize_daily_row(row: ObdMileageDaily, orgs: dict[int, dict[str, Any]] | 
         "closed": bool(row.closed),
         "source": row.source,
         "gap": is_gap,
+        "abnormal": abnormal and not is_gap,
+        "abnormalReason": abnormal_reason if abnormal and not is_gap else "",
         "_fromObd": True,
         "_from1302": True,
         "_pendingSettle": False,
     }
+
+
+async def _device_has_obd(db: AsyncSession, device_no: str) -> bool:
+    row = (
+        await db.execute(
+            select(ObdMileageDaily.id).where(
+                ObdMileageDaily.device_no == device_no,
+                ObdMileageDaily.source.like("obd_zlc%"),
+                ObdMileageDaily.source != "obd_zlc_gap",
+            ).limit(1)
+        )
+    ).first()
+    return row is not None
+
+
+def _load_gps_dtlc_rows(start_day: str, end_day: str) -> list[dict[str, Any]]:
+    """无 OBD 车辆：沿用 808 tgps_mileage.dtlc（原 GPS 日结）。"""
+    conn = _connect_jt808(read_timeout=60)
+    try:
+        with conn.cursor() as cur:
+            cars = _load_808_car_map(cur)
+            cur.execute(
+                "SELECT car_id, create_time, lc, dtlc FROM tgps_mileage "
+                "WHERE create_time>=%s AND create_time<=%s",
+                (start_day, end_day),
+            )
+            out: list[dict[str, Any]] = []
+            for car_id, day, lc, dtlc in cur.fetchall() or []:
+                info = cars.get(int(car_id)) or {}
+                tid = str(info.get("tid") or "")
+                day_s = _norm_day(day)
+                end_m = _to_float(lc)
+                drive = _to_float(dtlc)
+                if not tid or not day_s:
+                    continue
+                if drive is not None and drive < 0:
+                    drive = 0.0
+                if drive is not None and drive > _MAX_DAY_KM:
+                    drive = None
+                start_m = None
+                if end_m is not None and drive is not None:
+                    start_m = round(float(end_m) - float(drive), 2)
+                out.append(
+                    {
+                        "tid": tid,
+                        "plate_no": info.get("plate_no"),
+                        "day": day_s,
+                        "start_mileage": start_m,
+                        "end_mileage": end_m,
+                        "drive_km": 0.0 if drive is None else round(float(drive), 2),
+                    }
+                )
+            return out
+    finally:
+        conn.close()
+
+
+async def _fill_gps_for_no_obd(
+    db: AsyncSession,
+    start_day: str,
+    end_day: str,
+    scope: list[dict[str, Any]] | None = None,
+) -> int:
+    """只给从未有过 OBD 日结的车补 GPS 日里程，禁止用 GPS 填 OBD 车的空日。"""
+    import asyncio
+
+    gps_rows = await asyncio.to_thread(_load_gps_dtlc_rows, start_day, end_day)
+    if not gps_rows:
+        return 0
+    scope_devs = {str(v.get("device_no") or "") for v in (scope or []) if v.get("device_no")}
+    scope_plates = {str(v.get("plate_no") or "") for v in (scope or []) if v.get("plate_no")}
+    wrote = 0
+    now = china_now_naive()
+    checked: dict[str, bool] = {}
+    for item in gps_rows:
+        tid = str(item.get("tid") or "")
+        plate = str(item.get("plate_no") or "")
+        if scope:
+            hit = False
+            if tid and tid in scope_devs:
+                hit = True
+            if plate and plate in scope_plates:
+                hit = True
+            if not hit:
+                continue
+        if tid not in checked:
+            checked[tid] = await _device_has_obd(db, tid)
+        if checked[tid]:
+            continue
+        existing = (
+            await db.execute(
+                select(ObdMileageDaily).where(
+                    ObdMileageDaily.device_no == tid,
+                    ObdMileageDaily.day == item["day"],
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            if (existing.source or "") == "gps_dtlc":
+                existing.drive_km = item.get("drive_km") or 0.0
+                existing.start_mileage = item.get("start_mileage")
+                existing.end_mileage = item.get("end_mileage")
+                existing.updated_at = now
+                wrote += 1
+            continue
+        meta = next((v for v in (scope or []) if v.get("device_no") == tid or v.get("plate_no") == plate), {})
+        db.add(
+            ObdMileageDaily(
+                device_no=tid,
+                plate_no=plate or meta.get("plate_no"),
+                vehicle_id=meta.get("vehicle_id"),
+                company_id=meta.get("company_id"),
+                company_name=meta.get("company_name"),
+                driver_name=meta.get("driver_name"),
+                day=item["day"],
+                start_mileage=item.get("start_mileage"),
+                end_mileage=item.get("end_mileage"),
+                drive_km=item.get("drive_km") or 0.0,
+                closed=True,
+                source="gps_dtlc",
+                updated_at=now,
+                created_at=now,
+            )
+        )
+        wrote += 1
+    if wrote:
+        await db.commit()
+    return wrote
+
+
+async def lookup_mileage_map(
+    db: AsyncSession,
+    start_day: str,
+    end_day: str,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """(device_no|plate, day) -> 统一日行驶。无 OBD 车会先补 GPS 日结。"""
+    start_day = _norm_day(start_day)
+    end_day = _norm_day(end_day)
+    items = await query_obd_mileage_daily(
+        db,
+        start_day=start_day,
+        end_day=end_day,
+        backfill=True,
+    )
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in items:
+        day = str(item.get("day") or "")
+        if not day:
+            continue
+        for key in (item.get("device_no"), item.get("plate_no"), item.get("vehicle"), item.get("carno")):
+            if key:
+                out[(str(key), day)] = item
+    return out
+
+
+async def query_live_mileage(
+    db: AsyncSession,
+    *,
+    day: str | None = None,
+    plates: list[str] | None = None,
+    device_nos: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """监控/看板/AI 共用的当日行驶里程。"""
+    day = _norm_day(day) or china_now_naive().strftime("%Y%m%d")
+    items = await query_obd_mileage_daily(
+        db,
+        start_day=day,
+        end_day=day,
+        plates=plates,
+        device_nos=device_nos,
+        backfill=True,
+    )
+    out = []
+    for item in items:
+        out.append(
+            {
+                "plate_no": item.get("plate_no") or item.get("vehicle") or "",
+                "carno": item.get("carno") or item.get("plate_no") or "",
+                "device_no": item.get("device_no") or "",
+                "tid": item.get("device_no") or "",
+                "day": item.get("day") or day,
+                "drive_km": item.get("drive_km") if item.get("drive_km") is not None else item.get("mileage") or 0,
+                "mileage": item.get("mileage") or 0,
+                "startMileage": item.get("startMileage"),
+                "endMileage": item.get("endMileage"),
+                "source": item.get("source") or "",
+                "abnormal": bool(item.get("abnormal")),
+            }
+        )
+    return out
 
 
 async def query_obd_mileage_daily(
@@ -1054,6 +1318,10 @@ async def query_obd_mileage_daily(
     scope_devs = [str(v.get("device_no") or "") for v in scope if v.get("device_no")]
     by_plate = {str(v.get("plate_no") or ""): v for v in scope if v.get("plate_no")}
     by_vid = {int(v["vehicle_id"]): v for v in scope if v.get("vehicle_id") is not None}
+    try:
+        await _fill_gps_for_no_obd(db, start_day, end_day, scope or None)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("无 OBD 车辆 GPS 日里程回填失败: %s", exc)
 
     stmt = select(ObdMileageDaily).where(
         ObdMileageDaily.day >= start_day,

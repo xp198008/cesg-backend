@@ -1870,6 +1870,7 @@ def build_core_indicators_from_obd(
     snapshot: dict[str, Any],
     *,
     obd_type: str = "yc",
+    day_km: float | None = None,
 ) -> list[dict[str, Any]]:
     """把 OBD 快照映射为车辆风险画像「核心指标」四组卡片。"""
     from app.obd_speed_monitor import _dict_get_ci
@@ -1918,7 +1919,7 @@ def build_core_indicators_from_obd(
                 "items": [
                     _obd_metric("累计里程", get("zlc"), "km", digits=1),
                     _obd_metric("小计里程", get("bclc"), "km", digits=1),
-                    _obd_metric("日行驶里程", None, "km"),
+                    _obd_metric("日行驶里程", day_km, "km"),
                     _obd_metric("燃料消耗率", None, "L/h"),
                     _obd_metric("百公里油耗", None, "L/100km"),
                     _obd_metric("油箱液位", None, "%"),
@@ -1978,7 +1979,7 @@ def build_core_indicators_from_obd(
                 _obd_metric("油箱液位", get("yxyw"), "%"),
                 _obd_metric("累计里程", get("zlc"), "km", digits=1),
                 _obd_metric("小计里程", get("bclc"), "km", digits=1),
-                _obd_metric("日行驶里程", None, "km"),
+                _obd_metric("日行驶里程", day_km, "km"),
             ],
         },
     ]
@@ -2056,6 +2057,7 @@ async def load_vehicle_obd_indicators(
 
     plate = str(plate_no or "").strip()
     empty_groups = build_core_indicators_from_obd({}, obd_type="yc")
+    day_km = None
     result: dict[str, Any] = {
         "ok": False,
         "plate_no": plate,
@@ -2147,8 +2149,38 @@ async def load_vehicle_obd_indicators(
     else:
         result["message"] = "Redis 无该车 OBD 数据"
         result["device_no"] = used_tid or (candidates[0] if candidates else None)
+        try:
+            from app.obd_mileage_daily import query_live_mileage
+            from app.timeutil import china_now_naive
+
+            live = await query_live_mileage(
+                db,
+                day=china_now_naive().strftime("%Y%m%d"),
+                plates=[plate] if plate else None,
+                device_nos=[result["device_no"]] if result["device_no"] else None,
+            )
+            if live:
+                result["groups"] = build_core_indicators_from_obd(
+                    {}, obd_type="yc", day_km=live[0].get("drive_km")
+                )
+        except Exception:  # noqa: BLE001
+            pass
         return result
 
+    try:
+        from app.obd_mileage_daily import query_live_mileage
+        from app.timeutil import china_now_naive
+
+        live = await query_live_mileage(
+            db,
+            day=china_now_naive().strftime("%Y%m%d"),
+            plates=[plate] if plate else None,
+            device_nos=[used_tid] if used_tid else None,
+        )
+        if live:
+            day_km = live[0].get("drive_km")
+    except Exception:  # noqa: BLE001
+        day_km = None
     result.update(
         {
             "ok": True,
@@ -2157,7 +2189,7 @@ async def load_vehicle_obd_indicators(
             "source": source,
             "ts": _dict_get_ci(snapshot, "ts"),
             "snapshot": snapshot,
-            "groups": build_core_indicators_from_obd(snapshot, obd_type=obd_type),
+            "groups": build_core_indicators_from_obd(snapshot, obd_type=obd_type, day_km=day_km),
             "message": "",
         }
     )

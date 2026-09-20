@@ -13,6 +13,7 @@ from app.models import (
     Driver,
     ManualFaultReport,
     ObdEnergySnapshot,
+    ObdMileageDaily,
     OrgCompany,
     Vehicle,
     VehicleFaultLive,
@@ -588,6 +589,28 @@ async def _board_energy(db: AsyncSession, scoped_company_ids: set[int] | None) -
 
     oil = await _agg_one("oil")
     ev = await _agg_one("ev")
+    try:
+        mile_rows = (
+            await db.execute(
+                select(ObdMileageDaily.day, ObdMileageDaily.drive_km).where(
+                    ObdMileageDaily.day.in_(days_7),
+                )
+            )
+        ).all()
+        by_day: dict[str, float] = {d: 0.0 for d in days_7}
+        for day, drive in mile_rows:
+            key = str(day or "")
+            if key in by_day:
+                by_day[key] += float(drive or 0)
+        oil["mileage"] = round(by_day.get(today) or 0, 1)
+        for item in oil.get("daily") or []:
+            label = str(item.get("label") or "")
+            for d, val in by_day.items():
+                if f"{int(d[4:6])}/{int(d[6:8])}" == label:
+                    item["mileage"] = round(val, 1)
+                    break
+    except Exception:  # noqa: BLE001
+        pass
     return {"oil": oil, "ev": ev}
 
 

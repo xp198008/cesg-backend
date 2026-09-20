@@ -189,5 +189,34 @@ async def list_obd_fuel_daily(
         )
     ).scalars().all()
 
-    items = [_row_dict(r) for r in rows]
+    from app.obd_mileage_daily import lookup_mileage_map
+
+    mile_map = {}
+    try:
+        mile_map = await lookup_mileage_map(db, start, end)
+    except Exception:  # noqa: BLE001
+        mile_map = {}
+    items = []
+    for r in rows:
+        item = _row_dict(r)
+        hit = mile_map.get((str(r.device_no or ""), str(r.day or ""))) or mile_map.get(
+            (str(r.plate_no or ""), str(r.day or ""))
+        )
+        if hit is not None:
+            drive = hit.get("drive_km")
+            if drive is None:
+                drive = hit.get("mileage")
+            if drive is not None:
+                item["drive_km"] = drive
+                item["lc"] = drive
+                item["mileage"] = drive
+                item["_fromObd"] = True
+            if hit.get("startMileage") is not None:
+                item["startMileage"] = hit.get("startMileage")
+            if hit.get("endMileage") is not None:
+                item["endMileage"] = hit.get("endMileage")
+            if item.get("fuel_l") is not None and drive and float(drive) > 0.1:
+                item["fuel100"] = round(float(item["fuel_l"]) / float(drive) * 100.0, 2)
+                item["ave_oil"] = item["fuel100"]
+        items.append(item)
     return {"ok": True, "items": items, "total": len(items), "stime": start, "etime": end}

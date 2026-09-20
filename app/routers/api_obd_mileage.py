@@ -8,6 +8,7 @@ from app.database import get_db
 from app.obd_mileage_daily import (
     query_obd_mileage_daily,
     query_obd_mileage_monthly,
+    query_live_mileage,
     _summarize_company,
     _summarize_driver,
     _summarize_vehicle,
@@ -112,3 +113,20 @@ async def list_obd_mileage_summary(
     else:
         items = _summarize_vehicle(daily)
     return {"ok": True, "items": items, "total": len(items), "source": "obd_mileage_daily", "group": kind}
+
+
+@router.get("/live")
+async def list_obd_mileage_live(
+    day: str | None = Query(None, description="自然日 yyyyMMdd，默认今天"),
+    plates: str | None = Query(None),
+    device_nos: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """监控列表 / 看板 / AI 共用的统一当日行驶里程。"""
+    items = await query_live_mileage(
+        db,
+        day=day,
+        plates=_split_csv(plates) or None,
+        device_nos=_split_csv(device_nos) or None,
+    )
+    return {"ok": True, "items": items, "total": len(items), "source": "obd_mileage_daily"}
