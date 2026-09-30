@@ -18,6 +18,11 @@ _UNKNOWN_VIOLATION_TYPE_MARKERS = (
 )
 
 
+def is_tamper_alarm_name(name: Any) -> bool:
+    """防拆报警来自终端 IO，没有主动安全取证，不要求图片/视频。"""
+    return "防拆" in str(name or "")
+
+
 def is_unknown_violation_type_name(name: Any) -> bool:
     """808 等平台无法识别类型码时返回的占位名称，业务侧不入库、不展示。"""
     text = str(name or "").strip()
@@ -82,6 +87,34 @@ def is_obd_speed_source(source: Any) -> bool:
     return str(source or "").strip().lower() == OBD_SPEED_SOURCE
 
 
+def violation_ready_for_human_clause():
+    """状态已明确、可以人工处理：OBD/人工录入，或 AI 已评估（ai_queried）。"""
+    return or_(
+        VehicleViolation.ai_queried.is_(True),
+        VehicleViolation.source == OBD_SPEED_SOURCE,
+        VehicleViolation.source.ilike(OBD_SPEED_SOURCE),
+        VehicleViolation.source == "manual",
+        VehicleViolation.source.ilike("manual"),
+        VehicleViolation.violation_type_name.ilike("OBD%"),
+        VehicleViolation.violation_type_name.like("%防拆%"),
+    )
+
+
+def human_pending_violation_clause():
+    """待处理任务 / 报警记录处理：只计明确等人处理的记录。
+
+    不含「已入库待AI分析中」：status 仍是待处理，但 ai_queried 未置位。
+    仍含确认处理待审核（preprocess）。
+    """
+    return or_(
+        and_(VehicleViolation.status == "待处理", violation_ready_for_human_clause()),
+        and_(
+            VehicleViolation.status == "待审核",
+            VehicleViolation.pre_audit_kind == "preprocess",
+        ),
+    )
+
+
 def is_manual_source(source: Any) -> bool:
     return str(source or "").strip().lower() == "manual"
 
@@ -93,6 +126,8 @@ def violation_row_is_page_visible(row: Any) -> bool:
     if is_obd_speed_source(getattr(row, "source", None)):
         return True
     if is_manual_source(getattr(row, "source", None)):
+        return True
+    if is_tamper_alarm_name(getattr(row, "violation_type_name", None)):
         return True
     return has_displayable_media_evidence(
         getattr(row, "ttx_evidence_refs", None),
@@ -127,6 +162,7 @@ def violation_has_media_evidence_clause():
         VehicleViolation.source.ilike(OBD_SPEED_SOURCE),
         VehicleViolation.source == "manual",
         VehicleViolation.source.ilike("manual"),
+        VehicleViolation.violation_type_name.like("%防拆%"),
         _ttx_or_stream_media_clause(),
     )
 
@@ -148,7 +184,7 @@ def violation_list_visibility(disabled_alarm_type_names: list[str] | None = None
 
     - 不展示 JT808 同步且未关联 CESG 车辆的记录
     - 不展示未知类型；停用类型历史记录软隐藏
-    - 除 OBD 超速、人工录入外，无图片/视频证据的记录不展示
+    - 除 OBD 超速、人工录入、防拆报警外，无图片/视频证据的记录不展示
     """
     return and_(
         violation_type_is_known_clause(),

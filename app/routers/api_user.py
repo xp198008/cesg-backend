@@ -50,6 +50,15 @@ from app.org_scope import (
 from app.password_policy import generate_login_password, require_strong_password
 from app.secret_box import load_proxy_password, store_proxy_password
 from app.session_auth import attach_session_cookie, clear_session_cookie, extract_session_token, invalidate_session_token
+from app.button_permissions import (
+    USER_ADD,
+    USER_BATCH_DELETE,
+    USER_DELETE,
+    USER_EDIT,
+    USER_SET_PASSWORD,
+    current_permission_ids,
+    require_button_permission,
+)
 from app.vehicle_alloc_scope import parse_user_id_header, resolve_monitor_scope
 
 router = APIRouter(prefix="/api/user", tags=["user"])
@@ -349,6 +358,7 @@ async def user_create(
     db: AsyncSession = Depends(get_db),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
+    await require_button_permission(db, x_user_id, (USER_ADD,), "添加")
     username = (payload.username or "").strip()
     if not username:
         raise HTTPException(status_code=400, detail="用户名不能为空")
@@ -437,6 +447,7 @@ async def user_update(
     db: AsyncSession = Depends(get_db),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
+    await require_button_permission(db, x_user_id, (USER_EDIT,), "编辑")
     username = (payload.username or "").strip()
     if not username:
         raise HTTPException(status_code=400, detail="用户名不能为空")
@@ -547,6 +558,8 @@ async def user_set_password(
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
     actor_id = parse_user_id_header(x_user_id)
+    if actor_id is not None and int(actor_id) != int(payload.user_id):
+        await require_button_permission(db, x_user_id, (USER_SET_PASSWORD,), "修改密码")
     # 自己改自己（或请求未带操作人）必须校验旧密码；管理员给别人改密不要求。
     admin_reset = actor_id is not None and int(actor_id) != int(payload.user_id)
     old_pwd = (payload.old_password or "").strip()
@@ -602,6 +615,7 @@ async def user_reset_password(
     db: AsyncSession = Depends(get_db),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
+    await require_button_permission(db, x_user_id, (USER_SET_PASSWORD,), "修改密码")
     user = await db.scalar(select(SysUser).where(SysUser.id == payload.user_id).limit(1))
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
@@ -1196,6 +1210,15 @@ async def user_jt808_auth_sync(
     return {"ok": True, "message": "808 车组授权已同步", "data": result}
 
 
+@router.get("/my-permissions")
+async def user_my_permissions(
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
+    """当前登录角色的权限 id，供车辆/用户按钮刷新，不必重新登录。"""
+    return {"ok": True, "permission_ids": await current_permission_ids(db, x_user_id)}
+
+
 @router.post("/session/check")
 async def user_session_check(payload: UserSessionCheckPayload, db: AsyncSession = Depends(get_db)):
     user = await db.scalar(select(SysUser).where(SysUser.id == payload.user_id).limit(1))
@@ -1371,6 +1394,7 @@ async def user_delete(
     db: AsyncSession = Depends(get_db),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
+    await require_button_permission(db, x_user_id, (USER_DELETE, USER_BATCH_DELETE), "删除")
     user = await db.scalar(select(SysUser).where(SysUser.id == user_id).limit(1))
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")

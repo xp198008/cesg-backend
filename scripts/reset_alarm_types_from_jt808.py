@@ -20,6 +20,7 @@ from app.database import AsyncSessionLocal, init_models  # noqa: E402
 from app.jt808_alarm_sync import jt808_alarm_type_catalog  # noqa: E402
 from app.models import AlarmTypeDict  # noqa: E402
 from app.timeutil import china_now_naive  # noqa: E402
+from app.violation_risk import safety_level_for_alarm_type  # noqa: E402
 
 
 async def main() -> None:
@@ -35,8 +36,8 @@ async def main() -> None:
                 AlarmTypeDict(
                     type_code=f"AT{stamp}{index:04d}",
                     type_name=name,
-                    alarm_level="中级",
-                    safety_level="中",
+                    alarm_level={"高": "高级", "中": "中级", "低": "低级"}[safety_level_for_alarm_type(name)],
+                    safety_level=safety_level_for_alarm_type(name),
                     min_interval_minutes=15,
                     status="启用",
                     data_source="jt808",

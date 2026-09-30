@@ -163,6 +163,12 @@ def open_session_count() -> int:
         return len(_sessions)
 
 
+def list_open_overspeed_sessions() -> list[OverspeedSession]:
+    """当前仍在超速的会话。速度回到限速以内后会从这里消失。"""
+    with _lock:
+        return list(_sessions.values())
+
+
 def session_status_snapshot() -> list[dict[str, Any]]:
     with _lock:
         items = list(_sessions.values())

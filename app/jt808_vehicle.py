@@ -89,14 +89,23 @@ async def _ensure_token(force: bool = False) -> str:
         return _token
 
 
+def _session_rejected(r: dict[str, Any]) -> bool:
+    """808 把会话失效和接口无权限都写成「无权限」，过期令牌必须重新登录。"""
+    if str(r.get("code")) in {"40001", "40002"}:
+        return True
+    msg = str(r.get("message") or "")
+    if "无权限" in msg:
+        return True
+    return any(h in msg for h in _AUTH_HINTS)
+
+
 async def _call(payload: dict[str, Any]) -> dict[str, Any]:
     token = await _ensure_token()
     r = await _post({**payload, "lingxtoken": token})
-    if r.get("code") != 1:
-        msg = str(r.get("message") or "")
-        if any(h in msg for h in _AUTH_HINTS):
-            token = await _ensure_token(force=True)
-            r = await _post({**payload, "lingxtoken": token})
+    if r.get("code") != 1 and _session_rejected(r):
+        invalidate_token()
+        token = await _ensure_token(force=True)
+        r = await _post({**payload, "lingxtoken": token})
     return r
 
 
@@ -630,6 +639,112 @@ async def _sync_delete(device_no: str | None, plate_no: str | None = None) -> bo
                 logger.warning("JT808 1216 删除失败 device=%s: %s", tid, msg or r)
 
     return ok
+
+
+def lookup_tlingx_user_id(account: str) -> str | None:
+    """按登录账号找 808 用户 id，供区域查车按组织过滤。"""
+    name = (account or "").strip()
+    if not name:
+        return None
+    conn = _connect_mysql()
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM tlingx_user WHERE account=%s LIMIT 1", (name,))
+        row = cur.fetchone()
+        return str(row[0]).strip() if row and row[0] is not None else None
+    except Exception as e:  # noqa: BLE001
+        logger.debug("JT808 查用户失败 account=%s: %s", name, e)
+        return None
+    finally:
+        conn.close()
+
+
+def search_cars_in_bounds(
+    min_lng: float,
+    min_lat: float,
+    max_lng: float,
+    max_lat: float,
+    *,
+    jt808_user_id: str | None = None,
+    plates: set[str] | None = None,
+    limit: int = 5000,
+) -> list[dict]:
+    """按 WGS84 矩形查 tgps_car 最后定位，在线和离线都返回。"""
+    if plates is not None and not plates:
+        return []
+    conn = _connect_mysql()
+    if conn is None:
+        raise RuntimeError("808 车辆库不可用")
+    try:
+        cur = conn.cursor()
+        where = [
+            "c.lat IS NOT NULL",
+            "c.lng IS NOT NULL",
+            "c.lat BETWEEN %s AND %s",
+            "c.lng BETWEEN %s AND %s",
+            "NOT (c.lat = 0 AND c.lng = 0)",
+        ]
+        params: list = [min_lat, max_lat, min_lng, max_lng]
+        uid = (jt808_user_id or "").strip()
+        if uid:
+            where.append(
+                "c.group_id IN (SELECT group_id FROM tgps_group_user WHERE user_id=%s)"
+            )
+            params.append(uid)
+        if plates is not None:
+            plate_list = sorted({p.strip() for p in plates if p and p.strip()})
+            if not plate_list:
+                return []
+            where.append("c.carno IN (" + ",".join(["%s"] * len(plate_list)) + ")")
+            params.extend(plate_list)
+        cap = max(1, min(int(limit or 5000), 5000))
+        sql = (
+            "SELECT c.id, c.tid, c.carno, c.lat, c.lng, c.speed, c.direction, "
+            "c.gpstime, c.systime, c.online, IFNULL(g.name, '') "
+            "FROM tgps_car c LEFT JOIN tgps_group g ON g.id = c.group_id "
+            "WHERE " + " AND ".join(where) + " LIMIT %s"
+        )
+        params.append(cap)
+        cur.execute(sql, params)
+        rows = []
+        for rec in cur.fetchall():
+            online_raw = rec[9]
+            online = 1 if str(online_raw).strip() in {"1", "true", "True"} else 0
+            try:
+                speed = float(rec[5] or 0)
+            except (TypeError, ValueError):
+                speed = 0.0
+            status_jt808 = 4 if online != 1 else (2 if speed > 0 else 3)
+            gpstime = "".join(ch for ch in str(rec[7] or "") if ch.isdigit())[:14]
+            systime = "".join(ch for ch in str(rec[8] or "") if ch.isdigit())[:14]
+            plate = str(rec[2] or "").replace("\u3000", " ").strip()
+            if " " in plate:
+                plate = plate.split(" ", 1)[0]
+            rows.append(
+                {
+                    "car_id": str(rec[0]),
+                    "id": str(rec[0]),
+                    "tid": str(rec[1] or ""),
+                    "carno": plate,
+                    "lat": float(rec[3]),
+                    "lng": float(rec[4]),
+                    "speed": speed,
+                    "direction": rec[6] if rec[6] is not None else 0,
+                    "gpstime": gpstime,
+                    "systime": systime,
+                    "online": online,
+                    "status_jt808": status_jt808,
+                    "group_name": str(rec[10] or ""),
+                    "alarm_str": "-",
+                    "status_str": "-",
+                    "type": "0x0200",
+                }
+            )
+        return rows
+    finally:
+        conn.close()
 
 
 def _connect_mysql() -> pymysql.connections.Connection | None:

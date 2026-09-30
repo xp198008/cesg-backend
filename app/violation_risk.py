@@ -18,6 +18,21 @@ _SAFETY_TO_RISK = {
 }
 
 
+# 客户口径：高风险 超速/疲劳/接打电话；中风险 分神/抽烟；其余低风险。
+_HIGH_SAFETY_KEYWORDS = ("超速", "疲劳", "接打电话", "打电话")
+_MID_SAFETY_KEYWORDS = ("分神", "抽烟")
+
+
+def safety_level_for_alarm_type(type_name: str | None) -> str:
+    """报警类型名称 → 安全级别（高/中/低）。"""
+    name = (type_name or "").strip()
+    if any(key in name for key in _HIGH_SAFETY_KEYWORDS):
+        return "高"
+    if any(key in name for key in _MID_SAFETY_KEYWORDS):
+        return "中"
+    return "低"
+
+
 def risk_from_safety_level(safety_level: str | None) -> str:
     """报警类型安全级别（高/中/低）→ 风险码 high/mid/low。"""
     return _SAFETY_TO_RISK.get((safety_level or "").strip(), RISK_MID)

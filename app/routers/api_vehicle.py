@@ -22,6 +22,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import jt808_vehicle
 from app.database import get_db
+from app.button_permissions import (
+    VEHICLE_ADD,
+    VEHICLE_BATCH_DELETE,
+    VEHICLE_DELETE,
+    VEHICLE_EDIT,
+    require_button_permission,
+)
 from app.vehicle_jt808_sync import mark_pending, vehicle_jt808_sync_scheduler
 from app.jt808_openapi_client import jt808_openapi_client
 from app.tongtianxing_client import list_plate_device_pairs
@@ -30,6 +37,7 @@ from app.models import (
     Fleet,
     OrgCompany,
     ReserveTerminal,
+    SysUser,
     Vehicle,
     VehicleAllocRuleVehicle,
     VehicleDevice,
@@ -48,7 +56,9 @@ from app.risk_profile_service import (
 from app.vehicle_alloc_scope import (
     apply_vehicle_id_scope,
     parse_user_id_header,
+    resolve_allowed_plate_nos,
     resolve_allowed_vehicle_ids,
+    user_has_vehicle_alloc_rules,
 )
 from app.vehicle_op_log import (
     diff_vehicle_snapshot,
@@ -862,6 +872,7 @@ async def vehicle_create(
     db: AsyncSession = Depends(get_db),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
+    await require_button_permission(db, x_user_id, (VEHICLE_ADD,), "添加")
     co = await _ensure_company_and_fleet(db, payload.company_id, payload.fleet_id)
     await _ensure_driver_binding(db, payload.driver_id if payload.driver_id and payload.driver_id > 0 else None, payload.company_id)
     await _apply_status_device_occupy(db, payload)
@@ -912,6 +923,7 @@ async def vehicle_update(
     db: AsyncSession = Depends(get_db),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
+    await require_button_permission(db, x_user_id, (VEHICLE_EDIT,), "编辑")
     vid = int(payload.vehicle_id or 0)
     if vid <= 0:
         raise HTTPException(status_code=400, detail="vehicle_id 必填")
@@ -2093,6 +2105,7 @@ async def vehicle_delete(
     db: AsyncSession = Depends(get_db),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
+    await require_button_permission(db, x_user_id, (VEHICLE_DELETE, VEHICLE_BATCH_DELETE), "删除")
     row = (await db.execute(select(Vehicle).where(Vehicle.id == vehicle_id))).scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=404, detail="车辆不存在")
@@ -2140,6 +2153,52 @@ async def vehicle_jt808_sync_status():
 async def vehicle_jt808_sync_run_once():
     result = await vehicle_jt808_sync_scheduler.run_once()
     return {"ok": True, **result}
+
+
+class AreaCarsIn(BaseModel):
+    min_lng: float
+    min_lat: float
+    max_lng: float
+    max_lat: float
+
+
+@router.post("/area-cars")
+async def vehicle_area_cars(
+    body: AreaCarsIn,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
+    """实时监控框选查车：返回矩形内最后定位，包含离线车辆。坐标为 WGS84。"""
+    min_lng, max_lng = sorted((float(body.min_lng), float(body.max_lng)))
+    min_lat, max_lat = sorted((float(body.min_lat), float(body.max_lat)))
+    if max_lng - min_lng < 1e-7 or max_lat - min_lat < 1e-7:
+        raise HTTPException(status_code=400, detail="请拖拽绘制一块区域")
+    if max_lng - min_lng > 30 or max_lat - min_lat > 30:
+        raise HTTPException(status_code=400, detail="框选范围过大")
+    jt_uid = None
+    plates = None
+    uid = parse_user_id_header(x_user_id)
+    if uid is not None:
+        user = await db.get(SysUser, uid)
+        if user is not None:
+            jt_uid = (getattr(user, "jt808_user_id", None) or "").strip() or None
+            if not jt_uid and (user.username or "").strip():
+                jt_uid = await asyncio.to_thread(jt808_vehicle.lookup_tlingx_user_id, user.username)
+        if await user_has_vehicle_alloc_rules(db, uid):
+            plates = await resolve_allowed_plate_nos(db, uid)
+    try:
+        items = await asyncio.to_thread(
+            jt808_vehicle.search_cars_in_bounds,
+            min_lng,
+            min_lat,
+            max_lng,
+            max_lat,
+            jt808_user_id=jt_uid,
+            plates=plates,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ok": True, "total": len(items), "truncated": len(items) >= 5000, "items": items}
 
 
 @router.get("/companies")

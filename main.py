@@ -40,6 +40,7 @@ from app.jt808_alarm_sync import (
     cleanup_jt808_violations_without_vehicle,
     jt808_alarm_scheduler,
 )
+from app.tamper_alarm_sync import tamper_alarm_scheduler
 from app.obd_speed_monitor import obd_speed_scheduler
 from app.shared_scheduler_flag import obd_speed_flag
 from app.park_alarm_scheduler import park_alarm_scheduler
@@ -336,7 +337,7 @@ async def _background_startup_backfill() -> None:
     from app.user_online_daily import backfill_login_log_org_names, finalize_stale_open_sessions
     from app.obd_speed_monitor import backfill_abnormal_obd_speed_false_alarms
     from app.violation_ai_assessment import backfill_insufficient_evidence_false_alarms
-    from app.violation_risk_backfill import backfill_violation_risk_levels
+    from app.violation_risk_backfill import apply_alarm_type_safety_levels, backfill_violation_risk_levels
     from app.routers.api_driver import backfill_driver_company_from_vehicles
 
     try:
@@ -348,7 +349,13 @@ async def _background_startup_backfill() -> None:
             if driver_filled:
                 logger.info("已补全 %s 条司机的所属公司", driver_filled)
             stale = await finalize_stale_open_sessions(s)
+            await apply_alarm_type_safety_levels(s)
             await backfill_violation_risk_levels(s)
+            from app.button_permissions import backfill_button_permissions
+
+            button_roles = await backfill_button_permissions(s)
+            if button_roles:
+                logger.info("已为 %s 个角色补上用户/车辆按钮权限", button_roles)
             await s.commit()
             if stale:
                 logger.info("启动已补全 %s 条过期未退出会话", stale)
@@ -481,6 +488,7 @@ async def _startup() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("补发道路类型维护权限失败: %s", exc)
     jt808_alarm_scheduler.start()
+    tamper_alarm_scheduler.start()
     try:
         if obd_speed_flag.get_desired(default=True):
             obd_speed_scheduler.start()
@@ -544,6 +552,7 @@ async def _startup() -> None:
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     await jt808_alarm_scheduler.stop()
+    await tamper_alarm_scheduler.stop()
     await obd_speed_scheduler.stop_local()
     try:
         await violation_ai_assessment_scheduler.stop_local()

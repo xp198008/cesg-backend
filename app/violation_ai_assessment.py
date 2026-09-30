@@ -28,7 +28,7 @@ from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models import OrgCompany, Vehicle, VehicleViolation, ViolationAiAssessment
 from app.timeutil import china_now_naive
-from app.violation_filters import is_obd_speed_source, violation_row_is_page_visible
+from app.violation_filters import is_obd_speed_source, is_tamper_alarm_name, violation_row_is_page_visible
 
 _AI_AUTO_FALSE_ALARM_HANDLER = "AI自动评估"
 _AI_AUTO_FALSE_ALARM_REMARK = "AI评估建议为误报，系统自动处理"
@@ -443,6 +443,8 @@ def _should_false_alarm_for_insufficient_evidence(row: VehicleViolation) -> bool
     if is_obd_speed_source(getattr(row, "source", None)):
         return False
     if str(getattr(row, "source", "") or "").strip().lower() == "manual":
+        return False
+    if is_tamper_alarm_name(getattr(row, "violation_type_name", None)):
         return False
     if len(_list_image_urls(row)) < _AI_REQUIRED_IMAGE_COUNT:
         return True

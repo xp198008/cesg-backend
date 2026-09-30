@@ -25,7 +25,7 @@ from app.jt808_violation_sync import lookup_company_name, notify_violation_creat
 from app.alarm_blocked import clear_alarm_blocked, upsert_alarm_blocked
 from app.models import Jt808AlarmSyncState, Vehicle, VehicleDevice, VehicleLocation, VehicleViolation, ViolationTicket
 from app.plate_util import norm_plate
-from app.violation_filters import is_unknown_violation_type_name
+from app.violation_filters import is_tamper_alarm_name, is_unknown_violation_type_name
 
 logger = logging.getLogger(__name__)
 
@@ -658,7 +658,7 @@ async def describe_alarm_block(
         reason = str(gate.get("reason") or "filtered")
         code = {"interval": "interval", "disabled": "type_disabled", "missing": "type_missing"}.get(reason, "type_missing")
         return {**payload, "reason_code": code}
-    if not _has_image_or_video_evidence(media):
+    if not _has_image_or_video_evidence(media) and not is_tamper_alarm_name(type_name):
         return {**payload, "reason_code": "no_evidence"}
     return None
 
@@ -943,7 +943,12 @@ async def cleanup_jt808_violations_without_evidence() -> int:
                 select(VehicleViolation).where(VehicleViolation.source.ilike("jt808%"))
             )
         ).scalars().all()
-        to_delete = [row for row in rows if not _has_image_or_video_evidence(row.ttx_evidence_refs)]
+        to_delete = [
+            row
+            for row in rows
+            if not is_tamper_alarm_name(row.violation_type_name)
+            and not _has_image_or_video_evidence(row.ttx_evidence_refs)
+        ]
         deleted = await _delete_violations_with_tickets(db, to_delete)
         if deleted:
             await db.commit()

@@ -6,13 +6,13 @@ import secrets
 from app.timeutil import china_now_naive
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.alarm_filter import ALLOWED_ALARM_LEVELS, KNOWN_ALARM_TYPE_NAMES, format_alarm_level, load_enabled_rules
 from app.database import get_db
 from app.models import AlarmFilterRule, SysUser, VehicleViolation
-from app.violation_filters import violation_list_visibility
+from app.violation_filters import human_pending_violation_clause, violation_list_visibility
 
 router = APIRouter(prefix="/api/alarm-filter-rule", tags=["alarm-filter-rule"])
 
@@ -106,10 +106,7 @@ async def _ensure_unique(db: AsyncSession, type_name: str, level: str | None, ex
 async def alarm_filter_rule_effect_preview(db: AsyncSession = Depends(get_db)):
     """诊断：过滤规则对当前库内报警记录的影响（便于排查列表未减少问题）。"""
     rules = await load_enabled_rules(db)
-    pending_status = or_(
-        VehicleViolation.status == "待处理",
-        and_(VehicleViolation.status == "待审核", VehicleViolation.pre_audit_kind == "preprocess"),
-    )
+    pending_status = human_pending_violation_clause()
 
     async def _count(extra_visibility):
         stmt = select(func.count()).select_from(VehicleViolation).where(extra_visibility, pending_status)

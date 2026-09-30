@@ -1,4 +1,4 @@
-"""高德 Web 服务 Key：CESG 库优先，失败再从 808 appkey1 刷新并回写。
+"""高德 Web 服务 Key：CESG 库优先；失败可用 808 appkey1 重试，但不覆盖手工保存的 Key。
 
 地图接口管理中的 api_key 是 JS API Key（前端画地图）；
 web_service_key 是 Web 服务 Key（逆地理、轨迹纠偏等）。
@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.jt808_address import get_jt808_regeo_amap_key
 from app.models import MapApiConfig
+from app.timeutil import china_now_naive
 
 _logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ async def save_web_service_key(db: AsyncSession, key: str) -> str:
         )
         db.add(row)
     row.web_service_key = key or None
+    row.updated_at = china_now_naive()
     await db.flush()
     return key
 
@@ -90,8 +92,20 @@ async def ensure_web_service_key(db: AsyncSession) -> tuple[str, str]:
 
 
 async def refresh_web_service_key_after_failure(db: AsyncSession) -> str:
-    """调用失败后：强制从 808 再取一次并同步到库。"""
-    return await sync_web_service_key_from_jt808(db, force_refresh=True)
+    """调用失败后：用 808 appkey1 再试一次。
+
+    库里已有手工保存的 Key 时只返回 808 值供本次重试，不回写覆盖。
+    只有库为空时才把 808 Key 落库。
+    """
+    stored = await get_stored_web_service_key(db)
+    jt808_key = await fetch_jt808_web_service_key(force_refresh=True)
+    if not stored and jt808_key:
+        await save_web_service_key(db, jt808_key)
+        _logger.info("库内 Web 服务 Key 为空，已从 808 补全")
+        return jt808_key
+    if stored and jt808_key and stored != jt808_key:
+        _logger.info("Web 服务调用失败，试用 808 appkey1，不覆盖地图接口管理已保存的 Key")
+    return jt808_key or stored
 
 
 async def with_web_service_key(
@@ -100,7 +114,7 @@ async def with_web_service_key(
     *,
     is_success: Callable[[T], bool],
 ) -> tuple[T | None, str, str]:
-    """用库内 Key 调用；失败则强制从 808 刷新后再调一次，成功则已写入库。
+    """用库内 Key 调用；失败再用 808 appkey1 重试，但不覆盖已保存的手工 Key。
 
     返回 (result_or_None, key_used, source)
     """
@@ -119,7 +133,4 @@ async def with_web_service_key(
         return last, key, source
 
     again = await call(refreshed)
-    if is_success(again):
-        # sync 已写入；若与库一致则无需再写
-        return again, refreshed, "jt808"
     return again, refreshed, "jt808"

@@ -12,7 +12,7 @@ from app.database import get_db
 from app.jt808_alarm_sync import jt808_alarm_type_catalog
 from app.models import AlarmTypeDict, VehicleViolation
 from app.timeutil import china_now_naive
-from app.violation_risk import risk_from_safety_level
+from app.violation_risk import risk_from_safety_level, safety_level_for_alarm_type
 
 router = APIRouter(prefix="/api/alarm-type", tags=["alarm-type"])
 
@@ -154,7 +154,7 @@ async def alarm_type_list(
 
 @router.post("/reset-from-jt808")
 async def alarm_type_reset_from_jt808(db: AsyncSession = Depends(get_db)):
-    """清空报警类型表，并按 808 真实规则灌入（ADAS/DSM 报警×三级；BSD/事件不分级；含 OBD超速；默认启用/中/15分钟）。"""
+    """清空报警类型表，并按 808 真实规则灌入（ADAS/DSM 报警×三级；BSD/事件不分级；含 OBD超速；安全级别按客户分类）。"""
     cleared = await db.scalar(select(func.count()).select_from(AlarmTypeDict)) or 0
     await db.execute(delete(AlarmTypeDict))
     await db.flush()
@@ -167,8 +167,8 @@ async def alarm_type_reset_from_jt808(db: AsyncSession = Depends(get_db)):
             type_code=f"AT{stamp}{index:04d}",
             type_name=name,
             description=None,
-            alarm_level="中级",
-            safety_level="中",
+            alarm_level=_legacy_alarm_level(safety_level_for_alarm_type(name)),
+            safety_level=safety_level_for_alarm_type(name),
             min_interval_minutes=15,
             status="启用",
             data_source="jt808",

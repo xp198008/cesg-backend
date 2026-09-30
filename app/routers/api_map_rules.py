@@ -12,6 +12,7 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_db
+from app.timeutil import china_now_naive
 from app.models import (
     MapApiConfig,
     MapRuleCategory,
@@ -193,28 +194,10 @@ async def map_api_config_put(body: MapApiConfigBody, db: AsyncSession = Depends(
     if body.default_center_lat is not None:
         row.default_center_lat = body.default_center_lat
     row.remark = (body.remark or "").strip() or None
+    row.updated_at = china_now_naive()
     await db.flush()
     await db.refresh(row)
     return {"ok": True, "data": _map_config_out(row)}
-
-
-@router.post("/map-api-config/sync-web-service-key")
-async def map_api_config_sync_web_service_key(
-    provider: str = Query("amap"),
-    db: AsyncSession = Depends(get_db),
-):
-    """从 808 appkey1 强制同步 Web 服务 Key 到 CESG 库。"""
-    from app.amap_web_service_key import sync_web_service_key_from_jt808
-
-    if (provider or "amap").strip() != "amap":
-        return {"ok": False, "message": "仅支持 amap"}
-    key = await sync_web_service_key_from_jt808(db, force_refresh=True)
-    row = await db.scalar(select(MapApiConfig).where(MapApiConfig.provider == "amap").limit(1))
-    return {
-        "ok": bool(key),
-        "message": "已同步" if key else "808 未返回可用 Web 服务 Key（检查 type1=gaode 与 appkey1）",
-        "data": _map_config_out(row) if row else None,
-    }
 
 
 class PublicMapRuleCreateBody(BaseModel):

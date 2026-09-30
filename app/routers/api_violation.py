@@ -55,7 +55,11 @@ from app.violation_ai_assessment import (
     run_violation_ai_assessment,
     stream_violation_ai_assessment,
 )
-from app.violation_filters import violation_list_visibility, violation_row_is_page_visible
+from app.violation_filters import (
+    human_pending_violation_clause,
+    violation_list_visibility,
+    violation_row_is_page_visible,
+)
 from app.violation_manual_ocr import run_violation_manual_ocr
 
 router = APIRouter(prefix="/api/violation", tags=["violation"])
@@ -735,12 +739,7 @@ async def violation_list(
     )
     if status:
         if status == "pending":
-            q = q.where(
-                or_(
-                    VehicleViolation.status == "待处理",
-                    and_(VehicleViolation.status == "待审核", VehicleViolation.pre_audit_kind == "preprocess"),
-                )
-            )
+            q = q.where(human_pending_violation_clause())
         elif status == "handled":
             q = q.where(VehicleViolation.status == "已处理")
         else:

@@ -23,7 +23,7 @@ from app.models import (
 from app.org_scope import collect_org_company_subtree_ids, require_x_org_id_header, wants_org_tree_scope
 from app.alarm_type_gate import load_disabled_alarm_type_names
 from app.jt808_alarm_sync import _strip_alarm_level_suffix
-from app.violation_filters import violation_list_visibility
+from app.violation_filters import human_pending_violation_clause, violation_list_visibility
 
 # docs/ico：1=高危红 / 2=中危黄 / 3=低危绿，对应 alarm_type_dict.safety_level
 _SAFETY_TO_ICON_LEVEL = {"高": "1", "中": "2", "低": "3"}
@@ -136,21 +136,31 @@ def _violation_scope_clause(scoped_company_ids: set[int] | None):
     )
 
 
-async def build_home_stats(db: AsyncSession, x_org_id: str | None) -> dict:
+def _default_alarm_week_bounds() -> tuple[datetime, datetime]:
+    """与报警记录处理页默认「近一周」一致：今天往前 6 天 00:00:00 ～ 今天 23:59:59。"""
+    now = china_now_naive()
+    start = (now - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    return start, end
+
+
+async def build_home_stats(db: AsyncSession, x_org_id: str | None, x_user_id: str | None = None) -> dict:
     scoped_company_ids = await _scoped_company_ids(db, x_org_id)
     scope = _violation_scope_clause(scoped_company_ids)
     filter_rules = await load_disabled_alarm_type_names(db)
     visibility = violation_list_visibility(filter_rules)
 
-    pending_q = select(func.count()).select_from(VehicleViolation).where(
-        visibility,
-        or_(
-            VehicleViolation.status == "待处理",
-            and_(VehicleViolation.status == "待审核", VehicleViolation.pre_audit_kind == "preprocess"),
-        ),
+    # 待处理任务数必须和「报警记录处理」打开时的列表总数一致：同一组织/车辆分配、同一近一周。
+    from app.routers.api_violation import _scoped_query
+
+    week_start, week_end = _default_alarm_week_bounds()
+    pending_q = await _scoped_query(db, x_org_id, filter_rules, x_user_id)
+    pending_q = pending_q.where(
+        human_pending_violation_clause(),
+        VehicleViolation.violation_time >= week_start,
+        VehicleViolation.violation_time <= week_end,
     )
-    if scope is not None:
-        pending_q = pending_q.where(scope)
+    pending_q = pending_q.with_only_columns(func.count()).order_by(None)
 
     start_iso, end_iso = _today_iso_range()
     completed_q = select(func.count()).select_from(VehicleViolation).where(
@@ -299,14 +309,8 @@ async def _board_warnings(db: AsyncSession, scope, now: datetime, filter_rules) 
         key=lambda x: (-int(x.get("count") or 0), str(x.get("name") or "")),
     )
 
-    # 下方明细：当天待处理（不再截最近几小时 / 近7天最新20条）
-    pending_status = or_(
-        VehicleViolation.status == "待处理",
-        and_(
-            VehicleViolation.status == "待审核",
-            VehicleViolation.pre_audit_kind == "preprocess",
-        ),
-    )
+    # 下方明细：当天待人工处理（不含待 AI 分析）
+    pending_status = human_pending_violation_clause()
     recent_rows = (
         await db.execute(
             scoped(

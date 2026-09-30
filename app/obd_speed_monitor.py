@@ -53,6 +53,7 @@ from app.jt808_car_alarm_1303 import (
     OverspeedSession,
     OverspeedTick,
     advance_overspeed_sessions,
+    list_open_overspeed_sessions,
     open_session_count,
     schedule_flush_1303,
     session_status_snapshot,
@@ -205,8 +206,8 @@ async def backfill_abnormal_obd_speed_false_alarms(
 
 _WEATHER_CODE_LABEL = {str(x["code"]): str(x["label"]) for x in WEATHER_TYPE_OPTIONS}
 
-# 即时通知冷却：同车两次语音下发至少间隔（秒），避免临界限速抖动刷屏
-_NOTIFY_COOLDOWN_SEC = 300
+# 已超速语音：同车仍在超速时每 30 秒再播一次，回到限速以内即停
+_NOTIFY_COOLDOWN_SEC = 30
 _notify_cooldown: dict[int, float] = {}
 _notify_cooldown_lock = Lock()
 _notify_bg_tasks: set[asyncio.Task] = set()
@@ -782,7 +783,7 @@ def _cooldown_bucket(at: datetime, interval_minutes: int = 5) -> str:
 
 
 async def _ensure_obd_alarm_type(db: AsyncSession) -> AlarmTypeDict:
-    """字典缺 OBD超速 时自动补一条（启用/中/15分钟），避免闸门把超速全部拒掉。"""
+    """字典缺 OBD超速 时自动补一条（启用/高/15分钟），避免闸门把超速全部拒掉。"""
     row = await load_alarm_type_by_name(db, OBD_VIOLATION_TYPE_NAME)
     if row is not None:
         return row
@@ -791,8 +792,8 @@ async def _ensure_obd_alarm_type(db: AsyncSession) -> AlarmTypeDict:
         type_code=f"AT{stamp}OBD1",
         type_name=OBD_VIOLATION_TYPE_NAME,
         description="OBD 时速监测超速（限速路段/区域）",
-        alarm_level="中级",
-        safety_level="中",
+        alarm_level="高级",
+        safety_level="高",
         min_interval_minutes=15,
         status="启用",
         data_source="obd_speed",
@@ -1601,18 +1602,18 @@ async def _apply_session_pair_flush(
     result: ObdSyncResult,
     overspeed_ticks: dict[int, OverspeedTick],
 ) -> None:
-    """会话结束/拆段：本地违章与 1303 成对落库；新开会话触发即时通知。"""
+    """会话结束/拆段：本地违章与 1303 成对落库；超速未结束则每 30 秒播报已超速。"""
     result.overspeed_active = len(overspeed_ticks)
     try:
-        session_stats, flushes, just_opened = advance_overspeed_sessions(overspeed_ticks)
+        session_stats, flushes, _just_opened = advance_overspeed_sessions(overspeed_ticks)
         result.session_opened = int(session_stats.get("opened") or 0)
         result.session_updated = int(session_stats.get("updated") or 0)
         result.session_closed = int(session_stats.get("closed") or 0)
         result.session_split = int(session_stats.get("split") or 0)
-        for opened in just_opened:
-            if _session_has_abnormal_speed(opened):
+        for active in list_open_overspeed_sessions():
+            if _session_has_abnormal_speed(active):
                 continue
-            schedule_instant_notify(opened)
+            schedule_instant_notify(active)
         pushed = 0
         for session, reason in flushes:
             pair = await _persist_session_pair(session, reason=reason)

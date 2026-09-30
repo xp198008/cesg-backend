@@ -16,10 +16,11 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 @router.get("/home-stats")
 async def dashboard_home_stats(
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
     """快捷桌面业务指标：待处理任务、今日完成任务（808 在线/报警由前端用登录 token 调 /api）。"""
-    return await build_home_stats(db, x_org_id)
+    return await build_home_stats(db, x_org_id, x_user_id)
 
 
 @router.get("/board-stats")

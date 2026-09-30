@@ -625,7 +625,6 @@ _STATUS_PAGE = """<!DOCTYPE html>
       <div class="btns" style="margin-top:14px;margin-bottom:0">
         <button id="btnMapSave">保存</button>
         <button id="btnMapReload" class="ghost">重新加载</button>
-        <button id="btnMapSync" class="ghost">从 808 同步 Web服务 Key</button>
         <span class="muted" id="mapMsg"></span>
       </div>
     </div>
@@ -1449,16 +1448,6 @@ $("btnMapSave").onclick = async () => {
   } catch (e) {
     $("mapMsg").textContent = "保存失败：" + e.message;
     alert("保存失败：" + e.message);
-  }
-};
-$("btnMapSync").onclick = async () => {
-  try {
-    const data = await apiJson("/api/map-api-config/sync-web-service-key?provider=amap", { method: "POST" });
-    alert(data.message || (data.ok ? "已同步" : "同步失败"));
-    if (data.data) fillMapForm(data.data);
-    else loadMapConfig();
-  } catch (e) {
-    alert("同步失败：" + e.message);
   }
 };
 

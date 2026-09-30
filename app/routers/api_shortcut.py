@@ -259,10 +259,11 @@ async def _selected_ids(db: AsyncSession, user_id: int) -> set[str]:
 @router.get("/home-stats")
 async def shortcut_home_stats(
     x_org_id: str | None = Header(None, alias="X-Org-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db),
 ):
-    """快捷桌面业务指标（待处理、今日完成）。"""
-    return await build_home_stats(db, x_org_id)
+    """快捷桌面业务指标（待处理、今日完成）。待处理与报警记录处理默认列表同一口径。"""
+    return await build_home_stats(db, x_org_id, x_user_id)
 
 
 @router.get("/permission-tree")
