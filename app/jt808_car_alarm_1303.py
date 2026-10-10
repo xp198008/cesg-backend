@@ -70,6 +70,8 @@ class OverspeedTick:
     category_id: int | None = None
     instant_notify_enabled: bool = False
     broadcast_content: str | None = None
+    # 防抖确认后的会话终点；缺省时与 at 相同
+    end_at: datetime | None = None
 
 
 @dataclass
@@ -201,7 +203,7 @@ def _new_session(tick: OverspeedTick) -> OverspeedSession:
         start_lat=tick.lat,
         start_lng=tick.lng,
         start_mileage=mileage,
-        end_at=tick.at,
+        end_at=tick.end_at or tick.at,
         end_speed=speed,
         end_lat=tick.lat,
         end_lng=tick.lng,

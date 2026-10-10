@@ -11,6 +11,8 @@ from app.models import VehicleViolation
 
 # 与 obd_speed_monitor.SOURCE_OBD_SPEED 一致：无图片/视频也可展示
 OBD_SPEED_SOURCE = "obd_speed"
+# 禁入/禁出围栏报警：无现场照片，与 OBD 超速一样直接进入处理页
+FENCE_ACCESS_SOURCE = "fence_access"
 
 _UNKNOWN_VIOLATION_TYPE_MARKERS = (
     "未知报警类型",
@@ -87,16 +89,29 @@ def is_obd_speed_source(source: Any) -> bool:
     return str(source or "").strip().lower() == OBD_SPEED_SOURCE
 
 
+def is_fence_access_source(source: Any) -> bool:
+    return str(source or "").strip().lower() == FENCE_ACCESS_SOURCE
+
+
+def is_fence_access_alarm_name(name: Any) -> bool:
+    text = str(name or "")
+    return "禁入报警" in text or "禁出报警" in text
+
+
 def violation_ready_for_human_clause():
     """状态已明确、可以人工处理：OBD/人工录入，或 AI 已评估（ai_queried）。"""
     return or_(
         VehicleViolation.ai_queried.is_(True),
         VehicleViolation.source == OBD_SPEED_SOURCE,
         VehicleViolation.source.ilike(OBD_SPEED_SOURCE),
+        VehicleViolation.source == FENCE_ACCESS_SOURCE,
+        VehicleViolation.source.ilike(FENCE_ACCESS_SOURCE),
         VehicleViolation.source == "manual",
         VehicleViolation.source.ilike("manual"),
         VehicleViolation.violation_type_name.ilike("OBD%"),
         VehicleViolation.violation_type_name.like("%防拆%"),
+        VehicleViolation.violation_type_name.like("%禁入报警%"),
+        VehicleViolation.violation_type_name.like("%禁出报警%"),
     )
 
 
@@ -129,6 +144,10 @@ def violation_row_is_page_visible(row: Any) -> bool:
         return True
     if is_tamper_alarm_name(getattr(row, "violation_type_name", None)):
         return True
+    if is_fence_access_source(getattr(row, "source", None)):
+        return True
+    if is_fence_access_alarm_name(getattr(row, "violation_type_name", None)):
+        return True
     return has_displayable_media_evidence(
         getattr(row, "ttx_evidence_refs", None),
         getattr(row, "stream_snapshot_refs", None),
@@ -160,9 +179,13 @@ def violation_has_media_evidence_clause():
     return or_(
         VehicleViolation.source == OBD_SPEED_SOURCE,
         VehicleViolation.source.ilike(OBD_SPEED_SOURCE),
+        VehicleViolation.source == FENCE_ACCESS_SOURCE,
+        VehicleViolation.source.ilike(FENCE_ACCESS_SOURCE),
         VehicleViolation.source == "manual",
         VehicleViolation.source.ilike("manual"),
         VehicleViolation.violation_type_name.like("%防拆%"),
+        VehicleViolation.violation_type_name.like("%禁入报警%"),
+        VehicleViolation.violation_type_name.like("%禁出报警%"),
         _ttx_or_stream_media_clause(),
     )
 

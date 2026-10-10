@@ -58,6 +58,7 @@ from app.vehicle_alloc_scope import (
     parse_user_id_header,
     resolve_allowed_plate_nos,
     resolve_allowed_vehicle_ids,
+    sync_vehicle_alloc_for_company,
     user_has_vehicle_alloc_rules,
 )
 from app.vehicle_op_log import (
@@ -881,6 +882,7 @@ async def vehicle_create(
     _apply_vehicle_payload(v, co, payload)
     db.add(v)
     await db.flush()
+    await sync_vehicle_alloc_for_company(db, v.id, payload.company_id)
     await _upsert_main_device(db, v.id, payload)
     await _remove_reserve_for_device_no(db, _norm(payload.device_no or ""))
     bare_no = _bare_device_no(payload.device_no)
@@ -930,6 +932,7 @@ async def vehicle_update(
     v = await db.scalar(select(Vehicle).where(Vehicle.id == vid).limit(1))
     if v is None:
         raise HTTPException(status_code=404, detail="车辆不存在")
+    old_company_id = int(v.company_id) if v.company_id else None
     existing_plate = _norm(v.plate_no)
     incoming_plate = _norm(payload.plate_no)
     if existing_plate and incoming_plate and incoming_plate != existing_plate:
@@ -951,6 +954,8 @@ async def vehicle_update(
     )
     await _ensure_unique_plate_and_device(db, payload, vid)
     _apply_vehicle_payload(v, co, payload)
+    if old_company_id != int(payload.company_id):
+        await sync_vehicle_alloc_for_company(db, vid, payload.company_id)
     await _upsert_main_device(db, vid, payload)
     await _remove_reserve_for_device_no(db, _norm(payload.device_no or ""))
     bare_no = _bare_device_no(payload.device_no)
@@ -1556,6 +1561,7 @@ async def import_vehicle_from_carinfos(
             continue
 
         is_new = v is None
+        old_company_id = None if is_new else (int(v.company_id) if v.company_id else None)
         if is_new:
             v = Vehicle(plate_no=plate)
             db.add(v)
@@ -1577,6 +1583,8 @@ async def import_vehicle_from_carinfos(
         v.status = row_status
         v.channel_count = _to_int(_vehicle_import_cell(row, i_channel), 0) or 0
         await db.flush()
+        if is_new or old_company_id != int(company.id):
+            await sync_vehicle_alloc_for_company(db, v.id, int(company.id))
 
         d = (
             await db.execute(
@@ -2198,7 +2206,48 @@ async def vehicle_area_cars(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    plates = [str(it.get("carno") or "").strip() for it in items]
+    plates = [p for p in plates if p]
+    driver_by_plate: dict[str, str] = {}
+    try:
+        for offset in range(0, len(plates), 500):
+            chunk = plates[offset:offset + 500]
+            found = (
+                await db.execute(
+                    select(Vehicle.plate_no, Vehicle.driver_name).where(Vehicle.plate_no.in_(chunk))
+                )
+            ).all()
+            for plate, name in found:
+                driver_by_plate[str(plate)] = (name or "").strip()
+    except Exception:
+        driver_by_plate = {}
+    for it in items:
+        it["driver_name"] = driver_by_plate.get(str(it.get("carno") or "").strip(), "")
     return {"ok": True, "total": len(items), "truncated": len(items) >= 5000, "items": items}
+
+
+@router.get("/follows")
+async def vehicle_follows(
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+):
+    """当前登录用户的关注车辆。直接读 808 库，不经过 1101。"""
+    uid = parse_user_id_header(x_user_id)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="未登录")
+    user = await db.get(SysUser, uid)
+    if user is None:
+        raise HTTPException(status_code=401, detail="未登录")
+    jt_uid = (getattr(user, "jt808_user_id", None) or "").strip() or None
+    if not jt_uid and (user.username or "").strip():
+        jt_uid = await asyncio.to_thread(jt808_vehicle.lookup_tlingx_user_id, user.username)
+    if not jt_uid:
+        return {"ok": True, "total": 0, "items": []}
+    try:
+        items = await asyncio.to_thread(jt808_vehicle.list_followed_cars, jt_uid)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ok": True, "total": len(items), "items": items}
 
 
 @router.get("/companies")

@@ -71,6 +71,20 @@ def is_unreadable_evidence_error(text: str | None) -> bool:
     return any(k in raw for k in keys)
 
 
+def is_model_insufficient_evidence_error(text: str | None) -> bool:
+    """模型已明确不具备自动判定条件：再问结果相同，应直接落误报并让出队列。"""
+    raw = str(text or "")
+    if not raw:
+        return False
+    keys = (
+        "insufficient_evidence",
+        "不具备",
+        "至少需要 3",
+        "至少需要3",
+    )
+    return any(k in raw for k in keys)
+
+
 def _mp4_missing_moov(data: bytes | None) -> bool:
     if not data or len(data) < 16:
         return True
@@ -1927,8 +1941,13 @@ async def run_violation_ai_assessment(
                     last_error = str(exc)
                     logger.warning("video/violation 失败 kind=%s: %s", kind, exc)
 
-            if is_unreadable_evidence_error(last_error):
+            if is_unreadable_evidence_error(last_error) or is_model_insufficient_evidence_error(last_error):
                 existing, auto_false = await _apply_insufficient_evidence_false_alarm(db, row, existing)
+                logger.info(
+                    "模型判定证据不足，直接落误报 violation_id=%s plate=%s",
+                    violation_id,
+                    (row.plate_no or "").strip(),
+                )
                 return {
                     "ok": True,
                     "cached": False,
@@ -2252,6 +2271,27 @@ async def stream_violation_ai_assessment(
                                 "cached": False,
                                 "ai_queried": True,
                                 "source": "video_violation",
+                                "auto_false_alarm": auto_false,
+                                "status": (row.status or "").strip(),
+                                "assessment": _assessment_out(existing),
+                            }
+                        )
+                        return
+
+                    if is_unreadable_evidence_error(last_error) or is_model_insufficient_evidence_error(last_error):
+                        existing, auto_false = await _apply_insufficient_evidence_false_alarm(db, row, existing)
+                        await db.commit()
+                        logger.info(
+                            "模型判定证据不足，直接落误报 violation_id=%s plate=%s",
+                            violation_id,
+                            (row.plate_no or "").strip(),
+                        )
+                        yield _sse(
+                            {
+                                "object": "assessment",
+                                "cached": False,
+                                "ai_queried": True,
+                                "source": "insufficient_evidence",
                                 "auto_false_alarm": auto_false,
                                 "status": (row.status or "").strip(),
                                 "assessment": _assessment_out(existing),

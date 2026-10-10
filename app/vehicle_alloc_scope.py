@@ -3,8 +3,12 @@
 规则：
 - admin：不限制；
 - 用户未绑定任何车辆分配规则：可见所属组织树范围内全部车辆；
-- 用户已绑定一条或多条规则：仅可见这些规则管控车辆的并集。
-  808 监控树在 UI 层按 resolve_monitor_scope 过滤（808 车组权限仍为 company 级）。
+- 用户已绑定一条或多条规则：可见这些规则管控车辆的并集，
+  外加所属组织树中「没有车辆分配规则的公司」名下全部车辆
+  （该公司及上级公司里已绑规则的用户也能看到这些车）。
+车辆信息修改所属公司后，车辆从其他公司的分配规则中移除，并加入新公司的全部规则。
+新公司没有规则时不挂规则，可见范围走上面的组织树。
+808 监控树在 UI 层按 resolve_monitor_scope 过滤（808 车组权限仍为 company 级）。
 """
 from __future__ import annotations
 
@@ -13,18 +17,30 @@ import logging
 import time
 
 import pymysql
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
-from app.models import SysUser, Vehicle, VehicleAllocRuleUser, VehicleAllocRuleVehicle, VehicleDevice
+from app.models import (
+    SysUser,
+    Vehicle,
+    VehicleAllocRule,
+    VehicleAllocRuleUser,
+    VehicleAllocRuleVehicle,
+    VehicleDevice,
+)
 
 logger = logging.getLogger(__name__)
 
 # 选车弹窗每次都会打 monitor-scope；短缓存避免反复扫全表 + 查 808
 _MONITOR_SCOPE_TTL_SEC = 45.0
 _monitor_scope_cache: dict[int, tuple[float, dict[str, object]]] = {}
+
+
+def clear_monitor_scope_cache() -> None:
+    """车辆所属公司或分配规则变化后，监控范围立刻按新关系计算。"""
+    _monitor_scope_cache.clear()
 
 
 def parse_user_id_header(x_user_id: str | None) -> int | None:
@@ -55,6 +71,81 @@ def _effective_user_org_id(user: SysUser) -> int | None:
     return None
 
 
+async def _vehicles_of_companies_without_alloc_rules(
+    db: AsyncSession,
+    company_ids: set[int],
+) -> set[int]:
+    """所属公司没有车辆分配规则的车辆。这些车对本公司及上级公司全员可见。"""
+    if not company_ids:
+        return set()
+    ruled = (
+        await db.execute(
+            select(VehicleAllocRule.company_id)
+            .where(VehicleAllocRule.company_id.in_(company_ids))
+            .distinct()
+        )
+    ).scalars().all()
+    open_ids = company_ids - {int(cid) for cid in ruled if cid is not None}
+    if not open_ids:
+        return set()
+    rows = (
+        await db.execute(select(Vehicle.id).where(Vehicle.company_id.in_(open_ids)))
+    ).scalars().all()
+    return {int(vid) for vid in rows}
+
+
+async def sync_vehicle_alloc_for_company(
+    db: AsyncSession,
+    vehicle_id: int,
+    company_id: int | None,
+) -> None:
+    """车辆信息改所属公司后，同步车辆分配规则里的管控车辆。
+
+    从其他公司的规则中移除，并加入新公司的全部规则。
+    新公司没有规则时不挂任何规则，可见范围由组织树决定。
+    """
+    vid = int(vehicle_id)
+    cid = int(company_id) if company_id else 0
+    if vid < 1 or cid < 1:
+        return
+    other_rule_ids = list(
+        (
+            await db.execute(
+                select(VehicleAllocRule.id).where(VehicleAllocRule.company_id != cid)
+            )
+        ).scalars().all()
+    )
+    if other_rule_ids:
+        await db.execute(
+            delete(VehicleAllocRuleVehicle).where(
+                VehicleAllocRuleVehicle.vehicle_id == vid,
+                VehicleAllocRuleVehicle.rule_id.in_([int(rid) for rid in other_rule_ids]),
+            )
+        )
+    rule_ids = [
+        int(rid)
+        for rid in (
+            await db.execute(select(VehicleAllocRule.id).where(VehicleAllocRule.company_id == cid))
+        ).scalars().all()
+    ]
+    if rule_ids:
+        linked = {
+            int(rid)
+            for rid in (
+                await db.execute(
+                    select(VehicleAllocRuleVehicle.rule_id).where(
+                        VehicleAllocRuleVehicle.vehicle_id == vid,
+                        VehicleAllocRuleVehicle.rule_id.in_(rule_ids),
+                    )
+                )
+            ).scalars().all()
+        }
+        for rid in rule_ids:
+            if rid not in linked:
+                db.add(VehicleAllocRuleVehicle(rule_id=rid, vehicle_id=vid))
+    clear_monitor_scope_cache()
+
+
 async def _resolve_scope_vehicle_ids(db: AsyncSession, user: SysUser) -> tuple[set[int], bool]:
     """计算监控范围车辆 id。
 
@@ -81,7 +172,14 @@ async def _resolve_scope_vehicle_ids(db: AsyncSession, user: SysUser) -> tuple[s
                 )
             )
         ).scalars().all()
-        return {int(vid) for vid in vehicle_ids}, False
+        scoped = {int(vid) for vid in vehicle_ids}
+        org_id = _effective_user_org_id(user)
+        if org_id is not None:
+            from app.org_scope import collect_org_company_subtree_ids
+
+            subtree = await collect_org_company_subtree_ids(db, org_id)
+            scoped |= await _vehicles_of_companies_without_alloc_rules(db, subtree)
+        return scoped, False
 
     org_id = _effective_user_org_id(user)
     if org_id is None:
@@ -145,7 +243,7 @@ async def resolve_allowed_vehicle_ids(
     与 monitor-scope / 业务说明对齐：
     - admin：None（不限制）
     - 未绑定分配规则：所属组织树内车辆
-    - 已绑定规则：规则管控车辆并集
+    - 已绑定规则：规则管控车辆，加上组织树里没有分配规则的公司的车辆
     """
     if user_id is None:
         return None

@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    BigInteger,
     Integer,
     Float,
     JSON,
@@ -408,6 +409,20 @@ class RoadTypeDict(Base):
     sort_order = Column(Integer, nullable=False, server_default="0", default=0)
     created_at = Column(DateTime(timezone=True), default=china_now_naive, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=china_now_naive)
+
+
+class FenceAccessState(Base):
+    """禁入/禁出围栏：车辆相对每条范围的上一次内外状态，用于只在进出瞬间报警。"""
+
+    __tablename__ = "fence_access_state"
+    __table_args__ = (
+        UniqueConstraint("vehicle_id", "rule_id", name="uq_fence_access_vehicle_rule"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    vehicle_id = Column(Integer, nullable=False, index=True)
+    rule_id = Column(Integer, nullable=False, index=True)
+    inside = Column(Boolean, nullable=False, default=False, server_default="0")
+    updated_at = Column(DateTime, nullable=False, default=china_now_naive)
 
 
 class VehicleLocation(Base):
@@ -1105,6 +1120,34 @@ class RoutePlanPreset(Base):
     send_count = Column(Integer, nullable=False, default=0, server_default="0")
     created_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
     updated_at = Column(DateTime, nullable=True)
+
+
+class FtpUploadTask(Base):
+    """历史录像 FTP 上传任务。页面关掉后由后台继续，完成后按车辆、通道、时间固化。"""
+
+    __tablename__ = "ftp_upload_task"
+    __table_args__ = (
+        UniqueConstraint("car_id", "channel", "stime", "etime", name="uq_ftp_upload_span"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    car_id = Column(String(32), nullable=False, index=True)
+    channel = Column(Integer, nullable=False)
+    stime = Column(String(14), nullable=False)
+    etime = Column(String(14), nullable=False)
+    media_type = Column(String(8), nullable=False, default="0", server_default="0")
+    stream_type = Column(String(8), nullable=False, default="0", server_default="0")
+    storage_type = Column(String(8), nullable=False, default="0", server_default="0")
+    expected_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    status = Column(String(16), nullable=False, default="uploading", server_default="uploading", index=True)
+    file_name = Column(String(180), nullable=True)
+    bytes_size = Column(BigInteger, nullable=False, default=0, server_default="0")
+    percent = Column(Integer, nullable=False, default=0, server_default="0")
+    resume_count = Column(Integer, nullable=False, default=0, server_default="0")
+    message = Column(String(256), nullable=True)
+    last_dispatch_at = Column(DateTime, nullable=True)
+    last_growth_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, default=china_now_naive, server_default=func.now(), index=True)
 
 
 class AlarmBlockedRecord(Base):

@@ -15,8 +15,10 @@
 5b. 按车辆坐标查询实况天气，套用类别 weather_speed_limits 调整生效限速
 6. 优先级仲裁（仅重叠时生效）：按规则 ``priority_level`` 1–10，数字越小越高；
    未配置或历史数据默认 5 级；同级多条命中时随机取一条
-7. 超过生效限速 → 维护超速会话（持续只更新终点）；
-   会话结束或满 15 分钟拆段时 **同时** 写本地 OBD超速 + 后台 1303（1:1）
+7. 超过生效限速后先做防抖：在配置的秒数内连续重读 OBD 车速，
+   任一采样未超速则放弃、下次超速重新计时；连续达到该时长才开会话。
+   会话结束或满 15 分钟拆段，且持续时长达到防抖秒数时，
+   **同时** 写本地 OBD超速 + 后台 1303（1:1）
 """
 from __future__ import annotations
 
@@ -24,10 +26,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
@@ -85,6 +89,35 @@ OBD_VIOLATION_TYPE_NAME = "OBD超速"
 OBD_VIOLATION_TYPE_ALIASES = ("OBD超速", "OBD限速路段超速", "OBD区域超速")
 _ABNORMAL_SPEED_HANDLER = "系统自动判定"
 _PREVIEW_SPEED_KEYS = ("obd_speed_kmh", "start_speed_kmh", "end_speed_kmh", "peak_speed_kmh")
+
+
+_DEBOUNCE_DEFAULT_SECONDS = 5
+_DEBOUNCE_MAX_SECONDS = 300
+
+
+def _debounce_path() -> Path:
+    raw = (os.getenv("CESG_SCHEDULER_LOCK") or "").strip()
+    base = Path(raw).parent if raw else Path("/tmp")
+    return base / "obd_speed_debounce.seconds"
+
+
+def get_overspeed_debounce_seconds() -> int:
+    """超速防抖秒数。连续超速达到该时长才允许生成报警，默认 5 秒，0 表示不防抖。"""
+    path = _debounce_path()
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        seconds = int(text)
+    except (OSError, ValueError):
+        return _DEBOUNCE_DEFAULT_SECONDS
+    return max(0, min(_DEBOUNCE_MAX_SECONDS, seconds))
+
+
+def set_overspeed_debounce_seconds(seconds: int) -> int:
+    value = max(0, min(_DEBOUNCE_MAX_SECONDS, int(seconds)))
+    path = _debounce_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(value), encoding="utf-8")
+    return value
 
 
 def abnormal_obd_speed_limit_kmh() -> float:
@@ -674,19 +707,8 @@ async def _load_candidates_for_vehicle(db: AsyncSession, vehicle_id: int) -> lis
     return out
 
 
-async def resolve_vehicle_rule_speed(
-    db: AsyncSession,
-    *,
-    vehicle: Vehicle,
-    lng: float,
-    lat: float,
-    coord_is_wgs84: bool = True,
-    weather_text: str | None = None,
-    weather_type_code: str | None = None,
-) -> dict[str, Any]:
-    """按车辆当前位置命中用户已分配的地图规则，重叠时走同一套优先级。"""
-    candidates = await _load_candidates_for_vehicle(db, int(vehicle.id))
-    empty = {
+def _empty_rule_speed() -> dict[str, Any]:
+    return {
         "hit": False,
         "speed_limit_kmh": None,
         "rule_id": None,
@@ -697,17 +719,21 @@ async def resolve_vehicle_rule_speed(
         "hit_count": 0,
         "weather_type_code": None,
     }
-    if not candidates:
-        return empty
+
+
+def _winner_at_point(
+    candidates: list[RuleHit],
+    lng: float,
+    lat: float,
+    *,
+    coord_is_wgs84: bool,
+    weather_code: str,
+) -> tuple[RuleHit | None, int]:
+    """已加载的车辆规则上，按一个坐标挑出生效限速。返回 (命中, 参与仲裁的条数)。"""
     if coord_is_wgs84:
         lng_gcj, lat_gcj = wgs84_to_gcj02(float(lng), float(lat))
     else:
         lng_gcj, lat_gcj = float(lng), float(lat)
-    weather_code = (weather_type_code or "").strip().lower()
-    if not weather_code and (weather_text or "").strip():
-        weather_code = weather_text_to_type_code(weather_text)
-    if not weather_code:
-        weather_code = await _weather_code_at(float(lat), float(lng))
     buffer_m = float(settings.obd_polyline_buffer_m)
     hits: list[RuleHit] = []
     for h in candidates:
@@ -724,9 +750,12 @@ async def resolve_vehicle_rule_speed(
                 weather_rule_row=h.weather_rule_row,
             )
         )
-    winner = arbitrate(hits, stable=True)
+    return arbitrate(hits, stable=True), len(hits)
+
+
+def _rule_speed_payload(winner: RuleHit | None, hit_count: int, weather_code: str) -> dict[str, Any]:
     if winner is None:
-        return {**empty, "weather_type_code": weather_code, "hit_count": 0}
+        return {**_empty_rule_speed(), "weather_type_code": weather_code or None, "hit_count": 0}
     return {
         "hit": True,
         "speed_limit_kmh": int(winner.limit_kmh),
@@ -735,9 +764,96 @@ async def resolve_vehicle_rule_speed(
         "category_name": (winner.category.type_name or "").strip() or None,
         "priority_rank": rule_user_priority(winner),
         "priority_level": rule_user_priority(winner),
-        "hit_count": len(hits),
-        "weather_type_code": weather_code,
+        "hit_count": hit_count,
+        "weather_type_code": weather_code or None,
     }
+
+
+async def resolve_vehicle_rule_speed(
+    db: AsyncSession,
+    *,
+    vehicle: Vehicle,
+    lng: float,
+    lat: float,
+    coord_is_wgs84: bool = True,
+    weather_text: str | None = None,
+    weather_type_code: str | None = None,
+) -> dict[str, Any]:
+    """按车辆当前位置命中用户已分配的地图规则，重叠时走同一套优先级。"""
+    candidates = await _load_candidates_for_vehicle(db, int(vehicle.id))
+    if not candidates:
+        return _empty_rule_speed()
+    weather_code = (weather_type_code or "").strip().lower()
+    if not weather_code and (weather_text or "").strip():
+        weather_code = weather_text_to_type_code(weather_text)
+    if not weather_code:
+        weather_code = await _weather_code_at(float(lat), float(lng))
+    winner, hit_count = _winner_at_point(
+        candidates,
+        lng,
+        lat,
+        coord_is_wgs84=coord_is_wgs84,
+        weather_code=weather_code,
+    )
+    return _rule_speed_payload(winner, hit_count, weather_code)
+
+
+async def resolve_vehicle_rule_speeds(
+    db: AsyncSession,
+    *,
+    vehicle: Vehicle,
+    points: list[tuple[float, float]],
+    coord_is_wgs84: bool = True,
+) -> list[int | None]:
+    """同一辆车的一批坐标，各点返回生效限速。规则只加载一次，相近点复用结果。"""
+    count = len(points)
+    if count == 0:
+        return []
+    candidates = await _load_candidates_for_vehicle(db, int(vehicle.id))
+    if not candidates:
+        return [None] * count
+
+    cell_keys: list[str | None] = []
+    cells: dict[str, tuple[float, float]] = {}
+    for lng, lat in points:
+        try:
+            flng = float(lng)
+            flat = float(lat)
+        except (TypeError, ValueError):
+            cell_keys.append(None)
+            continue
+        if not (flng == flng and flat == flat):
+            cell_keys.append(None)
+            continue
+        key = f"{flng:.4f},{flat:.4f}"
+        cell_keys.append(key)
+        cells.setdefault(key, (flng, flat))
+
+    grids: dict[str, tuple[float, float]] = {}
+    for flng, flat in cells.values():
+        grids.setdefault(f"{round(flat, 2)}:{round(flng, 2)}", (flat, flng))
+    weather_by_grid: dict[str, str] = {}
+    if grids:
+        sem = asyncio.Semaphore(4)
+
+        async def _one(gkey: str, flat: float, flng: float) -> None:
+            async with sem:
+                weather_by_grid[gkey] = await _weather_code_at(flat, flng)
+
+        await asyncio.gather(*(_one(gkey, flat, flng) for gkey, (flat, flng) in grids.items()))
+
+    limits_by_cell: dict[str, int | None] = {}
+    for key, (flng, flat) in cells.items():
+        gkey = f"{round(flat, 2)}:{round(flng, 2)}"
+        winner, _hit_count = _winner_at_point(
+            candidates,
+            flng,
+            flat,
+            coord_is_wgs84=coord_is_wgs84,
+            weather_code=weather_by_grid.get(gkey) or "",
+        )
+        limits_by_cell[key] = int(winner.limit_kmh) if winner is not None else None
+    return [None if key is None else limits_by_cell.get(key) for key in cell_keys]
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +881,7 @@ class ObdSyncResult:
     session_split: int = 0
     alarm_1303_pushed: int = 0
     warn_scheduled: int = 0
+    debounce_dropped: int = 0
     open_sessions: int = 0
     error: str | None = None
     detail: list[dict[str, Any]] = field(default_factory=list)
@@ -1234,8 +1351,112 @@ async def run_obd_speed_check_once() -> ObdSyncResult:
             )
         await db.commit()
 
+    await _apply_debounce_hold(result, overspeed_ticks)
     await _apply_session_pair_flush(result, overspeed_ticks)
     return result
+
+
+async def _latest_speed_kmh(device_no: str) -> float | None:
+    """防抖窗口内重读该车最新 OBD 车速。Redis 与能耗快照取更新的一条。"""
+    readings: list[ObdReading] = []
+    redis = _new_redis()
+    try:
+        variants = _terminal_variants(device_no) or [device_no]
+        for variant in variants:
+            payload = await redis.get(f"{variant}_OBD")
+            if not payload:
+                continue
+            text = payload if isinstance(payload, str) else str(payload)
+            reading = parse_obd_payload(str(variant), text)
+            if reading is not None:
+                readings.append(reading)
+            break
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("防抖读取 Redis OBD 失败 device=%s: %s", device_no, exc)
+    finally:
+        try:
+            await redis.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        async with AsyncSessionLocal() as db:
+            raw, _mapped = await _latest_energy_raw(db, device_no)
+        if raw:
+            reading = parse_obd_payload(device_no, raw)
+            if reading is not None:
+                readings.append(reading)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("防抖读取能耗快照失败 device=%s: %s", device_no, exc)
+    merged = _merge_readings(readings)
+    if not merged:
+        return None
+    best = next(iter(merged.values()))
+    if best.report_at is not None:
+        stale_after = timedelta(seconds=max(30, int(settings.obd_stale_seconds)))
+        if china_now_naive() - best.report_at > stale_after:
+            return None
+    return float(best.speed_kmh)
+
+
+def _speed_still_over_limit(speed: float | None, limit_kmh: float) -> bool:
+    if speed is None or limit_kmh <= 0:
+        return False
+    if speed <= float(settings.obd_min_speed_kmh):
+        return False
+    if is_abnormal_obd_speed(speed):
+        return False
+    return speed > limit_kmh
+
+
+async def _confirm_overspeed_hold(device_no: str, limit_kmh: float, seconds: int) -> bool:
+    """在防抖时长内每秒重读一次 OBD。任一采样未连续超速则放弃。"""
+    if seconds <= 0:
+        return True
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        await asyncio.sleep(1)
+        speed = await _latest_speed_kmh(device_no)
+        if not _speed_still_over_limit(speed, limit_kmh):
+            return False
+    return True
+
+
+async def _apply_debounce_hold(result: ObdSyncResult, ticks: dict[int, OverspeedTick]) -> None:
+    """尚无超速会话的车辆先做连续超速确认；未通过的从本轮超速集合移除。"""
+    seconds = get_overspeed_debounce_seconds()
+    if seconds <= 0 or not ticks:
+        return
+    open_ids = {int(session.vehicle_id) for session in list_open_overspeed_sessions()}
+    pending = [vid for vid in list(ticks) if vid not in open_ids]
+    if not pending:
+        return
+    sem = asyncio.Semaphore(6)
+
+    async def _one(vid: int) -> None:
+        tick = ticks.get(vid)
+        if tick is None:
+            return
+        limit = float(tick.limit_kmh or 0)
+        async with sem:
+            ok = await _confirm_overspeed_hold(tick.device_id, limit, seconds)
+        if not ok:
+            ticks.pop(vid, None)
+            result.debounce_dropped += 1
+            logger.info(
+                "超速防抖放弃 plate=%s device=%s limit=%s window=%ss",
+                tick.plate_no or "-",
+                tick.device_id,
+                limit,
+                seconds,
+            )
+            return
+        finished = china_now_naive()
+        tick.end_at = finished
+        start_floor = finished - timedelta(seconds=seconds)
+        if tick.at > start_floor:
+            tick.at = start_floor
+
+    await asyncio.gather(*(_one(vid) for vid in pending))
 
 
 async def _persist_session_pair(session: OverspeedSession, *, reason: str) -> dict[str, bool]:
@@ -1611,11 +1832,24 @@ async def _apply_session_pair_flush(
         result.session_closed = int(session_stats.get("closed") or 0)
         result.session_split = int(session_stats.get("split") or 0)
         for active in list_open_overspeed_sessions():
+            if active.duration_sec() < get_overspeed_debounce_seconds():
+                continue
             if _session_has_abnormal_speed(active):
                 continue
             schedule_instant_notify(active)
         pushed = 0
+        debounce_sec = get_overspeed_debounce_seconds()
         for session, reason in flushes:
+            if session.duration_sec() < debounce_sec:
+                result.debounce_dropped += 1
+                logger.info(
+                    "超速未达防抖时长，不生成报警 plate=%s duration=%ss need=%ss reason=%s",
+                    session.plate_no or "-",
+                    session.duration_sec(),
+                    debounce_sec,
+                    reason,
+                )
+                continue
             pair = await _persist_session_pair(session, reason=reason)
             if pair.get("local"):
                 result.violations_inserted += 1
@@ -1801,6 +2035,7 @@ class ObdSpeedScheduler:
             "redis": f"{settings.obd_redis_host}:{settings.obd_redis_port}/{settings.obd_redis_db}",
             "min_speed_kmh": settings.obd_min_speed_kmh,
             "max_speed_kmh": abnormal_obd_speed_limit_kmh(),
+            "debounce_seconds": get_overspeed_debounce_seconds(),
             "push_1303_enabled": bool(getattr(settings, "obd_speed_push_1303_enabled", True)),
             "session_max_seconds": int(getattr(settings, "obd_speed_session_max_seconds", 900) or 900),
             "open_overspeed_sessions": open_session_count(),
@@ -1853,6 +2088,8 @@ class ObdSpeedScheduler:
             local_n = 0
             alarm_n = 0
             for session, reason in pending:
+                if session.duration_sec() < get_overspeed_debounce_seconds():
+                    continue
                 pair = await _persist_session_pair(session, reason=reason)
                 if pair.get("local"):
                     local_n += 1

@@ -18,10 +18,16 @@ from app.jt808_obd_fuel_sync import (
     jt808_obd_fuel_sync_status,
 )
 from app.jt808_violation_sync import TABLE_NAME, jt808_violation_sync_status
-from app.obd_speed_monitor import backfill_obd_speed_violation_limits, obd_speed_scheduler, ping_redis
+from app.obd_speed_monitor import (
+    backfill_obd_speed_violation_limits,
+    obd_speed_scheduler,
+    ping_redis,
+    set_overspeed_debounce_seconds,
+)
 from app.park_alarm_scheduler import park_alarm_scheduler
 from app.vehicle_jt808_sync import queue_snapshot, vehicle_jt808_sync_scheduler
 from app.org_jt808_sync import org_jt808_sync_scheduler
+from app.ftp_video_upload import upload_queue_snapshot
 
 router = APIRouter(tags=["obd-speed-check"])
 
@@ -68,6 +74,7 @@ async def obd_speed_check_status():
         "park_alarm_scheduler": park_alarm_scheduler.status(),
         "vehicle_jt808_sync": vehicle_sync_info,
         "org_jt808_sync": org_jt808_sync_scheduler.status(),
+        "ftp_upload": await upload_queue_snapshot(),
     }
 
 
@@ -122,6 +129,21 @@ async def obd_speed_check_stop():
     """停止定时调度（服务重启后会再次自动启动）。"""
     await obd_speed_scheduler.stop()
     return {"ok": True, "scheduler": obd_speed_scheduler.status()}
+
+
+class OverspeedDebounceBody(BaseModel):
+    seconds: int = Field(5, ge=0, le=300)
+
+
+@router.post("/api/obd-speed-check/debounce")
+async def obd_speed_check_debounce(body: OverspeedDebounceBody):
+    """保存超速防抖时长（秒）。连续超速达到该时长才生成报警，0 表示不防抖。"""
+    seconds = set_overspeed_debounce_seconds(body.seconds)
+    return {
+        "ok": True,
+        "debounce_seconds": seconds,
+        "scheduler": obd_speed_scheduler.status(),
+    }
 
 
 @router.post("/api/obd-speed-check/vehicle-sync/run-once")
@@ -418,6 +440,17 @@ _STATUS_PAGE = """<!DOCTYPE html>
       <button id="btnRun" class="ghost">立即执行一轮检测</button>
     </div>
     <div class="card">
+      <h2>超速防抖</h2>
+      <p class="muted" style="margin-bottom:10px">检测到超速后，在该时长内连续重读 OBD 车速。任一次没有超速就放弃本次，下次超速重新计时。连续达到该时长才生成报警。默认 5 秒，填 0 表示不防抖。</p>
+      <div class="btns" style="margin:0">
+        <label>防抖时长
+          <input id="debounceSec" type="number" min="0" max="300" value="5" style="width:88px"> 秒
+        </label>
+        <button id="btnDebounce" type="button">保存</button>
+      </div>
+      <div id="debounceMsg" class="muted" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
       <h2><span class="dot" id="dotRedis"></span>Redis 连接</h2>
       <table id="tblRedis"><tr><td>状态</td><td>尚未测试，点击上方"测试 Redis 连接"</td></tr></table>
       <div id="sampleWrap" style="display:none">
@@ -456,6 +489,11 @@ _STATUS_PAGE = """<!DOCTYPE html>
         <button id="btnParkAlarmReset" class="ghost">清空游标并重扫窗口</button>
       </div>
       <table id="tblParkAlarm"><tr><td colspan="2">加载中…</td></tr></table>
+    </div>
+    <div class="card">
+      <h2><span class="dot" id="dotFtpUpload"></span>历史录像上传调度</h2>
+      <p class="muted" style="margin-bottom:10px">页面点上传只把任务写入队列。这里的调度每 5 秒执行，同时最多 2 辆车下发上传指令。同一辆车 15 秒内重复点击不会再次入库。</p>
+      <table id="tblFtpUpload"><tr><td colspan="2">加载中…</td></tr></table>
     </div>
     <div class="card">
       <h2><span class="dot" id="dotRun"></span>最近一轮执行结果</h2>
@@ -813,14 +851,18 @@ function renderStatus(data) {
     row("Redis 目标", esc(s.redis)) +
     row("最低处理时速", esc(s.min_speed_kmh) + " km/h") +
     row("最高处理时速", esc(s.max_speed_kmh) + " km/h（超过按误报）") +
+    row("超速防抖时长", esc(s.debounce_seconds == null ? 5 : s.debounce_seconds) + " 秒（连续超速达到后才报警）") +
     row("轨迹纠偏", '<span class="okc">已启用（高德 GraspRoad）</span>') +
     row("JT808 定位接口", data.jt808_openapi_configured ? '<span class="okc">已配置</span>' : '<span class="err">未配置（无法取车辆坐标）</span>') +
     row("最近执行时间", esc(s.last_run_at || "从未执行"));
   renderSync(data.violation_sync || {});
   renderFuelSync(data.obd_fuel_sync || {});
   renderParkAlarm(data.park_alarm_scheduler || {});
+  renderFtpUpload(data.ftp_upload || {});
   renderVehicleSync(data.vehicle_jt808_sync || {});
-  renderRun(s.last_result, s.last_error);
+    renderRun(s.last_result, s.last_error);
+  const deb = $("debounceSec");
+  if (deb && document.activeElement !== deb && s.debounce_seconds != null) deb.value = s.debounce_seconds;
 }
 
 function renderVehicleSync(vs) {
@@ -878,6 +920,33 @@ function renderParkAlarm(ps) {
     html += row("说明", `<span class="err">${esc(ps.last_error || m.error)}</span>`);
   }
   $("tblParkAlarm").innerHTML = html;
+}
+
+function renderFtpUpload(info) {
+  const ps = info.running || {};
+  const counts = info.counts || {};
+  const queued = (counts.queued || {}).tasks || 0;
+  const uploading = (counts.uploading || {}).tasks || 0;
+  const done = (counts.done || {}).tasks || 0;
+  const cars = (counts.uploading || {}).cars || 0;
+  let dot = "bad";
+  if (ps.running && !ps.last_error) dot = "ok";
+  else if (ps.running) dot = "warn";
+  const el = $("dotFtpUpload");
+  if (el) el.className = "dot " + dot;
+  const box = $("tblFtpUpload");
+  if (!box) return;
+  let html =
+    row("循环运行中", ps.running ? '<span class="okc">运行中</span>' : '<span class="err">已停止</span>') +
+    row("扫描间隔", esc(ps.interval_seconds || 5) + " 秒") +
+    row("同时上传车辆上限", `<b>${esc(ps.max_active_cars || 2)}</b> 辆`) +
+    row("连点保护", esc(ps.click_gap_seconds || 15) + " 秒内重复点击不重复入库") +
+    row("排队段数", `<b>${esc(queued)}</b>`) +
+    row("正在上传段数", `<b>${esc(uploading)}</b> / ${esc(cars)} 辆车`) +
+    row("已完成段数", `<b>${esc(done)}</b>`) +
+    row("最近执行时间", esc(ps.last_run_at || "尚未执行"));
+  if (ps.last_error) html += row("说明", `<span class="err">${esc(ps.last_error)}</span>`);
+  box.innerHTML = html;
 }
 
 function renderSync(vs) {
@@ -1162,6 +1231,34 @@ $("btnToggle").onclick = async () => {
     alert("操作失败：" + e);
   }
   renderToggleBtn();
+  loadStatus();
+};
+
+$("btnDebounce").onclick = async () => {
+  const btn = $("btnDebounce");
+  const msg = $("debounceMsg");
+  const seconds = Number($("debounceSec").value);
+  if (!Number.isFinite(seconds) || seconds < 0 || seconds > 300) {
+    msg.textContent = "请填写 0 到 300 之间的秒数";
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const res = await authFetch("/api/obd-speed-check/debounce", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seconds: Math.round(seconds) }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      msg.textContent = "保存失败：" + (data.detail || res.status);
+      return;
+    }
+    msg.textContent = "已保存，当前防抖 " + data.debounce_seconds + " 秒";
+  } catch (e) {
+    msg.textContent = "保存失败：" + e;
+  }
+  btn.disabled = false;
   loadStatus();
 };
 

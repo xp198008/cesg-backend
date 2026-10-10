@@ -24,7 +24,7 @@ from app.models import (
     Vehicle,
 )
 from app.jt808_alarm_sync import _vehicle_by_plate, _vehicle_by_terminal
-from app.obd_speed_monitor import resolve_vehicle_rule_speed
+from app.obd_speed_monitor import resolve_vehicle_rule_speed, resolve_vehicle_rule_speeds
 from app.org_scope import require_user_company_subtree_ids
 from app.vehicle_alloc_scope import parse_user_id_header
 
@@ -566,6 +566,49 @@ async def private_map_rules_resolve_at(
         weather_text=weather,
     )
     return {"ok": True, "vehicle_id": vehicle.id, "plate_no": vehicle.plate_no, **data}
+
+
+class ResolveTrackPoint(BaseModel):
+    lng: float
+    lat: float
+
+
+class ResolveTrackBody(BaseModel):
+    plate_no: str | None = None
+    device_no: str | None = None
+    vehicle_id: int | None = None
+    coord: str | None = "wgs84"
+    points: list[ResolveTrackPoint] = Field(default_factory=list, max_length=8000)
+
+
+@router.post("/private-map-rules/resolve-track")
+async def private_map_rules_resolve_track(
+    body: ResolveTrackBody,
+    db: AsyncSession = Depends(get_db),
+):
+    """行驶轨迹明细：同一辆车的一批坐标，按已分配地图规则返回各点限速。"""
+    vehicle = None
+    if body.vehicle_id:
+        vehicle = await db.scalar(select(Vehicle).where(Vehicle.id == int(body.vehicle_id)).limit(1))
+    if vehicle is None and (body.plate_no or "").strip():
+        vehicle = await _vehicle_by_plate(db, body.plate_no)
+    if vehicle is None and (body.device_no or "").strip():
+        vehicle = await _vehicle_by_terminal(db, body.device_no)
+    if vehicle is None:
+        return {"ok": True, "hit": False, "limits": [None] * len(body.points), "message": "未匹配到车辆档案"}
+    coord_is_wgs84 = str(body.coord or "wgs84").strip().lower() != "gcj02"
+    limits = await resolve_vehicle_rule_speeds(
+        db,
+        vehicle=vehicle,
+        points=[(float(p.lng), float(p.lat)) for p in body.points],
+        coord_is_wgs84=coord_is_wgs84,
+    )
+    return {
+        "ok": True,
+        "vehicle_id": vehicle.id,
+        "plate_no": vehicle.plate_no,
+        "limits": limits,
+    }
 
 
 class MapRuleCategoryCreateBody(BaseModel):

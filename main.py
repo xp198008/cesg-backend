@@ -44,6 +44,8 @@ from app.tamper_alarm_sync import tamper_alarm_scheduler
 from app.obd_speed_monitor import obd_speed_scheduler
 from app.shared_scheduler_flag import obd_speed_flag
 from app.park_alarm_scheduler import park_alarm_scheduler
+from app.fence_access_monitor import fence_access_scheduler
+from app.ftp_video_upload import ftp_upload_scheduler
 from app.redis_queue_consumer import redis_queue_scheduler
 from app.vehicle_jt808_sync import vehicle_jt808_sync_scheduler
 from app.org_jt808_sync import org_jt808_sync_scheduler
@@ -481,6 +483,7 @@ async def _startup() -> None:
         logger.warning("启动同步 Web 服务 Key 失败: %s", exc)
     await api_vehicle_type.ensure_default_vehicle_types()
     await api_road_type.ensure_default_road_types()
+    await api_road_type.ensure_fence_road_types()
     try:
         from app.permission_bootstrap import grant_road_type_permission
 
@@ -508,6 +511,14 @@ async def _startup() -> None:
         park_alarm_scheduler.start()
     except Exception as exc:  # noqa: BLE001
         logger.warning("停车超限报警调度未启用: %s", exc)
+    try:
+        fence_access_scheduler.start()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("禁入/禁出围栏报警调度未启用: %s", exc)
+    try:
+        ftp_upload_scheduler.start()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("录像上传进度调度未启用: %s", exc)
     try:
         vehicle_jt808_sync_scheduler.start()
     except Exception as exc:  # noqa: BLE001
@@ -567,6 +578,14 @@ async def _shutdown() -> None:
     await redis_queue_scheduler.stop()
     try:
         await park_alarm_scheduler.stop()
+    except Exception:
+        pass
+    try:
+        await fence_access_scheduler.stop()
+    except Exception:
+        pass
+    try:
+        await ftp_upload_scheduler.stop()
     except Exception:
         pass
     try:

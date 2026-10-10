@@ -641,6 +641,42 @@ async def _sync_delete(device_no: str | None, plate_no: str | None = None) -> bo
     return ok
 
 
+def list_followed_cars(jt808_user_id: str | None) -> list[dict]:
+    """当前 808 用户的关注车辆，直接读 tgps_car_follow / tgps_car。"""
+    uid = (jt808_user_id or "").strip()
+    if not uid:
+        return []
+    conn = _connect_mysql()
+    if conn is None:
+        raise RuntimeError("808 车辆库不可用")
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT c.id, c.carno, c.online, c.tid, c.speed, c.gpstime, IFNULL(g.name, '') "
+            "FROM tgps_car c "
+            "INNER JOIN tgps_car_follow f ON f.car_id = c.id "
+            "LEFT JOIN tgps_group g ON g.id = c.group_id "
+            "WHERE f.user_id = %s "
+            "ORDER BY c.online DESC, c.gpstime DESC",
+            (uid,),
+        )
+        rows = []
+        for row in cur.fetchall():
+            car_id, carno, online, tid, speed, gpstime, group_name = row
+            rows.append({
+                "id": car_id,
+                "carno": carno or "",
+                "online": 1 if str(online) == "1" else 0,
+                "tid": tid or "",
+                "speed": speed,
+                "gpstime": gpstime or "",
+                "group_name": group_name or "",
+            })
+        return rows
+    finally:
+        conn.close()
+
+
 def lookup_tlingx_user_id(account: str) -> str | None:
     """按登录账号找 808 用户 id，供区域查车按组织过滤。"""
     name = (account or "").strip()

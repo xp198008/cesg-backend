@@ -438,5 +438,31 @@ class Jt808OpenApiClient:
         }
         return await self._post(payload)
 
+    async def upload_history_video(
+        self,
+        *,
+        device_id: str,
+        channel: str,
+        stime: str,
+        etime: str,
+        media_type: str = "0",
+        stream_type: str = "0",
+        storage_type: str = "0",
+    ) -> dict[str, Any]:
+        """1114 下发 0x9206，终端把该时段录像上传到 JT1078_FTP。"""
+        return await self._post(
+            {
+                "apicode": 1114,
+                "lingxtoken": await self.token(),
+                "deviceId": str(device_id or "").strip(),
+                "channel": str(channel),
+                "stime": str(stime or "").strip(),
+                "etime": str(etime or "").strip(),
+                "type": str(media_type or "0"),
+                "mltype": str(stream_type or "0"),
+                "zcqtype": str(storage_type or "0"),
+            }
+        )
+
 
 jt808_openapi_client = Jt808OpenApiClient()

@@ -71,6 +71,33 @@ def _row_out(row: RoadTypeDict) -> dict:
     }
 
 
+FENCE_ROAD_TYPES = (
+    ("禁入范围", "车辆进入该范围时产生禁入报警"),
+    ("禁出范围", "车辆驶出该范围时产生禁出报警"),
+)
+
+
+async def ensure_fence_road_types() -> None:
+    """地图管理用的禁入/禁出范围。已有同名类型时不覆盖。"""
+    async with AsyncSessionLocal() as db:
+        for index, (name, desc) in enumerate(FENCE_ROAD_TYPES, start=90):
+            exists = await db.scalar(
+                select(RoadTypeDict.id).where(RoadTypeDict.type_name == name).limit(1)
+            )
+            if exists is not None:
+                continue
+            db.add(
+                RoadTypeDict(
+                    type_code=await _allocate_unique_type_code(db),
+                    type_name=name,
+                    description=desc,
+                    sort_order=index,
+                )
+            )
+            await db.flush()
+        await db.commit()
+
+
 async def ensure_default_road_types() -> None:
     """空库首次启动时写入常用道路类型。"""
     async with AsyncSessionLocal() as db:

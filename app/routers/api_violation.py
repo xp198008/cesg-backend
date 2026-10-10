@@ -579,6 +579,7 @@ def _row_out(
             "jt808_dsm": "JT808 DSM",
             "manual": "人工录入",
             "obd_speed": "OBD超速",
+            "fence_access": "禁入禁出",
         }.get((row.source or "").strip(), row.source or ""),
         "speed_limit_display": _speed_limit_display_from_row(row),
         "obd_speed_display": _obd_speed_display_from_row(row),

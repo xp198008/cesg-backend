@@ -12,8 +12,8 @@
 - 尚未 AI 评估
 - 有图片或视频证据
 
-证据不足（未满 3 张图 + 1 段有效视频）时 ``run_violation_ai_assessment``
-会立刻按误报落库，不再延后等待。
+证据不足（未满 3 张图 + 1 段有效视频，或模型明确回复不具备自动判定条件）时
+``run_violation_ai_assessment`` 会立刻按误报落库，不再延后等待。
 
 复用 ``run_violation_ai_assessment``（与处理弹窗同一套规则）。
 """
@@ -46,8 +46,10 @@ from app.scheduler_lock import should_run_schedulers
 from app.timeutil import china_now_naive, china_today
 from app.violation_ai_assessment import (
     AiRefusalError,
+    _apply_insufficient_evidence_false_alarm,
     backfill_ai_suggested_false_alarms,
     backfill_reset_refused_assessments,
+    is_model_insufficient_evidence_error,
     is_unreadable_evidence_error,
     run_violation_ai_assessment,
 )
@@ -283,25 +285,37 @@ async def run_violation_ai_assess_once() -> AiAssessRoundResult:
             result.errors += 1
             item["result"] = "error"
             item["reason"] = str(exc.detail)
-            if is_unreadable_evidence_error(str(exc.detail)):
+            detail = str(exc.detail)
+            if is_unreadable_evidence_error(detail) or is_model_insufficient_evidence_error(detail):
                 try:
                     async with AsyncSessionLocal() as db:
                         broken = await db.scalar(
                             select(VehicleViolation).where(VehicleViolation.id == vid).limit(1)
                         )
-                        if broken is not None:
-                            broken.ai_queried = True
+                        if broken is not None and (broken.status or "").strip() == "待处理":
+                            existing = await db.scalar(
+                                select(ViolationAiAssessment)
+                                .where(ViolationAiAssessment.violation_id == vid)
+                                .limit(1)
+                            )
+                            _, auto_false = await _apply_insufficient_evidence_false_alarm(
+                                db, broken, existing
+                            )
                             await db.commit()
-                    item["result"] = "skipped"
-                    item["reason"] = "证据损坏，已跳过"
-                    result.skipped_no_evidence += 1
+                            item["auto_false_alarm"] = auto_false
+                    item["result"] = "assessed"
+                    item["reason"] = "模型判定证据不足，已按误报落库"
+                    item["ticket_process_type"] = "误报"
+                    result.assessed += 1
+                    result.auto_false_alarm += 1
                     result.errors -= 1
+                    logger.info("模型判定证据不足，直接落误报 id=%s", vid)
                 except Exception as mark_exc:  # noqa: BLE001
-                    logger.warning("标记损坏证据失败 id=%s: %s", vid, mark_exc)
+                    logger.warning("证据不足落误报失败 id=%s: %s", vid, mark_exc)
                     violation_ai_assessment_scheduler.defer(vid, seconds=_DEFER_ERROR_SEC)
             else:
                 violation_ai_assessment_scheduler.defer(vid, seconds=_DEFER_ERROR_SEC)
-            logger.warning("自动 AI 评估 HTTP 失败 id=%s: %s", vid, exc.detail)
+                logger.warning("自动 AI 评估 HTTP 失败 id=%s: %s", vid, exc.detail)
         except Exception as exc:  # noqa: BLE001
             result.errors += 1
             item["result"] = "error"
